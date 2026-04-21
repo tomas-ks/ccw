@@ -20,7 +20,7 @@ use glam::{DMat4, DVec2, DVec3};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use thiserror::Error;
-use velr::{CellRef, Velr};
+use velr::{CellRef, TableResult, Velr};
 use velr_graphql_core::{GraphQlRequest, GraphQlResponse, GraphQlServer, JsonMap};
 use velr_graphql_managed::{ManagedGraphQlDatabase, ManagedGraphQlExecutor};
 
@@ -102,62 +102,52 @@ pub const CURATED_IFC_FIXTURES: &[IfcFixtureSpec] = &[
     IfcFixtureSpec {
         slug: "building-architecture",
         file_name: "building-architecture.ifc",
-        source_relative_path:
-            "testdata/buildingSMART/IFC4X3_ADD2/PCERT-Sample-Scene/Building-Architecture.ifc",
+        source_relative_path: "testdata/buildingSMART/IFC4X3_ADD2/PCERT-Sample-Scene/Building-Architecture.ifc",
     },
     IfcFixtureSpec {
         slug: "building-hvac",
         file_name: "building-hvac.ifc",
-        source_relative_path:
-            "testdata/buildingSMART/IFC4X3_ADD2/PCERT-Sample-Scene/Building-Hvac.ifc",
+        source_relative_path: "testdata/buildingSMART/IFC4X3_ADD2/PCERT-Sample-Scene/Building-Hvac.ifc",
     },
     IfcFixtureSpec {
         slug: "building-landscaping",
         file_name: "building-landscaping.ifc",
-        source_relative_path:
-            "testdata/buildingSMART/IFC4X3_ADD2/PCERT-Sample-Scene/Building-Landscaping.ifc",
+        source_relative_path: "testdata/buildingSMART/IFC4X3_ADD2/PCERT-Sample-Scene/Building-Landscaping.ifc",
     },
     IfcFixtureSpec {
         slug: "building-structural",
         file_name: "building-structural.ifc",
-        source_relative_path:
-            "testdata/buildingSMART/IFC4X3_ADD2/PCERT-Sample-Scene/Building-Structural.ifc",
+        source_relative_path: "testdata/buildingSMART/IFC4X3_ADD2/PCERT-Sample-Scene/Building-Structural.ifc",
     },
     IfcFixtureSpec {
         slug: "infra-bridge",
         file_name: "infra-bridge.ifc",
-        source_relative_path:
-            "testdata/buildingSMART/IFC4X3_ADD2/PCERT-Sample-Scene/Infra-Bridge.ifc",
+        source_relative_path: "testdata/buildingSMART/IFC4X3_ADD2/PCERT-Sample-Scene/Infra-Bridge.ifc",
     },
     IfcFixtureSpec {
         slug: "infra-landscaping",
         file_name: "infra-landscaping.ifc",
-        source_relative_path:
-            "testdata/buildingSMART/IFC4X3_ADD2/PCERT-Sample-Scene/Infra-Landscaping.ifc",
+        source_relative_path: "testdata/buildingSMART/IFC4X3_ADD2/PCERT-Sample-Scene/Infra-Landscaping.ifc",
     },
     IfcFixtureSpec {
         slug: "infra-plumbing",
         file_name: "infra-plumbing.ifc",
-        source_relative_path:
-            "testdata/buildingSMART/IFC4X3_ADD2/PCERT-Sample-Scene/Infra-Plumbing.ifc",
+        source_relative_path: "testdata/buildingSMART/IFC4X3_ADD2/PCERT-Sample-Scene/Infra-Plumbing.ifc",
     },
     IfcFixtureSpec {
         slug: "infra-rail",
         file_name: "infra-rail.ifc",
-        source_relative_path:
-            "testdata/buildingSMART/IFC4X3_ADD2/PCERT-Sample-Scene/Infra-Rail.ifc",
+        source_relative_path: "testdata/buildingSMART/IFC4X3_ADD2/PCERT-Sample-Scene/Infra-Rail.ifc",
     },
     IfcFixtureSpec {
         slug: "infra-road",
         file_name: "infra-road.ifc",
-        source_relative_path:
-            "testdata/buildingSMART/IFC4X3_ADD2/PCERT-Sample-Scene/Infra-Road.ifc",
+        source_relative_path: "testdata/buildingSMART/IFC4X3_ADD2/PCERT-Sample-Scene/Infra-Road.ifc",
     },
     IfcFixtureSpec {
         slug: "openifcmodel-20210219-architecture",
         file_name: "openifcmodel-20210219-architecture.ifc",
-        source_relative_path:
-            "testdata/buildingSMART/IFC4X3_ADD2/openifcmodel/20210219Architecture.ifc",
+        source_relative_path: "testdata/buildingSMART/IFC4X3_ADD2/openifcmodel/20210219Architecture.ifc",
     },
     IfcFixtureSpec {
         slug: "fzk-haus",
@@ -775,16 +765,17 @@ impl VelrIfcModel {
     }
 
     pub fn execute_cypher_rows(&self, cypher: &str) -> Result<CypherQueryResult, VelrIfcError> {
-        let mut table = self.raw_db.exec_one(cypher)?;
-        let columns = table.column_names().to_vec();
-        let mut rows = Vec::new();
+        exec_cypher_in_scoped_tx(&self.raw_db, cypher, |table| {
+            let columns = table.column_names().to_vec();
+            let mut rows = Vec::new();
 
-        table.for_each_row(|row| {
-            rows.push(row.iter().map(render_cell).collect());
-            Ok(())
-        })?;
+            table.for_each_row(|row| {
+                rows.push(row.iter().map(render_cell).collect());
+                Ok(())
+            })?;
 
-        Ok(CypherQueryResult { columns, rows })
+            Ok(CypherQueryResult { columns, rows })
+        })
     }
 
     pub fn query_projects_graphql(&self) -> Result<Vec<IfcProjectOverview>, VelrIfcError> {
@@ -1972,15 +1963,51 @@ fn orthogonal_axis(axis: DVec3) -> DVec3 {
 }
 
 fn scalar_count(raw_db: &Velr, cypher: &str) -> Result<i64, VelrIfcError> {
-    let mut table = raw_db.exec_one(cypher)?;
-    let mut count = None;
-    table.for_each_row(|row| {
-        if let Some(CellRef::Integer(value)) = row.first() {
-            count = Some(*value);
+    exec_cypher_in_scoped_tx(raw_db, cypher, |table| {
+        let mut count = None;
+        table.for_each_row(|row| {
+            if let Some(CellRef::Integer(value)) = row.first() {
+                count = Some(*value);
+            }
+            Ok(())
+        })?;
+        count.ok_or_else(|| VelrIfcError::MissingIntegerResult(cypher.to_string()))
+    })
+}
+
+// Ad hoc Cypher queries run against cached model handles in the web server, so we keep each
+// execution inside a short-lived transaction and close it explicitly even when the query fails.
+fn exec_cypher_in_scoped_tx<T>(
+    raw_db: &Velr,
+    cypher: &str,
+    extract: impl FnOnce(&mut TableResult) -> Result<T, VelrIfcError>,
+) -> Result<T, VelrIfcError> {
+    let tx = raw_db.begin_tx()?;
+    let result = match tx.exec_one(cypher) {
+        Ok(mut table) => {
+            let extracted = extract(&mut table);
+            drop(table);
+            extracted
         }
-        Ok(())
-    })?;
-    count.ok_or_else(|| VelrIfcError::MissingIntegerResult(cypher.to_string()))
+        Err(query_error) => {
+            return match tx.rollback() {
+                Ok(()) => Err(VelrIfcError::from(query_error)),
+                Err(rollback_error) => Err(VelrIfcError::IfcGeometryData(format!(
+                    "cypher query failed and transaction rollback cleanup also failed: query error: {query_error}; rollback error: {rollback_error}"
+                ))),
+            };
+        }
+    };
+
+    match tx.rollback() {
+        Ok(()) => result,
+        Err(rollback_error) => match result {
+            Ok(_) => Err(VelrIfcError::from(rollback_error)),
+            Err(query_error) => Err(VelrIfcError::IfcGeometryData(format!(
+                "cypher query processing failed and transaction rollback cleanup also failed: query error: {query_error}; rollback error: {rollback_error}"
+            ))),
+        },
+    }
 }
 
 fn render_cell(cell: &CellRef<'_>) -> String {
@@ -3192,6 +3219,49 @@ mod tests {
         );
 
         fs::remove_dir_all(&temp_root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn failed_cypher_query_does_not_poison_reused_model_handle() {
+        let temp_root = temp_test_root("cypher-tx-cleanup");
+        let layout = IfcArtifactLayout::new(&temp_root, "query-model");
+        layout.ensure_dirs().expect("layout dirs");
+        write_test_source_ifc(&layout, "IFC2X3");
+
+        {
+            let database_path = path_to_utf8(&layout.database).expect("database utf-8");
+            let db = Velr::open(Some(database_path.as_str())).expect("open test db");
+            db.run("CREATE (:Thing {name:'ok'})").expect("seed db");
+        }
+
+        let model = VelrIfcModel::open(layout.clone()).expect("open model");
+
+        model
+            .execute_cypher_rows("MATCH (")
+            .expect_err("invalid cypher should fail");
+
+        let result = model
+            .execute_cypher_rows("MATCH (n:Thing) RETURN count(n) AS count")
+            .expect("follow-up query should still succeed");
+
+        assert_eq!(result.columns, vec!["count".to_string()]);
+        assert_eq!(result.rows, vec![vec!["1".to_string()]]);
+
+        fs::remove_dir_all(&temp_root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn failed_scalar_count_query_does_not_poison_database_handle() {
+        let db = Velr::open(None).expect("open in-memory db");
+        db.run("CREATE (:Thing)")
+            .expect("seed in-memory test database");
+
+        scalar_count(&db, "MATCH (").expect_err("invalid cypher should fail");
+
+        let count = scalar_count(&db, "MATCH (n:Thing) RETURN count(n)")
+            .expect("follow-up scalar query should succeed");
+
+        assert_eq!(count, 1);
     }
 
     #[test]

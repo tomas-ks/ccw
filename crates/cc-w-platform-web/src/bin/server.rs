@@ -29,6 +29,13 @@ const PORT_SEARCH_LIMIT: u16 = 32;
 const RESOURCES_API_PATH: &str = "/api/resources";
 const PACKAGE_API_PATH: &str = "/api/package";
 const CYPHER_API_PATH: &str = "/api/cypher";
+const GRAPH_SUBGRAPH_API_PATH: &str = "/api/graph/subgraph";
+const DEFAULT_GRAPH_HOPS: usize = 1;
+const MAX_GRAPH_HOPS: usize = 2;
+const DEFAULT_GRAPH_MAX_NODES: usize = 120;
+const DEFAULT_GRAPH_MAX_EDGES: usize = 240;
+const MAX_GRAPH_MAX_NODES: usize = 400;
+const MAX_GRAPH_MAX_EDGES: usize = 800;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse(env::args().skip(1))?;
@@ -133,6 +140,17 @@ struct PackageApiRequest {
     resource: String,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct GraphSubgraphApiRequest {
+    resource: String,
+    seed_node_ids: Vec<i64>,
+    hops: Option<usize>,
+    max_nodes: Option<usize>,
+    max_edges: Option<usize>,
+    mode: Option<GraphSubgraphMode>,
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct CypherApiResponse {
@@ -140,6 +158,54 @@ struct CypherApiResponse {
     columns: Vec<String>,
     rows: Vec<Vec<String>>,
     semantic_element_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum GraphSubgraphMode {
+    Raw,
+    Semantic,
+}
+
+impl Default for GraphSubgraphMode {
+    fn default() -> Self {
+        Self::Raw
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct GraphSubgraphApiResponse {
+    resource: String,
+    mode: GraphSubgraphMode,
+    hops: usize,
+    max_nodes: usize,
+    max_edges: usize,
+    seed_node_ids: Vec<i64>,
+    nodes: Vec<GraphSubgraphNode>,
+    edges: Vec<GraphSubgraphEdge>,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct GraphSubgraphNode {
+    db_node_id: i64,
+    declared_entity: String,
+    global_id: Option<String>,
+    name: Option<String>,
+    display_label: String,
+    hop_distance: usize,
+    is_seed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct GraphSubgraphEdge {
+    edge_id: String,
+    source_db_node_id: i64,
+    target_db_node_id: i64,
+    relationship_type: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -166,6 +232,40 @@ struct CypherApiMetrics {
     columns: usize,
     rows: usize,
     semantic_element_ids: usize,
+}
+
+#[derive(Debug, Clone)]
+struct GraphSubgraphApiMetrics {
+    model_slug: String,
+    model_cache_status: &'static str,
+    open_ms: u128,
+    build_ms: u128,
+    nodes: usize,
+    edges: usize,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct GraphBuildLimits {
+    hops: usize,
+    max_nodes: usize,
+    max_edges: usize,
+    mode: GraphSubgraphMode,
+}
+
+#[derive(Debug, Clone)]
+struct GraphNodeQueryRecord {
+    db_node_id: i64,
+    declared_entity: String,
+    global_id: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GraphEdgeQueryRecord {
+    source_db_node_id: i64,
+    target_db_node_id: i64,
+    relationship_type: String,
 }
 
 impl Default for Args {
@@ -284,11 +384,14 @@ fn handle_connection(mut stream: TcpStream, state: &ServerState) -> Result<(), S
         "GET" | "HEAD" => {
             if request_path == RESOURCES_API_PATH {
                 serve_resources_api(&mut stream, request.method == "HEAD", state)
-            } else if request_path == CYPHER_API_PATH || request_path == PACKAGE_API_PATH {
+            } else if request_path == CYPHER_API_PATH
+                || request_path == PACKAGE_API_PATH
+                || request_path == GRAPH_SUBGRAPH_API_PATH
+            {
                 write_json_error(
                     &mut stream,
                     "405 Method Not Allowed",
-                    "use POST for package and cypher API routes",
+                    "use POST for package, cypher, and graph API routes",
                 )
             } else {
                 serve_path(
@@ -303,6 +406,9 @@ fn handle_connection(mut stream: TcpStream, state: &ServerState) -> Result<(), S
             serve_package_api(&mut stream, &request, state)
         }
         "POST" if request_path == CYPHER_API_PATH => serve_cypher_api(&mut stream, &request, state),
+        "POST" if request_path == GRAPH_SUBGRAPH_API_PATH => {
+            serve_graph_subgraph_api(&mut stream, &request, state)
+        }
         _ => write_response(
             &mut stream,
             "405 Method Not Allowed",
@@ -539,6 +645,67 @@ fn serve_cypher_api(
     }
 }
 
+fn serve_graph_subgraph_api(
+    stream: &mut TcpStream,
+    request: &HttpRequest,
+    state: &ServerState,
+) -> Result<(), String> {
+    let request_started = Instant::now();
+    let parse_started = Instant::now();
+    let api_request: GraphSubgraphApiRequest = serde_json::from_slice(&request.body)
+        .map_err(|error| format!("invalid /api/graph/subgraph JSON body: {error}"))?;
+    let parse_ms = parse_started.elapsed().as_millis();
+    let seed_count = api_request.seed_node_ids.len();
+
+    let execute_started = Instant::now();
+    match execute_graph_subgraph_api(&api_request, state) {
+        Ok((response, metrics)) => {
+            let execute_ms = execute_started.elapsed().as_millis();
+            let write_started = Instant::now();
+            let write_result = write_json_response(stream, "200 OK", &response);
+            let write_ms = write_started.elapsed().as_millis();
+            println!(
+                "[w web timing] graph_subgraph resource={} model={} model_cache={} parse_ms={} open_ms={} build_ms={} exec_ms={} write_ms={} total_ms={} seeds={} hops={} max_nodes={} max_edges={} nodes={} edges={} truncated={} mode={:?}",
+                api_request.resource,
+                metrics.model_slug,
+                metrics.model_cache_status,
+                parse_ms,
+                metrics.open_ms,
+                metrics.build_ms,
+                execute_ms,
+                write_ms,
+                request_started.elapsed().as_millis(),
+                seed_count,
+                response.hops,
+                response.max_nodes,
+                response.max_edges,
+                metrics.nodes,
+                metrics.edges,
+                metrics.truncated,
+                response.mode,
+            );
+            write_result
+        }
+        Err(error) => {
+            let execute_ms = execute_started.elapsed().as_millis();
+            let write_started = Instant::now();
+            let write_result = write_json_error(stream, "400 Bad Request", &error);
+            let write_ms = write_started.elapsed().as_millis();
+            eprintln!(
+                "[w web timing] graph_subgraph error resource={} parse_ms={} exec_ms={} write_ms={} total_ms={} seeds={} error={}",
+                api_request.resource,
+                parse_ms,
+                execute_ms,
+                write_ms,
+                request_started.elapsed().as_millis(),
+                seed_count,
+                error,
+            );
+            write_result
+        }
+    }
+}
+
 fn load_package_response(
     resource: &str,
     ifc_artifacts_root: &Path,
@@ -641,6 +808,420 @@ fn execute_cypher_api(
         },
         metrics,
     ))
+}
+
+fn execute_graph_subgraph_api(
+    request: &GraphSubgraphApiRequest,
+    state: &ServerState,
+) -> Result<(GraphSubgraphApiResponse, GraphSubgraphApiMetrics), String> {
+    let model_slug = parse_ifc_body_resource(&request.resource).ok_or_else(|| {
+        format!(
+            "graph exploration requires an IFC resource like `ifc/building-architecture`; got `{}`",
+            request.resource
+        )
+    })?;
+    let limits = validate_graph_subgraph_request(request)?;
+    let open_started = Instant::now();
+    let (model, cache_status) = cached_ifc_model(state, model_slug)?;
+    let open_ms = open_started.elapsed().as_millis();
+    let build_started = Instant::now();
+    let response = build_graph_subgraph_response(request, model.as_ref(), limits)?;
+    let build_ms = build_started.elapsed().as_millis();
+    let metrics = GraphSubgraphApiMetrics {
+        model_slug: model_slug.to_owned(),
+        model_cache_status: cache_status.as_str(),
+        open_ms,
+        build_ms,
+        nodes: response.nodes.len(),
+        edges: response.edges.len(),
+        truncated: response.truncated,
+    };
+    Ok((response, metrics))
+}
+
+fn build_graph_subgraph_response(
+    request: &GraphSubgraphApiRequest,
+    model: &VelrIfcModel,
+    limits: GraphBuildLimits,
+) -> Result<GraphSubgraphApiResponse, String> {
+    let requested_seed_count = request.seed_node_ids.len();
+    let mut seed_node_ids = dedup_sorted_ids(&request.seed_node_ids);
+    if seed_node_ids.len() > limits.max_nodes {
+        seed_node_ids.truncate(limits.max_nodes);
+    }
+
+    let seed_node_records = fetch_graph_nodes_by_ids(model, &seed_node_ids)?;
+    let seed_node_records_by_id = seed_node_records
+        .into_iter()
+        .map(|record| (record.db_node_id, record))
+        .collect::<HashMap<_, _>>();
+
+    let mut nodes_by_id = HashMap::<i64, GraphSubgraphNode>::new();
+    let mut edges_by_id = HashMap::<String, GraphSubgraphEdge>::new();
+    let mut frontier = seed_node_ids
+        .iter()
+        .filter_map(|db_node_id| {
+            seed_node_records_by_id
+                .get(db_node_id)
+                .cloned()
+                .map(|record| (*db_node_id, graph_node_from_record(record, 0, true)))
+        })
+        .collect::<Vec<_>>();
+    let mut truncated =
+        seed_node_ids.len() < requested_seed_count || frontier.len() < seed_node_ids.len();
+
+    for (db_node_id, node) in frontier.iter().cloned() {
+        nodes_by_id.insert(db_node_id, node);
+    }
+
+    for depth in 0..limits.hops {
+        if frontier.is_empty()
+            || nodes_by_id.len() >= limits.max_nodes
+            || edges_by_id.len() >= limits.max_edges
+        {
+            break;
+        }
+
+        let frontier_ids = frontier
+            .iter()
+            .map(|(db_node_id, _)| *db_node_id)
+            .collect::<Vec<_>>();
+        let frontier_set = frontier_ids.iter().copied().collect::<HashSet<_>>();
+        let remaining_edge_capacity = limits.max_edges.saturating_sub(edges_by_id.len());
+        let (candidate_edges, edge_query_truncated) =
+            fetch_incident_graph_edges(model, &frontier_ids, remaining_edge_capacity)?;
+        truncated |= edge_query_truncated;
+        let mut neighbor_ids = HashSet::new();
+
+        for edge in &candidate_edges {
+            if frontier_set.contains(&edge.source_db_node_id) {
+                neighbor_ids.insert(edge.target_db_node_id);
+            }
+            if frontier_set.contains(&edge.target_db_node_id) {
+                neighbor_ids.insert(edge.source_db_node_id);
+            }
+        }
+
+        let mut neighbor_ids = neighbor_ids
+            .into_iter()
+            .filter(|db_node_id| !nodes_by_id.contains_key(db_node_id))
+            .collect::<Vec<_>>();
+        neighbor_ids.sort_unstable();
+
+        let remaining_node_capacity = limits.max_nodes.saturating_sub(nodes_by_id.len());
+        if neighbor_ids.len() > remaining_node_capacity {
+            neighbor_ids.truncate(remaining_node_capacity);
+            truncated = true;
+        }
+
+        let neighbor_records = fetch_graph_nodes_by_ids(model, &neighbor_ids)?;
+        let neighbor_records_by_id = neighbor_records
+            .into_iter()
+            .map(|record| (record.db_node_id, record))
+            .collect::<HashMap<_, _>>();
+        let mut next_frontier = Vec::new();
+        for db_node_id in neighbor_ids {
+            let Some(record) = neighbor_records_by_id.get(&db_node_id).cloned() else {
+                truncated = true;
+                continue;
+            };
+            let node = graph_node_from_record(record, depth + 1, false);
+            if !graph_mode_keeps_node(&node, limits.mode) {
+                continue;
+            }
+            let db_node_id = node.db_node_id;
+            if nodes_by_id.insert(db_node_id, node.clone()).is_none() {
+                next_frontier.push((db_node_id, node));
+            }
+        }
+
+        for edge in candidate_edges {
+            if edges_by_id.len() >= limits.max_edges {
+                truncated = true;
+                break;
+            }
+            if !nodes_by_id.contains_key(&edge.source_db_node_id)
+                || !nodes_by_id.contains_key(&edge.target_db_node_id)
+            {
+                continue;
+            }
+            let edge_id = graph_edge_id(
+                edge.source_db_node_id,
+                &edge.relationship_type,
+                edge.target_db_node_id,
+            );
+            edges_by_id
+                .entry(edge_id.clone())
+                .or_insert(GraphSubgraphEdge {
+                    edge_id,
+                    source_db_node_id: edge.source_db_node_id,
+                    target_db_node_id: edge.target_db_node_id,
+                    relationship_type: edge.relationship_type,
+                });
+        }
+
+        frontier = next_frontier;
+    }
+
+    let mut nodes = nodes_by_id.into_values().collect::<Vec<_>>();
+    nodes.sort_by(|left, right| {
+        left.hop_distance
+            .cmp(&right.hop_distance)
+            .then_with(|| left.db_node_id.cmp(&right.db_node_id))
+    });
+
+    let mut edges = edges_by_id.into_values().collect::<Vec<_>>();
+    edges.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
+
+    Ok(GraphSubgraphApiResponse {
+        resource: request.resource.clone(),
+        mode: limits.mode,
+        hops: limits.hops,
+        max_nodes: limits.max_nodes,
+        max_edges: limits.max_edges,
+        seed_node_ids,
+        nodes,
+        edges,
+        truncated,
+    })
+}
+
+fn validate_graph_subgraph_request(
+    request: &GraphSubgraphApiRequest,
+) -> Result<GraphBuildLimits, String> {
+    if request.seed_node_ids.is_empty() {
+        return Err("graph exploration requires at least one seedNodeId".to_owned());
+    }
+
+    let hops = request.hops.unwrap_or(DEFAULT_GRAPH_HOPS);
+    if hops > MAX_GRAPH_HOPS {
+        return Err(format!(
+            "graph exploration supports hops up to {}; got {}",
+            MAX_GRAPH_HOPS, hops
+        ));
+    }
+
+    let max_nodes = validate_graph_limit(
+        request.max_nodes,
+        DEFAULT_GRAPH_MAX_NODES,
+        MAX_GRAPH_MAX_NODES,
+        "maxNodes",
+    )?;
+    let max_edges = validate_graph_limit(
+        request.max_edges,
+        DEFAULT_GRAPH_MAX_EDGES,
+        MAX_GRAPH_MAX_EDGES,
+        "maxEdges",
+    )?;
+    Ok(GraphBuildLimits {
+        hops,
+        max_nodes,
+        max_edges,
+        mode: request.mode.unwrap_or_default(),
+    })
+}
+
+fn validate_graph_limit(
+    requested: Option<usize>,
+    default: usize,
+    maximum: usize,
+    label: &str,
+) -> Result<usize, String> {
+    let value = requested.unwrap_or(default);
+    if value == 0 {
+        return Err(format!("{label} must be at least 1"));
+    }
+    if value > maximum {
+        return Err(format!("{label} must be at most {maximum}; got {value}"));
+    }
+    Ok(value)
+}
+
+fn cypher_id_list(ids: &[i64]) -> String {
+    ids.iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn fetch_graph_nodes_by_ids(
+    model: &VelrIfcModel,
+    db_node_ids: &[i64],
+) -> Result<Vec<GraphNodeQueryRecord>, String> {
+    if db_node_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = cypher_id_list(db_node_ids);
+    let query = format!(
+        "MATCH (n) WHERE id(n) IN [{ids}] RETURN id(n) AS db_node_id, n.declared_entity AS declared_entity, n.GlobalId AS global_id, n.Name AS name ORDER BY id(n)"
+    );
+    let result = model
+        .execute_cypher_rows(&query)
+        .map_err(|error| format!("failed to load graph nodes by id: {error}"))?;
+    parse_graph_node_query_result(&result)
+}
+
+fn parse_graph_node_query_result(
+    result: &cc_w_velr::CypherQueryResult,
+) -> Result<Vec<GraphNodeQueryRecord>, String> {
+    let db_node_id_index = required_column_index(&result.columns, &["dbnodeid"], "db_node_id")?;
+    let declared_entity_index =
+        required_column_index(&result.columns, &["declaredentity"], "declared_entity")?;
+    let global_id_index = required_column_index(&result.columns, &["globalid"], "global_id")?;
+    let name_index = required_column_index(&result.columns, &["name"], "name")?;
+
+    let mut records = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        let db_node_id = parse_required_i64_cell(row.get(db_node_id_index), "db_node_id")?;
+        let declared_entity = parse_optional_string_cell(row.get(declared_entity_index))
+            .unwrap_or_else(|| "IfcEntity".to_owned());
+        let global_id = parse_optional_string_cell(row.get(global_id_index));
+        let name = parse_optional_string_cell(row.get(name_index));
+        records.push(GraphNodeQueryRecord {
+            db_node_id,
+            declared_entity,
+            global_id,
+            name,
+        });
+    }
+
+    Ok(records)
+}
+
+fn fetch_incident_graph_edges(
+    model: &VelrIfcModel,
+    db_node_ids: &[i64],
+    max_edges: usize,
+) -> Result<(Vec<GraphEdgeQueryRecord>, bool), String> {
+    if db_node_ids.is_empty() || max_edges == 0 {
+        return Ok((Vec::new(), false));
+    }
+    let ids = cypher_id_list(db_node_ids);
+    let query = format!(
+        "MATCH (source)-[rel]->(target) WHERE id(source) IN [{ids}] OR id(target) IN [{ids}] RETURN id(source) AS source_db_node_id, id(target) AS target_db_node_id, type(rel) AS relationship_type ORDER BY id(source), id(target), type(rel) LIMIT {}",
+        max_edges + 1
+    );
+    let result = model
+        .execute_cypher_rows(&query)
+        .map_err(|error| format!("failed to load incident graph edges: {error}"))?;
+    let mut edges = parse_graph_edge_query_result(&result)?;
+    let truncated = edges.len() > max_edges;
+    if truncated {
+        edges.truncate(max_edges);
+    }
+    Ok((edges, truncated))
+}
+
+fn parse_graph_edge_query_result(
+    result: &cc_w_velr::CypherQueryResult,
+) -> Result<Vec<GraphEdgeQueryRecord>, String> {
+    let source_index =
+        required_column_index(&result.columns, &["sourcedbnodeid"], "source_db_node_id")?;
+    let target_index =
+        required_column_index(&result.columns, &["targetdbnodeid"], "target_db_node_id")?;
+    let relationship_type_index =
+        required_column_index(&result.columns, &["relationshiptype"], "relationship_type")?;
+
+    let mut edges = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        edges.push(GraphEdgeQueryRecord {
+            source_db_node_id: parse_required_i64_cell(row.get(source_index), "source_db_node_id")?,
+            target_db_node_id: parse_required_i64_cell(row.get(target_index), "target_db_node_id")?,
+            relationship_type: parse_required_string_cell(
+                row.get(relationship_type_index),
+                "relationship_type",
+            )?
+            .to_owned(),
+        });
+    }
+
+    Ok(edges)
+}
+
+fn graph_node_from_record(
+    record: GraphNodeQueryRecord,
+    hop_distance: usize,
+    is_seed: bool,
+) -> GraphSubgraphNode {
+    let display_label = record
+        .name
+        .clone()
+        .or_else(|| record.global_id.clone())
+        .unwrap_or_else(|| record.declared_entity.clone());
+    GraphSubgraphNode {
+        db_node_id: record.db_node_id,
+        declared_entity: record.declared_entity,
+        global_id: record.global_id,
+        name: record.name,
+        display_label,
+        hop_distance,
+        is_seed,
+    }
+}
+
+fn graph_mode_keeps_node(node: &GraphSubgraphNode, mode: GraphSubgraphMode) -> bool {
+    match mode {
+        GraphSubgraphMode::Raw => true,
+        GraphSubgraphMode::Semantic => {
+            node.is_seed || node.global_id.is_some() || node.declared_entity.starts_with("IfcRel")
+        }
+    }
+}
+
+fn dedup_sorted_ids(ids: &[i64]) -> Vec<i64> {
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn graph_edge_id(
+    source_db_node_id: i64,
+    relationship_type: &str,
+    target_db_node_id: i64,
+) -> String {
+    format!("{source_db_node_id}:{relationship_type}:{target_db_node_id}")
+}
+
+fn required_column_index(
+    columns: &[String],
+    candidates: &[&str],
+    label: &str,
+) -> Result<usize, String> {
+    find_column_index(columns, candidates)
+        .ok_or_else(|| format!("cypher result is missing required column `{label}`"))
+}
+
+fn parse_required_i64_cell(cell: Option<&String>, label: &str) -> Result<i64, String> {
+    let value = parse_required_string_cell(cell, label)?;
+    value
+        .trim()
+        .parse::<i64>()
+        .map_err(|error| format!("invalid integer in `{label}`: {error}"))
+}
+
+fn parse_required_string_cell<'a>(
+    cell: Option<&'a String>,
+    label: &str,
+) -> Result<&'a str, String> {
+    let value = cell
+        .ok_or_else(|| format!("cypher result row is missing `{label}`"))?
+        .trim();
+    if value.is_empty() {
+        return Err(format!("cypher result row has an empty `{label}` value"));
+    }
+    Ok(value)
+}
+
+fn parse_optional_string_cell(cell: Option<&String>) -> Option<String> {
+    cell.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    })
 }
 
 fn cached_ifc_model(
@@ -904,10 +1485,13 @@ fn write_json_error(stream: &mut TcpStream, status: &str, error: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        candidate_ports, content_type_for_path, extract_semantic_element_ids, request_path_only,
-        sanitize_request_path,
+        GraphSubgraphMode, candidate_ports, content_type_for_path, dedup_sorted_ids,
+        extract_semantic_element_ids, graph_edge_id, graph_mode_keeps_node, request_path_only,
+        sanitize_request_path, validate_graph_limit,
     };
     use std::path::Path;
+
+    use crate::GraphSubgraphNode;
 
     #[test]
     fn request_root_maps_to_index() {
@@ -984,5 +1568,67 @@ mod tests {
             &[vec![String::from("42")]],
         );
         assert_eq!(from_product, vec!["42"]);
+    }
+
+    #[test]
+    fn graph_limit_validation_rejects_zero_and_oversized_values() {
+        assert_eq!(validate_graph_limit(None, 12, 50, "maxNodes").unwrap(), 12);
+        assert!(validate_graph_limit(Some(0), 12, 50, "maxNodes").is_err());
+        assert!(validate_graph_limit(Some(51), 12, 50, "maxNodes").is_err());
+    }
+
+    #[test]
+    fn graph_mode_semantic_filters_out_non_semantic_internal_nodes() {
+        let internal = GraphSubgraphNode {
+            db_node_id: 7,
+            declared_entity: "IfcCartesianPoint".to_string(),
+            global_id: None,
+            name: None,
+            display_label: "IfcCartesianPoint".to_string(),
+            hop_distance: 1,
+            is_seed: false,
+        };
+        let rel = GraphSubgraphNode {
+            db_node_id: 8,
+            declared_entity: "IfcRelAggregates".to_string(),
+            global_id: None,
+            name: None,
+            display_label: "IfcRelAggregates".to_string(),
+            hop_distance: 1,
+            is_seed: false,
+        };
+        let product = GraphSubgraphNode {
+            db_node_id: 9,
+            declared_entity: "IfcWall".to_string(),
+            global_id: Some("0abc".to_string()),
+            name: Some("Wall".to_string()),
+            display_label: "Wall".to_string(),
+            hop_distance: 1,
+            is_seed: false,
+        };
+
+        assert!(!graph_mode_keeps_node(
+            &internal,
+            GraphSubgraphMode::Semantic
+        ));
+        assert!(graph_mode_keeps_node(&rel, GraphSubgraphMode::Semantic));
+        assert!(graph_mode_keeps_node(&product, GraphSubgraphMode::Semantic));
+    }
+
+    #[test]
+    fn graph_edge_ids_are_stable_and_directed() {
+        assert_eq!(
+            graph_edge_id(7, "RELATING_OBJECT", 9),
+            "7:RELATING_OBJECT:9"
+        );
+        assert_ne!(
+            graph_edge_id(7, "RELATING_OBJECT", 9),
+            graph_edge_id(9, "RELATING_OBJECT", 7)
+        );
+    }
+
+    #[test]
+    fn graph_seed_ids_are_sorted_and_deduplicated() {
+        assert_eq!(dedup_sorted_ids(&[9, 2, 9, 4, 2]), vec![2, 4, 9]);
     }
 }

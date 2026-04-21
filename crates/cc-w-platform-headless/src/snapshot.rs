@@ -10,12 +10,14 @@ use thiserror::Error;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SnapshotOptions {
     pub tolerance_per_channel: u8,
+    pub update_expected: bool,
 }
 
 impl Default for SnapshotOptions {
     fn default() -> Self {
         Self {
             tolerance_per_channel: 0,
+            update_expected: false,
         }
     }
 }
@@ -113,9 +115,24 @@ pub fn assert_rendered_image_snapshot(
     paths: &SnapshotPaths,
     options: SnapshotOptions,
 ) -> Result<SnapshotComparison, SnapshotError> {
-    let expected = read_png(&paths.expected)?;
+    let expected = match read_png(&paths.expected) {
+        Ok(expected) => expected,
+        Err(SnapshotError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound && options.update_expected =>
+        {
+            write_png(&paths.expected, actual)?;
+            clear_snapshot_artifacts(paths)?;
+            return Ok(accepted_snapshot_result());
+        }
+        Err(error) => return Err(error),
+    };
 
     if expected.width != actual.width || expected.height != actual.height {
+        if options.update_expected {
+            write_png(&paths.expected, actual)?;
+            clear_snapshot_artifacts(paths)?;
+            return Ok(accepted_snapshot_result());
+        }
         write_png(&paths.actual, actual)?;
         write_png(&paths.diff, &dimension_mismatch_image(&expected, actual))?;
 
@@ -132,6 +149,11 @@ pub fn assert_rendered_image_snapshot(
 
     let comparison = compare_images(&expected, actual, options.tolerance_per_channel);
     if comparison.mismatched_pixels > 0 {
+        if options.update_expected {
+            write_png(&paths.expected, actual)?;
+            clear_snapshot_artifacts(paths)?;
+            return Ok(accepted_snapshot_result());
+        }
         write_png(&paths.actual, actual)?;
         write_png(
             &paths.diff,
@@ -148,7 +170,29 @@ pub fn assert_rendered_image_snapshot(
         });
     }
 
+    clear_snapshot_artifacts(paths)?;
     Ok(comparison)
+}
+
+fn accepted_snapshot_result() -> SnapshotComparison {
+    SnapshotComparison {
+        mismatched_pixels: 0,
+        max_channel_delta: 0,
+    }
+}
+
+fn clear_snapshot_artifacts(paths: &SnapshotPaths) -> Result<(), SnapshotError> {
+    remove_if_exists(&paths.actual)?;
+    remove_if_exists(&paths.diff)?;
+    Ok(())
+}
+
+fn remove_if_exists(path: &Path) -> Result<(), SnapshotError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn read_png(path: &Path) -> Result<RenderedImage, SnapshotError> {
@@ -336,6 +380,64 @@ mod tests {
         assert!(matches!(error, SnapshotError::PixelMismatch { .. }));
         assert!(paths.actual.exists());
         assert!(paths.diff.exists());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn accept_mode_writes_missing_expected_snapshot() {
+        let directory = temp_dir("snapshot-accept-missing");
+        let paths = SnapshotPaths {
+            expected: directory.join("expected.png"),
+            actual: directory.join("actual.png"),
+            diff: directory.join("diff.png"),
+        };
+        let actual = solid_image([64, 128, 192, 255]);
+
+        let comparison = assert_rendered_image_snapshot(
+            &actual,
+            &paths,
+            SnapshotOptions {
+                update_expected: true,
+                ..SnapshotOptions::default()
+            },
+        )
+        .expect("snapshot should be accepted");
+
+        assert_eq!(comparison.mismatched_pixels, 0);
+        assert!(paths.expected.exists());
+        assert!(!paths.actual.exists());
+        assert!(!paths.diff.exists());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn accept_mode_replaces_mismatched_expected_snapshot() {
+        let directory = temp_dir("snapshot-accept-replace");
+        let expected_path = directory.join("expected.png");
+        let paths = SnapshotPaths {
+            expected: expected_path.clone(),
+            actual: directory.join("actual.png"),
+            diff: directory.join("diff.png"),
+        };
+        let expected = solid_image([0, 0, 0, 255]);
+        let actual = solid_image([255, 0, 0, 255]);
+
+        write_png(&expected_path, &expected).expect("expected png");
+        let comparison = assert_rendered_image_snapshot(
+            &actual,
+            &paths,
+            SnapshotOptions {
+                update_expected: true,
+                ..SnapshotOptions::default()
+            },
+        )
+        .expect("snapshot should be accepted");
+        let written = read_png(&expected_path).expect("accepted png");
+
+        assert_eq!(comparison.mismatched_pixels, 0);
+        assert_eq!(written, actual);
+        assert!(!paths.actual.exists());
+        assert!(!paths.diff.exists());
         let _ = fs::remove_dir_all(directory);
     }
 

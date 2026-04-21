@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use std::process;
 
 use cc_w_velr::{
-    clear_all_ifc_geometry_caches, clear_all_ifc_legacy_runtime_sidecars,
-    clear_all_ifc_model_artifacts, clear_ifc_geometry_cache, clear_ifc_legacy_runtime_sidecars,
-    clear_ifc_model_artifacts, curated_fixture_specs, default_ifc_artifacts_root,
-    default_ifc_fixtures_root, default_velr_ifc_checkout, import_curated_fixture, import_ifc_file,
-    refresh_ifc_runtime_sidecars, refresh_ifc_schema_runtime_sidecars, slugify_model_name,
-    sync_curated_fixtures, IfcArtifactLayout, IfcImportOptions, IfcSchemaId, VelrIfcModel,
+    IfcArtifactLayout, IfcImportOptions, IfcSchemaId, VelrIfcModel, clear_all_ifc_geometry_caches,
+    clear_all_ifc_legacy_runtime_sidecars, clear_all_ifc_model_artifacts, clear_ifc_geometry_cache,
+    clear_ifc_legacy_runtime_sidecars, clear_ifc_model_artifacts, curated_fixture_specs,
+    default_ifc_artifacts_root, default_ifc_fixtures_root, default_velr_ifc_checkout,
+    import_curated_fixture, import_ifc_file, refresh_ifc_runtime_sidecars,
+    refresh_ifc_schema_runtime_sidecars, slugify_model_name, sync_curated_fixtures,
 };
 
 fn main() {
