@@ -438,43 +438,81 @@
         flex: 0 0 var(--terminal-height);
         height: var(--terminal-height);
         min-height: 0;
-        display: grid;
-        grid-template-rows: auto 1fr;
-        overflow: hidden;
-        background: #090d15;
-        border-top: 1px solid rgba(255, 255, 255, 0.08);
-      }
-
-      .terminal-header {
         display: flex;
-        align-items: center;
-        gap: 12px;
-        padding: 10px 16px 8px;
-        font-size: 12px;
-        color: rgba(243, 246, 255, 0.76);
+        overflow: hidden;
+        background: #0d1117;
       }
 
-      .terminal-header strong {
+      .terminal-tools {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 6px;
+        flex: 0 0 auto;
+        width: 40px;
+        padding: 6px 0;
+      }
+
+      .terminal-tool-tab {
+        height: 36px;
+        width: 36px;
+        padding: 0;
+        border: none;
+        border-bottom: 2px solid transparent;
+        border-radius: 0;
+        background: transparent;
+        color: rgba(243, 246, 255, 0.72);
+        font: inherit;
+        font-size: 12px;
+        font-weight: 700;
+        cursor: pointer;
+        text-align: center;
+      }
+
+      .terminal-tool-tab:hover {
         color: #f3f6ff;
-        font-size: 13px;
+      }
+
+      .terminal-tool-tab.active {
+        color: #f3f6ff;
+        border-bottom-color: #8db6ff;
       }
 
       .terminal-screen {
         min-height: 0;
         min-width: 0;
-        display: flex;
+        display: grid;
+        grid-template-columns: 40px 1fr;
+        gap: 8px;
+        flex: 1;
         overflow: hidden;
-        padding: 4px 16px 12px;
+        padding: 8px 12px 12px;
+        background: #0d1117;
+      }
+
+      .terminal-side {
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        justify-content: flex-start;
+        background: #0c1018;
+        border-right: 1px solid rgba(255, 255, 255, 0.04);
+        padding-top: 8px;
       }
 
       .terminal-host {
-        flex: 1;
-        height: 100%;
+        position: relative;
         min-width: 0;
         min-height: 0;
         overflow: hidden;
-        background: #090d15;
+        background: #0c1018;
         font: 12px/1.5 ui-monospace, SFMono-Regular, SF Mono, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+        display: none;
+      }
+
+      .terminal-host.active {
+        display: block;
       }
 
       .terminal-host .xterm {
@@ -482,11 +520,26 @@
       }
 
       .terminal-host .xterm-viewport {
+        background-color: #0c1018 !important;
         overflow-y: auto !important;
+        scrollbar-color: rgba(255, 255, 255, 0.18) #0c1018;
       }
 
       .terminal-host .xterm-screen {
         width: 100% !important;
+      }
+
+      .terminal-host .xterm-viewport::-webkit-scrollbar {
+        width: 10px;
+      }
+
+      .terminal-host .xterm-viewport::-webkit-scrollbar-track {
+        background: #0c1018;
+      }
+
+      .terminal-host .xterm-viewport::-webkit-scrollbar-thumb {
+        background: rgba(255, 255, 255, 0.16);
+        border-radius: 999px;
       }
 
       .terminal-host .xterm .xterm-selection div {
@@ -509,10 +562,8 @@
           height: var(--terminal-height);
         }
 
-        .terminal-header {
-          align-items: flex-start;
-          flex-direction: column;
-          gap: 4px;
+        .terminal-screen {
+          padding: 8px 10px;
         }
       }
     </style>
@@ -638,17 +689,33 @@
       aria-orientation="horizontal"
     ></div>
     <section class="terminal">
-      <div class="terminal-header">
-        <strong>JS</strong>
-        <span>
-          Queries automatically target the currently selected IFC model.
-          <code>ids(...)</code> returns raw IFC <code>GlobalId</code> values, so query results can be passed straight
-          into <code>hide(...)</code>, <code>show(...)</code>, and <code>select(...)</code>.
-          <code>graph.reset(...)</code> seeds the right-side explorer without blocking the rest of the UI.
-        </span>
-      </div>
       <div class="terminal-screen" id="repl-screen">
-        <div class="terminal-host" id="repl-terminal" aria-label="JavaScript terminal"></div>
+        <div class="terminal-side">
+          <div class="terminal-tools" role="tablist" aria-label="Terminal tools">
+            <button
+              class="terminal-tool-tab active"
+              id="terminal-tool-js"
+              type="button"
+              role="tab"
+              aria-selected="true"
+              data-terminal-tool="js"
+            >
+              JS
+            </button>
+            <button
+              class="terminal-tool-tab"
+              id="terminal-tool-ai"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              data-terminal-tool="ai"
+            >
+              AI
+            </button>
+          </div>
+        </div>
+        <div class="terminal-host active" id="repl-terminal" aria-label="JavaScript terminal"></div>
+        <div class="terminal-host" id="agent-terminal" aria-label="AI agent terminal"></div>
       </div>
     </section>
     <script src="./vendor/graphology.js"></script>
@@ -702,6 +769,7 @@
         sigma: ["./vendor/sigma.mjs", "./vendor/sigma.js"],
         graphology: ["./vendor/graphology.mjs", "./vendor/graphology.js"],
       };
+      const TERMINAL_SURFACE_BACKGROUND = "#0c1018";
       const GRAPH_EDGE_LABEL_MAX_RATIO = 0.95;
       const GRAPH_NODE_NAME_MAX_RATIO = 0.58;
       const GRAPH_NODE_FORCE_LABEL_MAX_RATIO = 1.05;
@@ -3161,9 +3229,9 @@
         return api;
       }
 
-      function installRepl(replApi) {
-        const screen = document.getElementById("repl-screen");
-        const host = document.getElementById("repl-terminal");
+      function installLineTerminal({ screenId, hostId, introLines, execute }) {
+        const screen = document.getElementById(screenId);
+        const host = document.getElementById(hostId);
         if (!screen || !host) {
           return null;
         }
@@ -3180,12 +3248,12 @@
           scrollback: 2000,
           smoothScrollDuration: 0,
           theme: {
-            background: "#090d15",
+            background: TERMINAL_SURFACE_BACKGROUND,
             foreground: "#d7deee",
             cursor: "#8db6ff",
-            cursorAccent: "#090d15",
+            cursorAccent: TERMINAL_SURFACE_BACKGROUND,
             selectionBackground: "rgba(141, 182, 255, 0.24)",
-            black: "#090d15",
+            black: TERMINAL_SURFACE_BACKGROUND,
             red: "#ff9d8a",
             green: "#8fe0a2",
             yellow: "#f2c879",
@@ -3213,6 +3281,9 @@
         }
 
         const fitTerminal = () => {
+          if (host.hidden || !host.classList.contains("active")) {
+            return;
+          }
           try {
             fitAddon.fit();
           } catch (_error) {
@@ -3268,19 +3339,9 @@
             term.focus();
             return;
           }
-          terminalWriteLine(
-            term,
-            "resource(), query(...), ids(...), hide([...]), show([...]), select([...]), graph.reset(...), graph.clear(), graph.mode(\"semantic\"), frame()"
-          );
-          terminalWriteLine(
-            term,
-            'Example: graph.reset("MATCH (p:IfcProject) RETURN id(p) AS node_id LIMIT 1");'
-          );
-          terminalWriteLine(
-            term,
-            'Example: var walls = ids("MATCH (w:IfcWall) RETURN w.GlobalId AS global_id LIMIT 8"); hide(walls);'
-          );
-          terminalWriteLine(term, "Enter runs. Up/Down walks history. Ctrl+C clears the line.");
+          for (const line of introLines) {
+            terminalWriteLine(term, line);
+          }
           term.write("\r\n");
           promptBooted = true;
           showPrompt();
@@ -3342,14 +3403,7 @@
           resetLineState();
           setRunning(true);
           try {
-            const rewritten = rewriteReplSource(code);
-            const fn = new AsyncFunction(
-              "api",
-              "window",
-              "document",
-              `"use strict"; const { viewer, graph, resource, listIds, visibleIds, selectedIds, query, queryIds, ids, hide, show, select, resetVisibility, clearSelection, frame, frameVisible, hideQuery, showQuery, selectQuery } = api; return (async () => { ${rewritten} })();`
-            );
-            const result = await fn(replApi, window, document);
+            const result = await execute(code);
             terminalWriteLine(term, formatResult(result ?? "ok"));
           } catch (error) {
             terminalWriteLine(term, String(error));
@@ -3463,13 +3517,109 @@
         });
 
         host.addEventListener("click", () => term.focus());
-        requestAnimationFrame(() => bootPrompt());
-        setTimeout(() => bootPrompt(), 50);
-        setTimeout(() => bootPrompt(), 180);
+        if (host.classList.contains("active")) {
+          requestAnimationFrame(() => bootPrompt());
+          setTimeout(() => bootPrompt(), 50);
+          setTimeout(() => bootPrompt(), 180);
+        }
 
         return {
           resize: fitTerminal,
           focus: () => term.focus(),
+          activate: () => {
+            host.hidden = false;
+            host.classList.add("active");
+            requestAnimationFrame(() => {
+              fitTerminal();
+              bootPrompt();
+            });
+          },
+          deactivate: () => {
+            host.classList.remove("active");
+            host.hidden = true;
+          },
+        };
+      }
+
+      function installRepl(replApi) {
+        return installLineTerminal({
+          screenId: "repl-screen",
+          hostId: "repl-terminal",
+          introLines: [
+            'resource(), query(...), ids(...), hide([...]), show([...]), select([...]), graph.reset(...), graph.clear(), graph.mode("semantic"), frame()',
+            'Example: graph.reset("MATCH (p:IfcProject) RETURN id(p) AS node_id LIMIT 1");',
+            'Example: var walls = ids("MATCH (w:IfcWall) RETURN w.GlobalId AS global_id LIMIT 8"); hide(walls);',
+            "Enter runs. Up/Down walks history. Ctrl+C clears the line.",
+          ],
+          execute: async (code) => {
+            const rewritten = rewriteReplSource(code);
+            const fn = new AsyncFunction(
+              "api",
+              "window",
+              "document",
+              `"use strict"; const { viewer, graph, resource, listIds, visibleIds, selectedIds, query, queryIds, ids, hide, show, select, resetVisibility, clearSelection, frame, frameVisible, hideQuery, showQuery, selectQuery } = api; return (async () => { ${rewritten} })();`
+            );
+            return fn(replApi, window, document);
+          },
+        });
+      }
+
+      function installEchoAgentTerminal() {
+        return installLineTerminal({
+          screenId: "repl-screen",
+          hostId: "agent-terminal",
+          introLines: [
+            "AI agent terminal placeholder.",
+            "For now this just echoes whatever you type so we can wire the second xterm cleanly.",
+            "Enter runs. Up/Down walks history. Ctrl+C clears the line.",
+          ],
+          execute: async (code) => `echo: ${code}`,
+        });
+      }
+
+      function installTerminalToolSelector(terminals) {
+        const buttons = Array.from(document.querySelectorAll("[data-terminal-tool]"));
+        const terminalMap = new Map(
+          terminals
+            .map((terminal) => [terminal.id, terminal.shell])
+            .filter((entry) => entry[1])
+        );
+        let activeTool = terminals.find((terminal) => terminal.defaultActive)?.id || terminals[0]?.id || null;
+
+        const setActiveTool = (nextTool) => {
+          if (!terminalMap.has(nextTool)) {
+            return;
+          }
+          activeTool = nextTool;
+          for (const [toolId, shell] of terminalMap.entries()) {
+            if (toolId === nextTool) {
+              shell.activate();
+            } else {
+              shell.deactivate();
+            }
+          }
+          for (const button of buttons) {
+            const active = button.dataset.terminalTool === nextTool;
+            button.classList.toggle("active", active);
+            button.setAttribute("aria-selected", String(active));
+          }
+        };
+
+        for (const button of buttons) {
+          button.addEventListener("click", () => {
+            setActiveTool(button.dataset.terminalTool);
+          });
+        }
+
+        if (activeTool) {
+          setActiveTool(activeTool);
+        }
+
+        return {
+          activeTool: () => activeTool,
+          resize: () => terminalMap.get(activeTool)?.resize(),
+          focus: () => terminalMap.get(activeTool)?.focus(),
+          setActiveTool,
         };
       }
 
@@ -3502,13 +3652,18 @@
           window.clearSelection = repl.clearSelection;
           window.frame = repl.frame;
           const replShell = installRepl(repl);
+          const agentShell = installEchoAgentTerminal();
+          const terminalShell = installTerminalToolSelector([
+            { id: "js", shell: replShell, defaultActive: true },
+            { id: "ai", shell: agentShell },
+          ]);
           installLayoutResizers({
             onSidePanelResize: () => {
               graphShell.resize();
               viewer.resizeViewport();
             },
             onTerminalResize: () => {
-              replShell?.resize();
+              terminalShell?.resize();
               viewer.resizeViewport();
             },
           });
