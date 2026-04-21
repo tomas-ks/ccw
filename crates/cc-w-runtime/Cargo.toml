@@ -1,0 +1,13 @@
+[package]
+name = "cc-w-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cc-w-render = { path = "../cc-w-render" }
+cc-w-scene = { path = "../cc-w-scene" }
+cc-w-types = { path = "../cc-w-types" }
+glam.workspace = true
+thiserror.workspace = true

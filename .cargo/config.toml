@@ -1,0 +1,5 @@
+[alias]
+check-all = "check --workspace"
+demo-native = "run -p cc-w-platform-native"
+demo-headless = "run -p cc-w-platform-headless --"
+snapshot-headless = "test -p cc-w-platform-headless --test snapshots -- --nocapture"

@@ -1,0 +1,17 @@
+# Rust build output
+/target/
+
+# Generated IFC / rendering artifacts
+/artifacts/
+/crates/cc-w-platform-headless/artifacts/
+/crates/cc-w-platform-web/artifacts/
+
+# Frontend dependencies
+/crates/cc-w-platform-web/web/node_modules/
+
+# macOS / editor noise
+.DS_Store
+**/.DS_Store
+*.swp
+*.swo
+*~

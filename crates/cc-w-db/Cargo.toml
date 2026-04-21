@@ -1,0 +1,11 @@
+[package]
+name = "cc-w-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cc-w-types = { path = "../cc-w-types" }
+glam.workspace = true
+thiserror.workspace = true

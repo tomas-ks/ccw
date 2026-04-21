@@ -1,0 +1,21 @@
+[package]
+name = "cc-w-platform-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cc-w-backend = { path = "../cc-w-backend" }
+cc-w-render = { path = "../cc-w-render" }
+cc-w-runtime = { path = "../cc-w-runtime" }
+cc-w-types = { path = "../cc-w-types" }
+cc-w-velr = { path = "../cc-w-velr" }
+bytemuck.workspace = true
+egui.workspace = true
+egui-winit.workspace = true
+glam.workspace = true
+pollster.workspace = true
+thiserror.workspace = true
+wgpu.workspace = true
+winit.workspace = true

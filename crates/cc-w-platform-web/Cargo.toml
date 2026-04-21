@@ -1,0 +1,54 @@
+[package]
+name = "cc-w-platform-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+native-server = []
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "cc-w-platform-web-server"
+path = "src/bin/server.rs"
+required-features = ["native-server"]
+
+[dependencies]
+cc-w-backend = { path = "../cc-w-backend" }
+cc-w-db = { path = "../cc-w-db" }
+cc-w-render = { path = "../cc-w-render" }
+cc-w-runtime = { path = "../cc-w-runtime" }
+cc-w-types = { path = "../cc-w-types" }
+glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wgpu.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cc-w-velr = { path = "../cc-w-velr" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+web-sys = { workspace = true, features = [
+    "CanvasRenderingContext2d",
+    "Document",
+    "Element",
+    "Event",
+    "EventTarget",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "HtmlSelectElement",
+    "Location",
+    "MouseEvent",
+    "RequestInit",
+    "Response",
+    "Node",
+    "WheelEvent",
+    "Window",
+    "console",
+] }

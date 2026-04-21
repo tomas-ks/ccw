@@ -1,0 +1,634 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>w web viewer</title>
+    <link rel="stylesheet" href="./vendor/xterm.css" />
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #0f1320;
+        color: #f3f6ff;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        background: #0f1320;
+        color: #f3f6ff;
+      }
+
+      .toolbar {
+        height: 56px;
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        padding: 0 16px;
+        background: #151b2a;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      }
+
+      .toolbar label {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 14px;
+        white-space: nowrap;
+      }
+
+      .toolbar select {
+        height: 32px;
+        min-width: 220px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 6px;
+        background: #0f1320;
+        color: inherit;
+        padding: 0 10px;
+        font: inherit;
+      }
+
+      .hint {
+        font-size: 13px;
+        color: rgba(243, 246, 255, 0.76);
+        white-space: nowrap;
+      }
+
+      .status {
+        min-width: 0;
+        flex: 1;
+        font-size: 13px;
+        color: rgba(243, 246, 255, 0.76);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .viewport {
+        position: relative;
+        flex: 1;
+        min-height: 320px;
+        background: #0f1320;
+      }
+
+      #viewer-canvas,
+      #axes-overlay {
+        position: absolute;
+        inset: 0;
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+
+      #viewer-canvas {
+        background: #0f1320;
+        touch-action: none;
+      }
+
+      #axes-overlay {
+        pointer-events: none;
+      }
+
+      .terminal {
+        height: 312px;
+        display: grid;
+        grid-template-rows: auto 1fr;
+        background: #090d15;
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+      }
+
+      .terminal-header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 16px 8px;
+        font-size: 12px;
+        color: rgba(243, 246, 255, 0.76);
+      }
+
+      .terminal-header strong {
+        color: #f3f6ff;
+        font-size: 13px;
+      }
+
+      .terminal-screen {
+        min-height: 0;
+        display: flex;
+        padding: 4px 16px 12px;
+      }
+
+      .terminal-host {
+        flex: 1;
+        height: 100%;
+        min-height: 0;
+        background: #090d15;
+        font: 12px/1.5 ui-monospace, SFMono-Regular, SF Mono, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      }
+
+      .terminal-host .xterm {
+        height: 100%;
+      }
+
+      .terminal-host .xterm-viewport {
+        overflow-y: auto !important;
+      }
+
+      .terminal-host .xterm-screen {
+        width: 100% !important;
+      }
+
+      .terminal-host .xterm .xterm-selection div {
+        border-radius: 2px;
+      }
+
+      @media (max-width: 900px) {
+        .toolbar {
+          height: auto;
+          min-height: 56px;
+          padding: 8px 12px;
+          flex-wrap: wrap;
+        }
+
+        .toolbar select {
+          min-width: 170px;
+        }
+
+        .terminal {
+          height: 264px;
+        }
+
+        .terminal-header {
+          align-items: flex-start;
+          flex-direction: column;
+          gap: 4px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="toolbar">
+      <label>
+        Resource
+        <select id="resource-picker"></select>
+      </label>
+      <div class="hint">Drag to orbit. Wheel to zoom.</div>
+      <div class="status" id="status-line">Starting w web viewer…</div>
+    </div>
+    <div class="viewport">
+      <canvas id="viewer-canvas"></canvas>
+      <canvas id="axes-overlay"></canvas>
+    </div>
+    <section class="terminal">
+      <div class="terminal-header">
+        <strong>JS</strong>
+        <span>Queries automatically target the currently selected IFC model. <code>ids(...)</code> returns raw IFC <code>GlobalId</code> values, so query results can be passed straight into <code>hide(...)</code>, <code>show(...)</code>, and <code>select(...)</code>.</span>
+      </div>
+      <div class="terminal-screen" id="repl-screen">
+        <div class="terminal-host" id="repl-terminal" aria-label="JavaScript terminal"></div>
+      </div>
+    </section>
+    <script type="module">
+      import { FitAddon } from "./vendor/addon-fit.mjs";
+      import { Terminal } from "./vendor/xterm.mjs";
+      import init, {
+        viewer_clear_selection,
+        viewer_current_resource,
+        viewer_frame_visible,
+        viewer_hide_elements,
+        viewer_list_element_ids,
+        viewer_reset_all_visibility,
+        viewer_reset_element_visibility,
+        viewer_select_elements,
+        viewer_selected_element_ids,
+        viewer_show_elements,
+        viewer_visible_element_ids,
+      } from "./pkg/cc_w_platform_web.js";
+
+      const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+      const REPL_GLOBAL_ASSIGN = /(^|[;{]\s*)(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=/gm;
+      const REPL_PROMPT = "w> ";
+
+      function createViewerApi() {
+        return {
+          currentResource: () => viewer_current_resource(),
+          listElementIds: () => Array.from(viewer_list_element_ids()),
+          visibleElementIds: () => Array.from(viewer_visible_element_ids()),
+          selectedElementIds: () => Array.from(viewer_selected_element_ids()),
+          hide: (ids) => viewer_hide_elements(ids),
+          show: (ids) => viewer_show_elements(ids),
+          resetVisibility: (ids) => viewer_reset_element_visibility(ids),
+          resetAllVisibility: () => viewer_reset_all_visibility(),
+          select: (ids) => viewer_select_elements(ids),
+          clearSelection: () => viewer_clear_selection(),
+          frameVisible: () => viewer_frame_visible(),
+          queryCypher: async (cypher, resource = viewer_current_resource()) => {
+            const response = await fetch("/api/cypher", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({ resource, cypher }),
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(payload.error || `Cypher query failed (${response.status})`);
+            }
+            return payload;
+          },
+          queryIds: async (cypher, resource = viewer_current_resource()) => {
+            const payload = await viewer.queryCypher(cypher, resource);
+            return Array.isArray(payload.semanticElementIds) ? payload.semanticElementIds : [];
+          },
+        };
+      }
+
+      function createReplApi(viewer) {
+        const currentIfcResource = (resource = viewer.currentResource()) => {
+          if (!resource || !resource.startsWith("ifc/")) {
+            throw new Error(`Current resource \`${resource}\` is not an IFC model.`);
+          }
+          return resource;
+        };
+
+        const api = {
+          viewer,
+          resource: () => viewer.currentResource(),
+          listIds: () => viewer.listElementIds(),
+          visibleIds: () => viewer.visibleElementIds(),
+          selectedIds: () => viewer.selectedElementIds(),
+          query: async (cypher, resource = currentIfcResource()) =>
+            viewer.queryCypher(cypher, resource),
+          queryIds: async (cypher, resource = currentIfcResource()) =>
+            viewer.queryIds(cypher, resource),
+          ids: async (cypher, resource = currentIfcResource()) =>
+            viewer.queryIds(cypher, resource),
+          hide: (ids) => viewer.hide(ids),
+          show: (ids) => viewer.show(ids),
+          select: (ids) => viewer.select(ids),
+          resetVisibility: (ids) =>
+            Array.isArray(ids) ? viewer.resetVisibility(ids) : viewer.resetAllVisibility(),
+          clearSelection: () => viewer.clearSelection(),
+          frame: () => viewer.frameVisible(),
+          frameVisible: () => viewer.frameVisible(),
+          hideQuery: async (cypher, resource = currentIfcResource()) => {
+            const ids = await api.queryIds(cypher, resource);
+            viewer.hide(ids);
+            return ids;
+          },
+          showQuery: async (cypher, resource = currentIfcResource()) => {
+            const ids = await api.queryIds(cypher, resource);
+            viewer.show(ids);
+            return ids;
+          },
+          selectQuery: async (cypher, resource = currentIfcResource()) => {
+            const ids = await api.queryIds(cypher, resource);
+            viewer.select(ids);
+            return ids;
+          },
+        };
+
+        return api;
+      }
+
+      function sanitizeTerminalText(text) {
+        return String(text).replace(/\x1b/g, "\\x1b");
+      }
+
+      function terminalWriteLine(term, text = "") {
+        term.writeln(sanitizeTerminalText(text));
+      }
+
+      function formatResult(value) {
+        if (value === undefined) {
+          return "undefined";
+        }
+        if (typeof value === "string") {
+          return value;
+        }
+        try {
+          return JSON.stringify(value, null, 2);
+        } catch (_error) {
+          return String(value);
+        }
+      }
+
+      function rewriteReplSource(source) {
+        return source
+          .replace(REPL_GLOBAL_ASSIGN, "$1globalThis.$2 =")
+          .replace(/(^|[=(,:]\s*|return\s+)ids\s*\(/gm, "$1await ids(")
+          .replace(/(^|[=(,:]\s*|return\s+)queryIds\s*\(/gm, "$1await queryIds(")
+          .replace(/(^|[=(,:]\s*|return\s+)query\s*\(/gm, "$1await query(")
+          .replace(/(^|[=(,:]\s*|return\s+)hideQuery\s*\(/gm, "$1await hideQuery(")
+          .replace(/(^|[=(,:]\s*|return\s+)showQuery\s*\(/gm, "$1await showQuery(")
+          .replace(/(^|[=(,:]\s*|return\s+)selectQuery\s*\(/gm, "$1await selectQuery(");
+      }
+
+      function installRepl(replApi) {
+        const screen = document.getElementById("repl-screen");
+        const host = document.getElementById("repl-terminal");
+        if (!screen || !host) {
+          return;
+        }
+
+        const term = new Terminal({
+          allowTransparency: false,
+          convertEol: true,
+          cursorBlink: true,
+          cursorStyle: "block",
+          fontFamily:
+            'ui-monospace, SFMono-Regular, SF Mono, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
+          fontSize: 12,
+          lineHeight: 1.35,
+          scrollback: 2000,
+          smoothScrollDuration: 0,
+          theme: {
+            background: "#090d15",
+            foreground: "#d7deee",
+            cursor: "#8db6ff",
+            cursorAccent: "#090d15",
+            selectionBackground: "rgba(141, 182, 255, 0.24)",
+            black: "#090d15",
+            red: "#ff9d8a",
+            green: "#8fe0a2",
+            yellow: "#f2c879",
+            blue: "#8db6ff",
+            magenta: "#d4a7ff",
+            cyan: "#7edfe6",
+            white: "#d7deee",
+            brightBlack: "#4e576c",
+            brightRed: "#ffb8aa",
+            brightGreen: "#a9efb9",
+            brightYellow: "#f7dca0",
+            brightBlue: "#abc8ff",
+            brightMagenta: "#dfbeff",
+            brightCyan: "#9be9ef",
+            brightWhite: "#f3f6ff",
+          },
+        });
+        const fitAddon = new FitAddon();
+        term.loadAddon(fitAddon);
+        term.open(host);
+
+        const fitTerminal = () => {
+          try {
+            fitAddon.fit();
+          } catch (_error) {
+            // Ignore pre-layout fit attempts; resize events will catch up.
+          }
+        };
+
+        if (typeof ResizeObserver !== "undefined") {
+          const resizeObserver = new ResizeObserver(() => fitTerminal());
+          resizeObserver.observe(host);
+        } else {
+          window.addEventListener("resize", fitTerminal);
+        }
+
+        requestAnimationFrame(() => {
+          fitTerminal();
+          term.focus();
+        });
+
+        terminalWriteLine(
+          term,
+          "resource(), query(...), ids(...), hide([...]), show([...]), select([...]), hideQuery(...), showQuery(...), selectQuery(...), frame()"
+        );
+        terminalWriteLine(
+          term,
+          "Example: var walls = ids(\"MATCH (w:IfcWall) RETURN w.GlobalId AS global_id LIMIT 8\"); hide(walls);"
+        );
+        terminalWriteLine(term, "Enter runs. Up/Down walks history. Ctrl+C clears the line.");
+        term.write("\r\n");
+
+        let running = false;
+        let currentLine = "";
+        let cursorIndex = 0;
+        const history = [];
+        let historyIndex = 0;
+        let historyDraft = "";
+
+        const setRunning = (next) => {
+          running = next;
+          screen.classList.toggle("running", next);
+        };
+
+        const renderPromptLine = () => {
+          term.write("\r\x1b[2K");
+          term.write(REPL_PROMPT);
+          if (currentLine.length) {
+            term.write(sanitizeTerminalText(currentLine));
+          }
+          const trailing = currentLine.length - cursorIndex;
+          if (trailing > 0) {
+            term.write(`\x1b[${trailing}D`);
+          }
+        };
+
+        const replaceCurrentLine = (next) => {
+          currentLine = next;
+          cursorIndex = currentLine.length;
+          renderPromptLine();
+        };
+
+        const showPrompt = () => {
+          renderPromptLine();
+        };
+
+        const moveHistory = (direction) => {
+          if (!history.length) {
+            return;
+          }
+
+          if (historyIndex === history.length) {
+            historyDraft = currentLine;
+          }
+          historyIndex = Math.max(0, Math.min(history.length, historyIndex + direction));
+          replaceCurrentLine(
+            historyIndex === history.length ? historyDraft : history[historyIndex]
+          );
+        };
+
+        const resetLineState = () => {
+          currentLine = "";
+          cursorIndex = 0;
+          historyIndex = history.length;
+          historyDraft = "";
+        };
+
+        const runCurrentCommand = async (code) => {
+          if (running) {
+            return;
+          }
+          if (!code.trim()) {
+            term.write("\r\n");
+            showPrompt();
+            return;
+          }
+
+          if (history[history.length - 1] !== code) {
+            history.push(code);
+          }
+          term.write("\r\n");
+          resetLineState();
+          setRunning(true);
+          try {
+            const rewritten = rewriteReplSource(code);
+            const fn = new AsyncFunction(
+              "api",
+              "window",
+              "document",
+              `"use strict"; const { viewer, resource, listIds, visibleIds, selectedIds, query, queryIds, ids, hide, show, select, resetVisibility, clearSelection, frame, frameVisible, hideQuery, showQuery, selectQuery } = api; return (async () => { ${rewritten} })();`
+            );
+            const result = await fn(replApi, window, document);
+            terminalWriteLine(term, formatResult(result ?? "ok"));
+          } catch (error) {
+            terminalWriteLine(term, String(error));
+            console.error(error);
+          } finally {
+            setRunning(false);
+            showPrompt();
+            term.focus();
+          }
+        };
+
+        term.onData((data) => {
+          if (data === "\u001b[A" || data === "\u001bOA") {
+            moveHistory(-1);
+            return;
+          }
+          if (data === "\u001b[B" || data === "\u001bOB") {
+            moveHistory(1);
+            return;
+          }
+
+          if (running) {
+            return;
+          }
+
+          if (data === "\r") {
+            void runCurrentCommand(currentLine);
+            return;
+          }
+
+          if (data === "\u0003") {
+            term.write("\r\x1b[2K");
+            term.write(`${REPL_PROMPT}${sanitizeTerminalText(currentLine)}^C\r\n`);
+            resetLineState();
+            showPrompt();
+            return;
+          }
+
+          if (data === "\u0001" || data === "\u001b[H" || data === "\u001bOH") {
+            cursorIndex = 0;
+            renderPromptLine();
+            return;
+          }
+
+          if (data === "\u0005" || data === "\u001b[F" || data === "\u001bOF") {
+            cursorIndex = currentLine.length;
+            renderPromptLine();
+            return;
+          }
+
+          if (data === "\u001b[D" || data === "\u001bOD") {
+            if (cursorIndex > 0) {
+              cursorIndex -= 1;
+              renderPromptLine();
+            }
+            return;
+          }
+
+          if (data === "\u001b[C" || data === "\u001bOC") {
+            if (cursorIndex < currentLine.length) {
+              cursorIndex += 1;
+              renderPromptLine();
+            }
+            return;
+          }
+
+          if (data === "\u007F") {
+            if (cursorIndex > 0) {
+              currentLine =
+                currentLine.slice(0, cursorIndex - 1) + currentLine.slice(cursorIndex);
+              cursorIndex -= 1;
+              renderPromptLine();
+            }
+            return;
+          }
+
+          if (data === "\u001b[3~") {
+            if (cursorIndex < currentLine.length) {
+              currentLine =
+                currentLine.slice(0, cursorIndex) + currentLine.slice(cursorIndex + 1);
+              renderPromptLine();
+            }
+            return;
+          }
+
+          for (const ch of data) {
+            if (ch === "\n") {
+              continue;
+            }
+            if (ch === "\r") {
+              void runCurrentCommand(currentLine);
+              return;
+            }
+            if (ch < " " && ch !== "\t") {
+              continue;
+            }
+            currentLine =
+              currentLine.slice(0, cursorIndex) + ch + currentLine.slice(cursorIndex);
+            cursorIndex += ch.length;
+            renderPromptLine();
+          }
+        });
+
+        term.onKey(() => {
+          if (document.activeElement !== term.textarea) {
+            term.focus();
+          }
+        });
+
+        host.addEventListener("click", () => term.focus());
+        showPrompt();
+      }
+
+      init().then(() => {
+        const viewer = createViewerApi();
+        const repl = createReplApi(viewer);
+        window.wViewer = viewer;
+        window.viewer = viewer;
+        window.query = repl.query;
+        window.queryIds = repl.queryIds;
+        window.ids = repl.ids;
+        window.hideQuery = repl.hideQuery;
+        window.showQuery = repl.showQuery;
+        window.selectQuery = repl.selectQuery;
+        window.resource = repl.resource;
+        window.listIds = repl.listIds;
+        window.visibleIds = repl.visibleIds;
+        window.selectedIds = repl.selectedIds;
+        window.hide = repl.hide;
+        window.show = repl.show;
+        window.select = repl.select;
+        window.resetVisibility = repl.resetVisibility;
+        window.clearSelection = repl.clearSelection;
+        window.frame = repl.frame;
+        installRepl(repl);
+      }).catch((error) => {
+        const status = document.getElementById("status-line");
+        if (status) {
+          status.textContent = `w web viewer failed: ${error}`;
+        }
+        console.error(error);
+      });
+    </script>
+  </body>
+</html>

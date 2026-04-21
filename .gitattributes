@@ -1,0 +1,1 @@
+fixtures/ifc/openifcmodel-20210219-architecture.ifc filter=lfs diff=lfs merge=lfs -text

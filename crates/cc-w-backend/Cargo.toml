@@ -1,0 +1,14 @@
+[package]
+name = "cc-w-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cc-w-db = { path = "../cc-w-db" }
+cc-w-kernel = { path = "../cc-w-kernel" }
+cc-w-prepare = { path = "../cc-w-prepare" }
+cc-w-types = { path = "../cc-w-types" }
+glam.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "cc-w-platform-headless"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+cc-w-backend = { path = "../cc-w-backend" }
+cc-w-render = { path = "../cc-w-render" }
+cc-w-runtime = { path = "../cc-w-runtime" }
+cc-w-types = { path = "../cc-w-types" }
+cc-w-velr = { path = "../cc-w-velr" }
+glam.workspace = true
+png.workspace = true
+pollster.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+cc-w-db = { path = "../cc-w-db" }
+cc-w-kernel = { path = "../cc-w-kernel" }
+cc-w-prepare = { path = "../cc-w-prepare" }

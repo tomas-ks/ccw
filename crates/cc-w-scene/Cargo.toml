@@ -1,0 +1,12 @@
+[package]
+name = "cc-w-scene"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cc-w-types = { path = "../cc-w-types" }
+glam.workspace = true
+slotmap.workspace = true
+smallvec.workspace = true

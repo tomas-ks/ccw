@@ -1,0 +1,18 @@
+[package]
+name = "cc-w-velr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cc-w-backend = { path = "../cc-w-backend" }
+cc-w-db = { path = "../cc-w-db" }
+cc-w-types = { path = "../cc-w-types" }
+glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+velr.workspace = true
+velr-graphql-core.workspace = true
+velr-graphql-managed.workspace = true
