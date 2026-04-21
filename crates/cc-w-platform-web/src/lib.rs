@@ -609,6 +609,16 @@ pub fn viewer_frame_visible() -> Result<(), JsValue> {
 }
 
 #[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_resize_viewport() -> Result<(), JsValue> {
+    with_web_viewer_state_mut(|state| {
+        state.resize_to_window()?;
+        state.render()?;
+        Ok(())
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(start)]
 pub fn start() {
     spawn_local(async {
