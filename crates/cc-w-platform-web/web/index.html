@@ -483,6 +483,7 @@
         min-width: 0;
         display: grid;
         grid-template-columns: 40px 1fr;
+        grid-template-rows: minmax(0, 1fr) auto;
         gap: 8px;
         flex: 1;
         overflow: hidden;
@@ -492,6 +493,7 @@
 
       .terminal-side {
         min-height: 0;
+        grid-row: 1 / span 2;
         display: flex;
         flex-direction: column;
         align-items: stretch;
@@ -503,6 +505,8 @@
 
       .terminal-host {
         position: relative;
+        grid-column: 2;
+        grid-row: 1;
         min-width: 0;
         min-height: 0;
         overflow: hidden;
@@ -513,6 +517,45 @@
 
       .terminal-host.active {
         display: block;
+      }
+
+      .agent-capability-controls {
+        grid-column: 2;
+        grid-row: 2;
+        min-height: 24px;
+        display: none;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 8px;
+        color: rgba(243, 246, 255, 0.52);
+        font: 11px/1.2 ui-monospace, SFMono-Regular, SF Mono, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      }
+
+      #agent-terminal.active ~ .agent-capability-controls {
+        display: flex;
+      }
+
+      .agent-capability-controls label {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        white-space: nowrap;
+      }
+
+      .agent-capability-controls select {
+        height: 22px;
+        max-width: 190px;
+        border: 1px solid rgba(141, 182, 255, 0.2);
+        border-radius: 6px;
+        background: #101622;
+        color: rgba(243, 246, 255, 0.78);
+        font: inherit;
+        padding: 0 20px 0 6px;
+      }
+
+      .agent-capability-controls select:disabled {
+        color: rgba(243, 246, 255, 0.36);
+        border-color: rgba(255, 255, 255, 0.08);
       }
 
       .terminal-host .xterm {
@@ -716,6 +759,20 @@
         </div>
         <div class="terminal-host active" id="repl-terminal" aria-label="JavaScript terminal"></div>
         <div class="terminal-host" id="agent-terminal" aria-label="AI agent terminal"></div>
+        <div class="agent-capability-controls" id="agent-capability-controls" aria-label="AI model controls">
+          <label>
+            Model
+            <select id="agent-model-select" disabled>
+              <option value="">loading</option>
+            </select>
+          </label>
+          <label>
+            Level
+            <select id="agent-level-select" disabled>
+              <option value="">loading</option>
+            </select>
+          </label>
+        </div>
       </div>
     </section>
     <script src="./vendor/graphology.js"></script>
@@ -755,7 +812,7 @@
 
       const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
       const REPL_GLOBAL_ASSIGN = /(^|[;{]\s*)(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=/gm;
-      const REPL_PROMPT = "w> ";
+      const REPL_PROMPT_TEXT = "W> ";
       const GRAPH_REPL_CALLS = [
         "reset",
         "expandSelected",
@@ -770,6 +827,15 @@
         graphology: ["./vendor/graphology.mjs", "./vendor/graphology.js"],
       };
       const TERMINAL_SURFACE_BACKGROUND = "#0c1018";
+      const TERMINAL_NO_RESULT = Symbol("terminal-no-result");
+      const TERMINAL_ACCENT_RGB = [230, 93, 71];
+      const TERMINAL_PROMPT_BLUE_RGB = [141, 182, 255];
+      const TERMINAL_MUTED_RGB = [160, 168, 184];
+      const TERMINAL_SOFT_RGB = [191, 198, 214];
+      const TERMINAL_QUERY_RGB = [150, 190, 255];
+      const TERMINAL_SUCCESS_RGB = [143, 224, 162];
+      const TERMINAL_WARNING_RGB = [242, 200, 121];
+      const TERMINAL_ACTIVITY_FRAMES = ["|", "/", "-", "\\"];
       const GRAPH_EDGE_LABEL_MAX_RATIO = 0.95;
       const GRAPH_NODE_NAME_MAX_RATIO = 0.58;
       const GRAPH_NODE_FORCE_LABEL_MAX_RATIO = 1.05;
@@ -844,6 +910,28 @@
             }
             return payload;
           },
+          queryGraphNodeProperties: async (
+            dbNodeId,
+            options = {},
+            resource = viewer_current_resource()
+          ) => {
+            const response = await fetch("/api/graph/node-properties", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                resource,
+                dbNodeId,
+                maxRelations: options.maxRelations,
+              }),
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(payload.error || `Node property query failed (${response.status})`);
+            }
+            return payload;
+          },
         };
         return api;
       }
@@ -856,12 +944,76 @@
         }
       }
 
+      function isIfcResource(resource) {
+        return typeof resource === "string" && resource.startsWith("ifc/");
+      }
+
+      function selectedIfcResource(viewer, explicitResource) {
+        if (isIfcResource(explicitResource)) {
+          return explicitResource;
+        }
+        const pickerValue = document.getElementById("resource-picker")?.value;
+        if (isIfcResource(pickerValue)) {
+          return pickerValue;
+        }
+        const viewerResource = safeViewerCurrentResource(viewer);
+        return isIfcResource(viewerResource) ? viewerResource : null;
+      }
+
+      async function postJson(url, payload) {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(body.error || `${url} failed (${response.status})`);
+        }
+        return body;
+      }
+
+      async function getJson(url) {
+        const response = await fetch(url);
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(body.error || `${url} failed (${response.status})`);
+        }
+        return body;
+      }
+
+      function sleep(ms) {
+        return new Promise((resolve) => window.setTimeout(resolve, ms));
+      }
+
       function sanitizeTerminalText(text) {
         return String(text).replace(/\x1b/g, "\\x1b");
       }
 
+      function terminalAnsiRgb([r, g, b]) {
+        return `\x1b[38;2;${r};${g};${b}m`;
+      }
+
+      function terminalAnsiWrap(text, rgb, { bold = false, dim = false } = {}) {
+        const open = `${bold ? "\x1b[1m" : ""}${dim ? "\x1b[2m" : ""}${terminalAnsiRgb(rgb)}`;
+        return `${open}${sanitizeTerminalText(text)}\x1b[0m`;
+      }
+
+      function terminalPromptMarkup() {
+        return (
+          `\x1b[1m${terminalAnsiRgb(TERMINAL_ACCENT_RGB)}W\x1b[0m` +
+          `${terminalAnsiRgb(TERMINAL_PROMPT_BLUE_RGB)}>\x1b[0m `
+        );
+      }
+
+      function terminalWriteRawLine(term, text = "") {
+        term.writeln(String(text));
+      }
+
       function terminalWriteLine(term, text = "") {
-        term.writeln(sanitizeTerminalText(text));
+        terminalWriteRawLine(term, sanitizeTerminalText(text));
       }
 
       function clamp(value, min, max) {
@@ -2703,6 +2855,24 @@
             }
             return node;
           },
+          setNodeDetails(nodeId, details = {}) {
+            const key = String(nodeId);
+            const node = state.nodesById.get(key);
+            if (!node) {
+              return null;
+            }
+            node.properties = {
+              ...(node.properties || {}),
+              ...(details.properties || {}),
+            };
+            if (Array.isArray(details.relations)) {
+              node.relations = mergeGraphRelations(node.relations, details.relations);
+            }
+            if (state.selectedNodeId === key) {
+              renderProperties();
+            }
+            return node;
+          },
           setStatus,
           clear(options = {}) {
             state.nodes = [];
@@ -2976,6 +3146,7 @@
             setData: api.setData,
             setSelectedNode: api.setSelectedNode,
             setNodeProperties: api.setNodeProperties,
+            setNodeDetails: api.setNodeDetails,
             setStatus: api.setStatus,
             clear: api.clear,
             snapshot: api.snapshot,
@@ -3229,6 +3400,1048 @@
         return api;
       }
 
+      function extractAgentSessionId(payload) {
+        const value = tryGetFirst(payload, ["sessionId", "id"]);
+        return value === null || value === undefined ? null : String(value);
+      }
+
+      function extractAgentSchemaId(payload) {
+        const value = tryGetFirst(payload, ["schemaId", "schema_id"]);
+        return typeof value === "string" && value.trim() ? value.trim() : null;
+      }
+
+      function extractAgentSchemaSlug(payload) {
+        const value = tryGetFirst(payload, ["schemaSlug", "schema_slug"]);
+        return typeof value === "string" && value.trim() ? value.trim() : null;
+      }
+
+      function extractAgentTranscriptItems(payload) {
+        const items = tryGetFirst(payload, ["transcript", "events", "items"]);
+        if (Array.isArray(items)) {
+          return items.map((item) =>
+            item && typeof item === "object" && item.item !== undefined ? item.item : item
+          );
+        }
+        const message = tryGetFirst(payload, ["message", "notice"]);
+        return typeof message === "string" && message.trim() ? [{ kind: "notice", text: message }] : [];
+      }
+
+      function isAgentTranscriptReplayMetaText(text) {
+        const lowered = String(text || "").trim().toLowerCase();
+        return (
+          lowered.startsWith("thinking about the request.") ||
+          lowered.startsWith("opencode progress:") ||
+          lowered.startsWith("ai session bound to ") ||
+          lowered.startsWith("ai context switched to ") ||
+          lowered.startsWith("ai context cleared.")
+        );
+      }
+
+      function tryParseJsonText(text) {
+        if (typeof text !== "string") {
+          return null;
+        }
+        const trimmed = text.trim();
+        if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+          return null;
+        }
+        try {
+          return JSON.parse(trimmed);
+        } catch (_error) {
+          return null;
+        }
+      }
+
+      function isJsonLikeText(text) {
+        const trimmed = String(text || "").trim();
+        return trimmed.startsWith("{") || trimmed.startsWith("[");
+      }
+
+      function countRowsLikeResult(value) {
+        if (!value || typeof value !== "object") {
+          return null;
+        }
+        const rows = tryGetFirst(value, ["rows", "items", "results"]);
+        return Array.isArray(rows) ? rows.length : null;
+      }
+
+      function summarizeAgentToolResult(toolName, item) {
+        const normalizedToolName = String(toolName || "tool").trim() || "tool";
+        const text = agentTextFromItem(item);
+        const result = tryGetFirst(item, ["result", "output", "data", "response"]);
+        const resultObject = result && typeof result === "object" ? result : null;
+
+        if (isCypherToolName(normalizedToolName)) {
+          const rowCount =
+            countRowsLikeResult(resultObject) ??
+            countRowsLikeResult(tryParseJsonText(text || ""));
+          if (typeof rowCount === "number") {
+            return `Read-only Cypher returned ${rowCount} row${rowCount === 1 ? "" : "s"}.`;
+          }
+          return "Read-only Cypher completed.";
+        }
+
+        if (normalizedToolName === "ifc_schema_context" && resultObject) {
+          const schemaId =
+            tryGetFirst(resultObject, ["schemaId", "schema_id"]) || "schema context";
+          const cautions = Array.isArray(resultObject.cautions) ? resultObject.cautions.length : 0;
+          const queryHabits = Array.isArray(resultObject.queryHabits)
+            ? resultObject.queryHabits.length
+            : 0;
+          const playbooks = resultObject.queryPlaybooks &&
+            typeof resultObject.queryPlaybooks === "object"
+            ? Object.keys(resultObject.queryPlaybooks).length
+            : 0;
+          return `${schemaId} loaded with ${cautions} caution${cautions === 1 ? "" : "s"}, ${queryHabits} query habit${queryHabits === 1 ? "" : "s"}, ${playbooks} playbook${playbooks === 1 ? "" : "s"}`;
+        }
+
+        if (normalizedToolName === "ifc_model_details" && resultObject) {
+          const summary = tryGetFirst(resultObject, ["summary", "message", "text"]);
+          if (typeof summary === "string" && summary.trim()) {
+            return summary.trim();
+          }
+        }
+
+        const rowCount = countRowsLikeResult(resultObject);
+        if (typeof rowCount === "number") {
+          return `Result from \`${normalizedToolName}\`: returned ${rowCount} item${
+            rowCount === 1 ? "" : "s"
+          }.`;
+        }
+
+        if (typeof text === "string" && text.trim() && !isJsonLikeText(text)) {
+          return text.trim();
+        }
+
+        return `Result from \`${normalizedToolName}\`: completed.`;
+      }
+
+      function compactAgentTranscriptItems(items) {
+        if (!Array.isArray(items) || !items.length) {
+          return [];
+        }
+
+        const conclusion = [...items].reverse().find((item) => {
+          const text = agentTextFromItem(item);
+          const kind = String(tryGetFirst(item, ["kind", "type", "event"]) || "text").toLowerCase();
+          return (
+            text &&
+            (kind === "assistant" || kind === "message" || kind === "notice" || kind === "info") &&
+            !isAgentTranscriptReplayMetaText(text)
+          );
+        });
+
+        const summary = [...items].reverse().find((item) => {
+          const text = agentTextFromItem(item);
+          const kind = String(tryGetFirst(item, ["kind", "type", "event"]) || "text").toLowerCase();
+          if (!text) {
+            return false;
+          }
+          if (kind !== "assistant" && kind !== "system") {
+            return false;
+          }
+          const lowered = text.trim().toLowerCase();
+          return (
+            lowered.startsWith("prepared ") ||
+            lowered.startsWith("completed ") ||
+            lowered.startsWith("applied:")
+          );
+        });
+
+        const compacted = [];
+        if (conclusion) {
+          compacted.push(conclusion);
+        }
+        if (summary && summary !== conclusion) {
+          compacted.push(summary);
+        }
+        if (compacted.length > 0) {
+          return compacted;
+        }
+
+        const lastItem = items[items.length - 1];
+        const lastText = agentTextFromItem(lastItem);
+        if (
+          lastText &&
+          /^(ai session bound to |ai context switched to |ai context cleared\.)/i.test(
+            lastText.trim()
+          )
+        ) {
+          return [lastItem];
+        }
+
+        return [];
+      }
+
+      function extractAgentTurnId(payload) {
+        const value = tryGetFirst(payload, ["turnId", "id"]);
+        return value === null || value === undefined ? null : String(value);
+      }
+
+      function extractAgentTurnResult(payload) {
+        const result = tryGetFirst(payload, ["result"]);
+        return result && typeof result === "object" ? result : null;
+      }
+
+      function extractAgentTurnError(payload) {
+        const error = tryGetFirst(payload, ["error"]);
+        return typeof error === "string" && error.trim() ? error.trim() : null;
+      }
+
+      function formatTerminalErrorMessage(error) {
+        if (error && typeof error === "object" && typeof error.message === "string") {
+          const message = error.message.trim();
+          if (message) {
+            return message;
+          }
+        }
+        return String(error);
+      }
+
+      function extractAgentActions(payload) {
+        const actions = tryGetFirst(payload, ["actions", "uiActions", "commands"]);
+        return Array.isArray(actions) ? actions : [];
+      }
+
+      function agentTextFromItem(item) {
+        if (typeof item === "string") {
+          return item;
+        }
+        if (!item || typeof item !== "object") {
+          return null;
+        }
+        const text = tryGetFirst(item, ["text", "message", "content", "summary"]);
+        if (typeof text === "string" && text.trim()) {
+          return text.trim();
+        }
+        return null;
+      }
+
+      function looksLikeCypherLine(text) {
+        return /^(MATCH|RETURN|WHERE|WITH|UNION|ORDER BY|LIMIT|OPTIONAL MATCH|CALL|UNWIND)\b/i.test(
+          String(text || "").trim()
+        );
+      }
+
+      function renderAgentTranscriptItems(shell, items) {
+        if (!shell || !Array.isArray(items) || !items.length) {
+          return;
+        }
+
+        const stopLiveStatus =
+          typeof shell.stopLiveStatus === "function"
+            ? (options) => shell.stopLiveStatus(options)
+            : () => {};
+        const writeRawLine =
+          typeof shell.writeRawLine === "function"
+            ? (text) => shell.writeRawLine(text)
+            : (text) => shell.writeLine(text);
+        const writeBlankLine =
+          typeof shell.writeBlankLine === "function"
+            ? () => shell.writeBlankLine()
+            : () => shell.writeLine("");
+        const startLiveStatus =
+          typeof shell.startLiveStatus === "function"
+            ? (label, options) => shell.startLiveStatus(label, options)
+            : () => {};
+
+        const state = (shell.__agentRenderState ||= {
+          lastBlock: null,
+        });
+
+        const ensureBlock = (nextBlock) => {
+          if (state.lastBlock && state.lastBlock !== nextBlock) {
+            writeBlankLine();
+          }
+          state.lastBlock = nextBlock;
+        };
+
+        const startMetaStatus = (label, options = {}) => {
+          ensureBlock("meta");
+          startLiveStatus(label, options);
+        };
+
+        const writeMuted = (text) => {
+          ensureBlock("meta");
+          writeRawLine(
+            terminalAnsiWrap(text, TERMINAL_MUTED_RGB, {
+              dim: true,
+            })
+          );
+        };
+
+        const writeWarning = (text) => {
+          ensureBlock("warning");
+          writeRawLine(
+            terminalAnsiWrap(text, TERMINAL_WARNING_RGB, {
+              bold: true,
+            })
+          );
+        };
+
+        const writeSuccess = (text) => {
+          ensureBlock("success");
+          writeRawLine(
+            terminalAnsiWrap(text, TERMINAL_SUCCESS_RGB, {
+              bold: true,
+            })
+          );
+        };
+
+        const writeAssistant = (text) => {
+          ensureBlock("assistant");
+          const lines = String(text).split(/\r?\n/);
+          for (const line of lines) {
+            if (!line.trim()) {
+              writeBlankLine();
+              continue;
+            }
+            writeRawLine(sanitizeTerminalText(line));
+          }
+        };
+
+        const writeToolBlock = (text) => {
+          const lines = String(text || "")
+            .split(/\r?\n/)
+            .map((line) => line.trimEnd());
+          if (!lines.length) {
+            return;
+          }
+
+          ensureBlock("tool");
+
+          let queryStart = lines.findIndex((line) => looksLikeCypherLine(line) || line === "Cypher:");
+          if (queryStart > 0 && lines[queryStart] === "Cypher:") {
+            writeRawLine(
+              terminalAnsiWrap(`[tool] ${lines[0]}`, TERMINAL_MUTED_RGB, { dim: true })
+            );
+            for (const line of lines.slice(queryStart + 1)) {
+              if (!line.trim()) {
+                continue;
+              }
+              writeRawLine(
+                `${terminalAnsiWrap("    ", TERMINAL_QUERY_RGB)}${terminalAnsiWrap(
+                  line,
+                  TERMINAL_QUERY_RGB
+                )}`
+              );
+            }
+            return;
+          }
+
+          if (queryStart > 0) {
+            writeRawLine(
+              terminalAnsiWrap(`[tool] ${lines[0]}`, TERMINAL_MUTED_RGB, { dim: true })
+            );
+            for (const line of lines.slice(queryStart)) {
+              if (!line.trim()) {
+                continue;
+              }
+              writeRawLine(
+                `${terminalAnsiWrap("    ", TERMINAL_QUERY_RGB)}${terminalAnsiWrap(
+                  line,
+                  TERMINAL_QUERY_RGB
+                )}`
+              );
+            }
+            return;
+          }
+
+          writeRawLine(
+            terminalAnsiWrap(`[tool] ${lines[0]}`, TERMINAL_MUTED_RGB, { dim: true })
+          );
+          for (const line of lines.slice(1)) {
+            if (!line.trim()) {
+              continue;
+            }
+            writeRawLine(
+              terminalAnsiWrap(`       ${line}`, TERMINAL_SOFT_RGB, { dim: true })
+            );
+          }
+        };
+
+        for (const item of items) {
+          if (typeof item === "string") {
+            stopLiveStatus({ persist: false });
+            writeAssistant(item);
+            continue;
+          }
+          if (!item || typeof item !== "object") {
+            stopLiveStatus({ persist: false });
+            writeAssistant(String(item));
+            continue;
+          }
+
+          const kind = String(tryGetFirst(item, ["kind", "type", "event"]) || "text").toLowerCase();
+          const text = agentTextFromItem(item);
+          if (kind === "cypher" || kind === "query") {
+            const query = tryGetFirst(item, ["cypher", "query"]) || text;
+            if (query) {
+              stopLiveStatus({ persist: false });
+              writeToolBlock(`Cypher:\n${query}`);
+            }
+            continue;
+          }
+          if (kind === "tool" || kind === "tool_call") {
+            stopLiveStatus({ persist: false });
+            const toolName = tryGetFirst(item, ["name", "tool", "toolName"]);
+            const input = tryGetFirst(item, ["input", "args", "arguments"]);
+            if (text) {
+              writeToolBlock(text);
+            } else {
+              writeToolBlock(
+                input
+                  ? `${toolName || "tool"}\n${formatResult(input)}`
+                  : String(toolName || "tool")
+              );
+            }
+            continue;
+          }
+          if (kind === "tool_result") {
+            stopLiveStatus({ persist: false });
+            const toolName = tryGetFirst(item, ["name", "tool", "toolName"]) || "tool result";
+            writeMuted(`${toolName}: ${summarizeAgentToolResult(toolName, item)}`);
+            continue;
+          }
+          if (kind === "error") {
+            stopLiveStatus({ persist: false });
+            writeWarning(text || formatResult(item));
+            continue;
+          }
+          if (kind === "notice" || kind === "info") {
+            stopLiveStatus({ persist: false });
+            writeMuted(text || formatResult(item));
+            continue;
+          }
+          if (kind === "system") {
+            if (text && /^thinking about the request\.?$/i.test(text.trim())) {
+              startMetaStatus("Thinking about the request");
+              continue;
+            }
+            if (text && /^opencode progress:/i.test(text.trim())) {
+              const progressText = text.trim().replace(/^opencode progress:\s*/i, "");
+              const label = progressText ? `Progress: ${progressText}` : "Progress";
+              startMetaStatus(label.length > 120 ? `${label.slice(0, 117)}...` : label);
+              continue;
+            }
+            stopLiveStatus({ persist: false });
+            writeMuted(text || formatResult(item));
+            continue;
+          }
+          if (kind === "assistant" || kind === "message") {
+            if (text) {
+              if (/^preparing \d+ viewer action/i.test(text)) {
+                startMetaStatus(text, { persistOnStop: true });
+              } else if (/^prepared \d+ validated ui action/i.test(text) || /^completed \d+ read-only cypher quer/i.test(text)) {
+                stopLiveStatus({ persist: false });
+                writeMuted(text);
+              } else if (/^applied:/i.test(text)) {
+                stopLiveStatus({ persist: false });
+                writeSuccess(text);
+              } else {
+                stopLiveStatus({ persist: false });
+                writeAssistant(text);
+              }
+            } else {
+              stopLiveStatus({ persist: false });
+            }
+            continue;
+          }
+          if (kind === "action") {
+            stopLiveStatus({ persist: false });
+            const actionKind = tryGetFirst(item, ["actionKind", "name", "label"]) || "action";
+            writeSuccess(text ? `${actionKind}: ${text}` : String(actionKind));
+            continue;
+          }
+          stopLiveStatus({ persist: false });
+          writeAssistant(text || formatResult(item));
+        }
+      }
+
+      function agentSemanticIds(action) {
+        const candidates = tryGetFirst(action, [
+          "semanticIds",
+          "semantic_ids",
+          "ids",
+          "elementIds",
+          "element_ids",
+        ]);
+        if (!Array.isArray(candidates)) {
+          return [];
+        }
+        return Array.from(
+          new Set(
+            candidates
+              .map((value) => String(value || "").trim())
+              .filter(Boolean)
+          )
+        );
+      }
+
+      function agentDbNodeIds(action) {
+        const candidates = tryGetFirst(action, [
+          "dbNodeIds",
+          "db_node_ids",
+          "dbNodeId",
+          "db_node_id",
+          "nodeIds",
+          "node_ids",
+          "nodeId",
+          "id",
+          "ids",
+        ]);
+        const values = Array.isArray(candidates) ? candidates : candidates === undefined ? [] : [candidates];
+        if (!values.length) {
+          return [];
+        }
+        return Array.from(
+          new Set(
+            values
+              .map((value) => Number.parseInt(String(value ?? ""), 10))
+              .filter((value) => Number.isFinite(value))
+          )
+        );
+      }
+
+      async function applyAgentAction(action, viewer, graph) {
+        if (!action || typeof action !== "object") {
+          return null;
+        }
+        const kind = String(tryGetFirst(action, ["kind", "type", "name"]) || "").toLowerCase();
+        if (!kind) {
+          return null;
+        }
+
+        if (kind === "graph.set_seeds" || kind === "graph.setseeds") {
+          const dbNodeIds = agentDbNodeIds(action);
+          const resource = safeViewerCurrentResource(viewer);
+          if (!dbNodeIds.length || !isIfcResource(resource)) {
+            return null;
+          }
+          const snapshot = await graph.snapshot();
+          const payload = await viewer.queryGraphSubgraph(
+            dbNodeIds,
+            {
+              hops: 1,
+              maxNodes: 120,
+              maxEdges: 240,
+              mode: snapshot?.mode || "semantic",
+            },
+            resource
+          );
+          graph.setData(
+            mapGraphSubgraphResponse(payload, {
+              status:
+                tryGetFirst(action, ["status", "message"]) ||
+                `Graph set from AI with ${dbNodeIds.length} seed node${dbNodeIds.length === 1 ? "" : "s"} in ${resource}${payload?.truncated ? " (truncated)" : ""}.`,
+            })
+          );
+          return "graph.set_seeds";
+        }
+
+        if (kind === "graph.expand") {
+          const dbNodeIds = agentDbNodeIds(action);
+          const resource = safeViewerCurrentResource(viewer);
+          if (!dbNodeIds.length || !isIfcResource(resource)) {
+            return null;
+          }
+          const snapshot = await graph.snapshot();
+          const payload = await viewer.queryGraphSubgraph(
+            dbNodeIds,
+            {
+              hops: 1,
+              maxNodes: 120,
+              maxEdges: 240,
+              mode: snapshot?.mode || "semantic",
+            },
+            resource
+          );
+          graph.mergeData(
+            mapGraphSubgraphResponse(payload, {
+              selectedNodeId: String(dbNodeIds[0]),
+              status:
+                tryGetFirst(action, ["status", "message"]) ||
+                `Graph expanded from AI around ${dbNodeIds.length} node${dbNodeIds.length === 1 ? "" : "s"} in ${resource}${payload?.truncated ? " (truncated)" : ""}.`,
+            })
+          );
+          return "graph.expand";
+        }
+
+        if (kind === "properties.show_node" || kind === "properties.shownode") {
+          const dbNodeIds = agentDbNodeIds(action);
+          const resource = safeViewerCurrentResource(viewer);
+          if (!dbNodeIds.length || !isIfcResource(resource)) {
+            return null;
+          }
+          const dbNodeId = dbNodeIds[0];
+          let selected = graph.setSelectedNode(String(dbNodeId), { revealProperties: true });
+          if (!selected) {
+            const snapshot = await graph.snapshot();
+            const payload = await viewer.queryGraphSubgraph(
+              [dbNodeId],
+              {
+                hops: 1,
+                maxNodes: 32,
+                maxEdges: 64,
+                mode: snapshot?.mode || "semantic",
+              },
+              resource
+            );
+            graph.mergeData(
+              mapGraphSubgraphResponse(payload, {
+                selectedNodeId: String(dbNodeId),
+                status:
+                  tryGetFirst(action, ["status", "message"]) ||
+                  `Graph loaded around node ${dbNodeId} for property inspection in ${resource}${payload?.truncated ? " (truncated)" : ""}.`,
+              })
+            );
+          }
+          const details = await viewer.queryGraphNodeProperties(dbNodeId, {}, resource);
+          graph.setNodeDetails(dbNodeId, {
+            properties: {
+              extraProperties: details?.properties || {},
+            },
+            relations: Array.isArray(details?.relations)
+              ? details.relations.map((relation) => {
+                  const other = relation?.other || {};
+                  return {
+                    type: relation.relationshipType || relation.type || "RELATION",
+                    target: String(
+                      tryGetFirst(other, ["dbNodeId", "db_node_id", "id"]) || ""
+                    ),
+                    targetLabel:
+                      tryGetFirst(other, [
+                        "displayLabel",
+                        "display_label",
+                        "name",
+                        "declaredEntity",
+                        "declared_entity",
+                      ]) || "",
+                    description: relation.direction || "",
+                  };
+                })
+              : [],
+          });
+          graph.setSelectedNode(String(dbNodeId), { revealProperties: true });
+          return "properties.show_node";
+        }
+
+        if (kind === "elements.hide") {
+          const semanticIds = agentSemanticIds(action);
+          if (!semanticIds.length) {
+            return null;
+          }
+          viewer.hide(semanticIds);
+          return "elements.hide";
+        }
+
+        if (kind === "elements.show") {
+          const semanticIds = agentSemanticIds(action);
+          if (!semanticIds.length) {
+            return null;
+          }
+          viewer.show(semanticIds);
+          return "elements.show";
+        }
+
+        if (kind === "elements.select") {
+          const semanticIds = agentSemanticIds(action);
+          if (!semanticIds.length) {
+            return null;
+          }
+          viewer.select(semanticIds);
+          return "elements.select";
+        }
+
+        if (kind === "viewer.frame_visible" || kind === "viewer.framevisible") {
+          viewer.frameVisible();
+          return "viewer.frame_visible";
+        }
+
+        return null;
+      }
+
+      function installAgentTerminal(viewer, graph) {
+        const state = {
+          sessionId: null,
+          resource: null,
+          schemaId: null,
+          schemaSlug: null,
+          bindingPromise: null,
+          capabilities: null,
+          capabilitiesPromise: null,
+          backendId: null,
+          modelId: null,
+          levelId: null,
+          activated: false,
+        };
+        const modelSelect = document.getElementById("agent-model-select");
+        const levelSelect = document.getElementById("agent-level-select");
+        const levelControl = levelSelect?.closest("label");
+
+        const currentIfcResource = (resource = null) =>
+          selectedIfcResource(viewer, resource);
+
+        const selectedBackendCapability = () => {
+          const backends = Array.isArray(state.capabilities?.backends)
+            ? state.capabilities.backends
+            : [];
+          return (
+            backends.find((backend) => backend.id === state.backendId) ||
+            backends.find((backend) => backend.id === state.capabilities?.defaultBackendId) ||
+            backends[0] ||
+            null
+          );
+        };
+
+        const renderCapabilitySelect = (select, options, selectedId, fallbackLabel) => {
+          if (!select) {
+            return;
+          }
+          select.innerHTML = "";
+          const safeOptions = Array.isArray(options) ? options : [];
+          if (!safeOptions.length) {
+            const option = document.createElement("option");
+            option.value = "";
+            option.textContent = fallbackLabel;
+            select.appendChild(option);
+            select.disabled = true;
+            return;
+          }
+          for (const item of safeOptions) {
+            const option = document.createElement("option");
+            option.value = String(item.id || "");
+            option.textContent = String(item.label || item.id || "unknown");
+            select.appendChild(option);
+          }
+          select.value = safeOptions.some((item) => item.id === selectedId)
+            ? selectedId
+            : String(safeOptions[0].id || "");
+          select.disabled = safeOptions.length <= 1;
+        };
+
+        const renderAgentCapabilityControls = () => {
+          const backend = selectedBackendCapability();
+          if (!backend) {
+            renderCapabilitySelect(modelSelect, [], null, "no models");
+            renderCapabilitySelect(levelSelect, [], null, "no levels");
+            if (levelControl) {
+              levelControl.hidden = true;
+            }
+            return;
+          }
+          state.backendId = backend.id;
+          const models = Array.isArray(backend.models) ? backend.models : [];
+          state.modelId =
+            models.find((item) => item.id === state.modelId)?.id ||
+            state.capabilities?.defaultModelId ||
+            models[0]?.id ||
+            null;
+          const levelsByModel =
+            backend.levelsByModel && typeof backend.levelsByModel === "object"
+              ? backend.levelsByModel
+              : {};
+          const modelLevels = Array.isArray(levelsByModel[state.modelId])
+            ? levelsByModel[state.modelId]
+            : [];
+          const backendLevels = Array.isArray(backend.levels) ? backend.levels : [];
+          const levels = modelLevels.length ? modelLevels : backendLevels;
+          const defaultLevelId = levels.some((item) => item.id === state.capabilities?.defaultLevelId)
+            ? state.capabilities.defaultLevelId
+            : levels[Math.floor(Math.max(levels.length - 1, 0) / 2)]?.id || null;
+          state.levelId =
+            levels.find((item) => item.id === state.levelId)?.id ||
+            defaultLevelId ||
+            null;
+          renderCapabilitySelect(modelSelect, models, state.modelId, "no models");
+          renderCapabilitySelect(levelSelect, levels, state.levelId, "no levels");
+          if (levelControl) {
+            levelControl.hidden = !levels.length;
+          }
+        };
+
+        const loadAgentCapabilities = async () => {
+          if (state.capabilities) {
+            renderAgentCapabilityControls();
+            return state.capabilities;
+          }
+          if (!state.capabilitiesPromise) {
+            state.capabilitiesPromise = getJson("/api/agent/capabilities")
+              .then((payload) => {
+                state.capabilities = payload;
+                state.backendId = payload.defaultBackendId || state.backendId;
+                state.modelId = payload.defaultModelId || state.modelId;
+                state.levelId = payload.defaultLevelId || state.levelId;
+                renderAgentCapabilityControls();
+                return payload;
+              })
+              .catch((error) => {
+                renderCapabilitySelect(modelSelect, [], null, "unavailable");
+                renderCapabilitySelect(levelSelect, [], null, "unavailable");
+                throw error;
+              })
+              .finally(() => {
+                state.capabilitiesPromise = null;
+              });
+          }
+          return state.capabilitiesPromise;
+        };
+
+        modelSelect?.addEventListener("change", () => {
+          state.modelId = modelSelect.value || null;
+          state.levelId = null;
+          renderAgentCapabilityControls();
+        });
+        levelSelect?.addEventListener("change", () => {
+          state.levelId = levelSelect.value || null;
+        });
+
+        const bindSession = async ({ resource = currentIfcResource(), force = false } = {}) => {
+          if (!resource) {
+            state.sessionId = null;
+            state.resource = null;
+            return {
+              sessionId: null,
+              resource: null,
+              schemaId: null,
+              schemaSlug: null,
+              transcript: [],
+            };
+          }
+
+          if (!force && state.sessionId && state.resource === resource) {
+            return {
+              sessionId: state.sessionId,
+              resource: state.resource,
+              schemaId: state.schemaId,
+              schemaSlug: state.schemaSlug,
+              transcript: [],
+              reused: true,
+            };
+          }
+
+          if (!force && state.bindingPromise) {
+            return state.bindingPromise;
+          }
+
+          const previousSessionId = state.sessionId;
+          const previousResource = state.resource;
+          const request = postJson("/api/agent/session", {
+            sessionId: previousSessionId,
+            resource,
+          }).then((payload) => {
+            const nextSessionId = extractAgentSessionId(payload);
+            if (!nextSessionId) {
+              throw new Error("Agent session response did not include a session id.");
+            }
+            state.sessionId = nextSessionId;
+            state.resource = String(tryGetFirst(payload, ["resource"]) || resource);
+            state.schemaId = extractAgentSchemaId(payload);
+            state.schemaSlug = extractAgentSchemaSlug(payload);
+            return {
+              sessionId: state.sessionId,
+              resource: state.resource,
+              schemaId: state.schemaId,
+              schemaSlug: state.schemaSlug,
+              transcript: extractAgentTranscriptItems(payload),
+              created: Boolean(tryGetFirst(payload, ["created"])),
+              rebound: Boolean(tryGetFirst(payload, ["rebound"])) || previousResource !== state.resource,
+              previousSessionId,
+            };
+          });
+          state.bindingPromise = request.finally(() => {
+            if (state.bindingPromise === request) {
+              state.bindingPromise = null;
+            }
+          });
+          return state.bindingPromise;
+        };
+
+        let shell = null;
+
+        const writeResourceNotice = async (resource, { forceRebind = false } = {}) => {
+          if (!shell) {
+            return;
+          }
+          if (!resource) {
+            state.sessionId = null;
+            state.resource = null;
+            state.schemaId = null;
+            state.schemaSlug = null;
+            shell.writeLine("AI context cleared. Select an IFC model to use the agent terminal.");
+            return;
+          }
+          try {
+            const session = await bindSession({ resource, force: forceRebind });
+            renderAgentTranscriptItems(shell, compactAgentTranscriptItems(session.transcript));
+            shell.writeLine(
+              session.schemaId
+                ? `AI context switched to ${session.resource} (${session.schemaId}).`
+                : `AI context switched to ${session.resource}.`
+            );
+          } catch (error) {
+            shell.writeLine(`AI context bind failed: ${error}`);
+          }
+        };
+
+        const baseShell = installLineTerminal({
+          screenId: "repl-screen",
+          hostId: "agent-terminal",
+          introLines: [
+            "AI agent terminal.",
+            "The agent is bound to the currently selected IFC model and can only request read-only Cypher plus validated viewer actions.",
+            "Enter runs. Up/Down walks history. Ctrl+C clears the line.",
+          ],
+          execute: async (code, terminal) => {
+            const resource = currentIfcResource();
+            if (!resource) {
+              terminal.writeLine("AI agent is available only while an IFC model is selected.");
+              return TERMINAL_NO_RESULT;
+            }
+
+            await loadAgentCapabilities();
+            const session = await bindSession({ resource });
+            if (!session.reused) {
+              renderAgentTranscriptItems(
+                terminal,
+                compactAgentTranscriptItems(session.transcript)
+              );
+            }
+
+            const startPayload = await postJson("/api/agent/turn-start", {
+              sessionId: session.sessionId,
+              resource: session.resource,
+              input: code,
+              prompt: code,
+              backendId: state.backendId,
+              modelId: state.modelId,
+              levelId: state.levelId,
+            });
+
+            const turnId = extractAgentTurnId(startPayload);
+            if (!turnId) {
+              throw new Error("Agent turn did not return a turn id.");
+            }
+
+            const startedSessionId = extractAgentSessionId(startPayload);
+            if (startedSessionId) {
+              state.sessionId = startedSessionId;
+            }
+            state.resource = String(
+              tryGetFirst(startPayload, ["resource"]) || session.resource || resource
+            );
+            state.schemaId = extractAgentSchemaId(startPayload) || session.schemaId || state.schemaId;
+            state.schemaSlug = extractAgentSchemaSlug(startPayload) || session.schemaSlug || state.schemaSlug;
+            state.backendId = String(tryGetFirst(startPayload, ["backendId"]) || state.backendId || "");
+            state.modelId = String(tryGetFirst(startPayload, ["modelId"]) || state.modelId || "");
+            state.levelId = String(tryGetFirst(startPayload, ["levelId"]) || state.levelId || "");
+            renderAgentCapabilityControls();
+
+            let afterSeq = 0;
+            let resultPayload = null;
+            while (true) {
+              const pollPayload = await postJson("/api/agent/turn-poll", {
+                turnId,
+                afterSeq,
+              });
+              const events = extractAgentTranscriptItems(pollPayload);
+              if (Array.isArray(pollPayload?.events) && pollPayload.events.length) {
+                const lastEvent = pollPayload.events[pollPayload.events.length - 1];
+                const seq = Number(lastEvent?.seq);
+                if (Number.isFinite(seq)) {
+                  afterSeq = Math.max(afterSeq, seq);
+                }
+              }
+              renderAgentTranscriptItems(terminal, events);
+              if (Boolean(tryGetFirst(pollPayload, ["done"]))) {
+                const pollError = extractAgentTurnError(pollPayload);
+                if (pollError) {
+                  throw new Error(pollError);
+                }
+                resultPayload = extractAgentTurnResult(pollPayload);
+                break;
+              }
+              await sleep(150);
+            }
+
+            if (!resultPayload) {
+              return TERMINAL_NO_RESULT;
+            }
+
+            const nextSessionId = extractAgentSessionId(resultPayload);
+            if (nextSessionId) {
+              state.sessionId = nextSessionId;
+            }
+            state.resource = String(
+              tryGetFirst(resultPayload, ["resource"]) || session.resource || resource
+            );
+            state.schemaId = extractAgentSchemaId(resultPayload) || session.schemaId || state.schemaId;
+            state.schemaSlug = extractAgentSchemaSlug(resultPayload) || session.schemaSlug || state.schemaSlug;
+
+            const actions = extractAgentActions(resultPayload);
+            const appliedKinds = [];
+            for (const action of actions) {
+              try {
+                const appliedKind = await applyAgentAction(action, viewer, graph);
+                if (appliedKind) {
+                  appliedKinds.push(appliedKind);
+                }
+              } catch (error) {
+                terminal.writeRawLine(
+                  terminalAnsiWrap(`action failed: ${error}`, TERMINAL_WARNING_RGB, {
+                    bold: true,
+                  })
+                );
+              }
+            }
+            if (appliedKinds.length) {
+              terminal.writeRawLine(
+                terminalAnsiWrap(`applied: ${appliedKinds.join(", ")}`, TERMINAL_SUCCESS_RGB, {
+                  bold: true,
+                })
+              );
+            }
+            return TERMINAL_NO_RESULT;
+          },
+        });
+
+        if (!baseShell) {
+          return null;
+        }
+
+        shell = {
+          ...baseShell,
+          activate() {
+            baseShell.activate();
+            void loadAgentCapabilities().catch((error) => {
+              baseShell.writeLine(`AI capabilities unavailable: ${formatTerminalErrorMessage(error)}`);
+            });
+            if (!state.activated) {
+              state.activated = true;
+              const resource = currentIfcResource();
+              if (resource) {
+                void bindSession({ resource })
+                  .then((session) => {
+                    renderAgentTranscriptItems(
+                      baseShell,
+                      compactAgentTranscriptItems(session.transcript)
+                    );
+                  })
+                  .catch((error) => {
+                    baseShell.writeLine(`AI context bind failed: ${error}`);
+                  });
+              }
+            }
+          },
+          async handleResourceSwitch(resource = null) {
+            const nextResource = currentIfcResource(resource);
+            await writeResourceNotice(nextResource, { forceRebind: true });
+          },
+        };
+
+        return shell;
+      }
+
       function installLineTerminal({ screenId, hostId, introLines, execute }) {
         const screen = document.getElementById(screenId);
         const host = document.getElementById(hostId);
@@ -3274,6 +4487,7 @@
         const fitAddon = new FitAddon();
         term.loadAddon(fitAddon);
         term.open(host);
+        let shellApi = null;
         try {
           term.resize(120, 18);
         } catch (_error) {
@@ -3305,6 +4519,7 @@
         let historyIndex = 0;
         let historyDraft = "";
         let promptBooted = false;
+        let liveStatus = null;
 
         const setRunning = (next) => {
           running = next;
@@ -3313,7 +4528,7 @@
 
         const renderPromptLine = () => {
           term.write("\r\x1b[2K");
-          term.write(REPL_PROMPT);
+          term.write(terminalPromptMarkup());
           if (currentLine.length) {
             term.write(sanitizeTerminalText(currentLine));
           }
@@ -3331,6 +4546,92 @@
 
         const showPrompt = () => {
           renderPromptLine();
+        };
+
+        const stopLiveStatus = ({ persist, finalText = null } = {}) => {
+          if (!liveStatus) {
+            return;
+          }
+          window.clearInterval(liveStatus.timer);
+          const shouldPersist =
+            typeof persist === "boolean" ? persist : Boolean(liveStatus.persistOnStop);
+          const settledText = finalText || liveStatus.finalTextOnStop || liveStatus.label;
+          const settledFrame = liveStatus.frame || TERMINAL_ACTIVITY_FRAMES[0];
+          liveStatus = null;
+          term.write("\r\x1b[2K");
+          if (shouldPersist && settledText) {
+            terminalWriteRawLine(
+              term,
+              terminalAnsiWrap(`${settledFrame} ${settledText}`, TERMINAL_MUTED_RGB, {
+                dim: true,
+              })
+            );
+          } else if (!running) {
+            showPrompt();
+          }
+        };
+
+        const renderLiveStatus = () => {
+          if (!liveStatus) {
+            return;
+          }
+          liveStatus.frame =
+            TERMINAL_ACTIVITY_FRAMES[liveStatus.frameIndex % TERMINAL_ACTIVITY_FRAMES.length];
+          liveStatus.frameIndex += 1;
+          term.write("\r\x1b[2K");
+          term.write(
+            terminalAnsiWrap(`${liveStatus.frame} ${liveStatus.label}`, TERMINAL_MUTED_RGB, {
+              dim: true,
+            })
+          );
+        };
+
+        const startLiveStatus = (label, { persistOnStop = false, finalTextOnStop = null } = {}) => {
+          if (!promptBooted) {
+            bootPrompt();
+          }
+          stopLiveStatus({ persist: false });
+          liveStatus = {
+            label: String(label || "Working..."),
+            persistOnStop,
+            finalTextOnStop,
+            frameIndex: 0,
+            frame: TERMINAL_ACTIVITY_FRAMES[0],
+            timer: 0,
+          };
+          renderLiveStatus();
+          liveStatus.timer = window.setInterval(renderLiveStatus, 120);
+        };
+
+        const writeBlankLine = () => {
+          stopLiveStatus();
+          term.write("\r\x1b[2K");
+          terminalWriteRawLine(term, "");
+          if (!running) {
+            showPrompt();
+          }
+        };
+
+        const writeRawLine = (text = "") => {
+          if (!promptBooted) {
+            bootPrompt();
+          }
+          stopLiveStatus();
+          term.write("\r\x1b[2K");
+          terminalWriteRawLine(term, text);
+          if (!running) {
+            showPrompt();
+          }
+        };
+
+        const writeLine = (text = "") => {
+          writeRawLine(sanitizeTerminalText(text));
+        };
+
+        const writeLines = (lines = []) => {
+          for (const line of lines) {
+            writeLine(line);
+          }
         };
 
         const bootPrompt = () => {
@@ -3403,12 +4704,33 @@
           resetLineState();
           setRunning(true);
           try {
-            const result = await execute(code);
-            terminalWriteLine(term, formatResult(result ?? "ok"));
+            const result = await execute(
+              code,
+              shellApi || {
+                term,
+                writeLine,
+                writeLines,
+                writeRawLine,
+                writeBlankLine,
+                startLiveStatus,
+                stopLiveStatus,
+                focus: () => term.focus(),
+              }
+            );
+            if (result !== TERMINAL_NO_RESULT) {
+              terminalWriteLine(term, formatResult(result ?? "ok"));
+            }
           } catch (error) {
-            terminalWriteLine(term, String(error));
+            stopLiveStatus();
+            terminalWriteRawLine(
+              term,
+              terminalAnsiWrap(formatTerminalErrorMessage(error), TERMINAL_WARNING_RGB, {
+                bold: true,
+              })
+            );
             console.error(error);
           } finally {
+            stopLiveStatus();
             setRunning(false);
             showPrompt();
             term.focus();
@@ -3439,7 +4761,7 @@
 
           if (data === "\u0003") {
             term.write("\r\x1b[2K");
-            term.write(`${REPL_PROMPT}${sanitizeTerminalText(currentLine)}^C\r\n`);
+            term.write(`${terminalPromptMarkup()}${sanitizeTerminalText(currentLine)}^C\r\n`);
             resetLineState();
             showPrompt();
             return;
@@ -3523,9 +4845,15 @@
           setTimeout(() => bootPrompt(), 180);
         }
 
-        return {
+        shellApi = {
           resize: fitTerminal,
           focus: () => term.focus(),
+          writeLine,
+          writeLines,
+          writeRawLine,
+          writeBlankLine,
+          startLiveStatus,
+          stopLiveStatus,
           activate: () => {
             host.hidden = false;
             host.classList.add("active");
@@ -3539,6 +4867,7 @@
             host.hidden = true;
           },
         };
+        return shellApi;
       }
 
       function installRepl(replApi) {
@@ -3561,19 +4890,6 @@
             );
             return fn(replApi, window, document);
           },
-        });
-      }
-
-      function installEchoAgentTerminal() {
-        return installLineTerminal({
-          screenId: "repl-screen",
-          hostId: "agent-terminal",
-          introLines: [
-            "AI agent terminal placeholder.",
-            "For now this just echoes whatever you type so we can wire the second xterm cleanly.",
-            "Enter runs. Up/Down walks history. Ctrl+C clears the line.",
-          ],
-          execute: async (code) => `echo: ${code}`,
         });
       }
 
@@ -3652,11 +4968,15 @@
           window.clearSelection = repl.clearSelection;
           window.frame = repl.frame;
           const replShell = installRepl(repl);
-          const agentShell = installEchoAgentTerminal();
+          const agentShell = installAgentTerminal(viewer, graphShell.api);
           const terminalShell = installTerminalToolSelector([
             { id: "js", shell: replShell, defaultActive: true },
             { id: "ai", shell: agentShell },
           ]);
+          document.getElementById("resource-picker")?.addEventListener("change", (event) => {
+            const nextResource = event?.target?.value;
+            void agentShell?.handleResourceSwitch?.(nextResource);
+          });
           installLayoutResizers({
             onSidePanelResize: () => {
               graphShell.resize();

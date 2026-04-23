@@ -9,6 +9,9 @@
 # Frontend dependencies
 /crates/cc-w-platform-web/web/node_modules/
 
+# Repo-local developer tools
+/.tools/
+
 # macOS / editor noise
 .DS_Store
 **/.DS_Store

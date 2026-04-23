@@ -167,6 +167,10 @@ Current status:
   pretending the browser can build them locally
 - the local Rust web server now exposes `POST /api/cypher` for IFC resources
 - the browser `queryCypher` / `queryIds` helpers now execute against that backend query surface
+- the next semantic-control step is an AI terminal that is also mediated by the Rust server:
+  read-only Cypher only, current-resource bound, and limited to a validated viewer action set
+- the dedicated AI terminal contract and implementation plan live in
+  [ai-agent-integration.md](./ai-agent-integration.md)
 - the current web IFC path is dev-server scoped; production-grade streaming, incremental loading,
   and cache policy are still the next backend/frontend bridge to complete
 

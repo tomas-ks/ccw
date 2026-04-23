@@ -97,6 +97,87 @@ Stop stray web viewer servers:
 just web-viewer-stop
 ```
 
+## Project-Local OpenCode Install
+
+Install the official `opencode` CLI and expose it through a repo-local launcher:
+
+```bash
+just opencode-install
+```
+
+Verify the launcher and the repo-local writable state setup:
+
+```bash
+just opencode-check
+```
+
+Authenticate the repo-local OpenCode runtime:
+
+```bash
+just opencode-login
+```
+
+Run the web viewer with the `AI` terminal backed by the repo-local `ifc-explorer`
+OpenCode agent and the allow-listed `ifc_*` tools:
+
+```bash
+just web-viewer-opencode
+```
+
+Smoke-test the authenticated OpenCode runtime outside the viewer:
+
+```bash
+just opencode-smoke
+```
+
+This gives the project a stable launcher at:
+
+```text
+.tools/opencode/bin/opencode
+```
+
+and keeps writable cache/config/data/state under `.tools/opencode/`.
+
+The web viewer now launches the real `opencode` binary directly from the Rust server.
+The Rust adapter:
+
+- keeps OpenCode state under `.tools/opencode/`
+- uses the locked-down config in
+  [tools/opencode/opencode.json](/Users/tomas/cartesian/codex/cc-renderer-w/tools/opencode/opencode.json)
+- defaults to the repo-local `ifc-explorer` agent in
+  [.opencode/agents/ifc-explorer.md](/Users/tomas/cartesian/codex/cc-renderer-w/.opencode/agents/ifc-explorer.md)
+- exposes only the allow-listed `ifc_*` tools from
+  [.opencode/tools/ifc.ts](/Users/tomas/cartesian/codex/cc-renderer-w/.opencode/tools/ifc.ts)
+
+The launcher defaults to `CC_W_OPENCODE_AGENT=ifc-explorer`. Set
+`CC_W_OPENCODE_AGENT` before `just web-viewer-opencode` if you want a different
+repo-local agent profile.
+
+By default, `just web-viewer-opencode` now pins the provider/model seed and lets
+OpenCode/provider metadata describe the available models and real provider-supported
+reasoning variants. The viewer only shows providers listed in:
+
+- [tools/opencode/provider-whitelist.json](/Users/tomas/cartesian/codex/cc-renderer-w/tools/opencode/provider-whitelist.json)
+
+Add `cloudflare` to that JSON list later if you want Cloudflare models surfaced too.
+
+To override the default model seed for one run:
+
+```bash
+CC_W_OPENCODE_MODEL=openai/gpt-5.4 just web-viewer-opencode
+```
+
+You can still override `CC_W_OPENCODE_MODEL` in your shell before launching the
+viewer. Set `CC_W_OPENCODE_VARIANT` only when you want to force a specific
+provider-supported variant. If no explicit variant is set, the viewer starts on a
+middle available level.
+
+If you want to inspect the repo-local OpenCode server directly, use:
+
+```bash
+just opencode-acp
+```
+
 Headless PNG render:
 
 ```bash

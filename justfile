@@ -108,7 +108,7 @@ web-viewer-build:
     mkdir -p crates/cc-w-platform-web/artifacts/viewer/vendor
     mkdir -p crates/cc-w-platform-web/artifacts/viewer/vendor/sigma
     mkdir -p crates/cc-w-platform-web/artifacts/viewer/vendor/sigma-edge-curve
-    cargo build -p cc-w-platform-web --target wasm32-unknown-unknown
+    cargo build -p cc-w-platform-web --lib --target wasm32-unknown-unknown
     wasm-bindgen --target web --no-typescript --out-dir crates/cc-w-platform-web/artifacts/viewer/pkg target/wasm32-unknown-unknown/debug/cc_w_platform_web.wasm
     cp crates/cc-w-platform-web/web/node_modules/@xterm/xterm/css/xterm.css crates/cc-w-platform-web/artifacts/viewer/vendor/xterm.css
     cp crates/cc-w-platform-web/web/node_modules/@xterm/xterm/lib/xterm.mjs crates/cc-w-platform-web/artifacts/viewer/vendor/xterm.mjs
@@ -145,3 +145,55 @@ web-viewer-stop:
         echo "stopping w web viewer servers: $pids"; \
         kill $pids; \
     fi
+
+opencode-install:
+    curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path
+    mkdir -p .tools/opencode/bin .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
+    ln -sf "$HOME/.opencode/bin/opencode" .tools/opencode/bin/opencode
+    XDG_CACHE_HOME="$PWD/.tools/opencode/cache" XDG_DATA_HOME="$PWD/.tools/opencode/data" XDG_CONFIG_HOME="$PWD/.tools/opencode/config" XDG_STATE_HOME="$PWD/.tools/opencode/state" .tools/opencode/bin/opencode --version
+    echo "repo-local opencode launcher: .tools/opencode/bin/opencode"
+
+opencode-check:
+    test -x .tools/opencode/bin/opencode
+    mkdir -p .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
+    XDG_CACHE_HOME="$PWD/.tools/opencode/cache" XDG_DATA_HOME="$PWD/.tools/opencode/data" XDG_CONFIG_HOME="$PWD/.tools/opencode/config" XDG_STATE_HOME="$PWD/.tools/opencode/state" .tools/opencode/bin/opencode --version
+
+opencode-login:
+    test -x .tools/opencode/bin/opencode
+    mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
+    HOME="$PWD/.tools/opencode/home" XDG_CACHE_HOME="$PWD/.tools/opencode/cache" XDG_DATA_HOME="$PWD/.tools/opencode/data" XDG_CONFIG_HOME="$PWD/.tools/opencode/config" XDG_STATE_HOME="$PWD/.tools/opencode/state" OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" .tools/opencode/bin/opencode auth login
+
+web-viewer-opencode:
+    just web-viewer-build
+    test -x .tools/opencode/bin/opencode
+    mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
+    # Model discovery stays narrowed by tools/opencode/provider-whitelist.json and the
+    # repo-local agent defaults to ifc-explorer unless CC_W_OPENCODE_AGENT overrides it.
+    real_home="$HOME"; \
+    env HOME="$PWD/.tools/opencode/home" \
+        CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}" \
+        RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}" \
+        XDG_CACHE_HOME="$PWD/.tools/opencode/cache" \
+        XDG_DATA_HOME="$PWD/.tools/opencode/data" \
+        XDG_CONFIG_HOME="$PWD/.tools/opencode/config" \
+        XDG_STATE_HOME="$PWD/.tools/opencode/state" \
+        OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
+        CC_W_AGENT_BACKEND=opencode \
+        CC_W_OPENCODE_EXECUTABLE="$PWD/.tools/opencode/bin/opencode" \
+        CC_W_OPENCODE_WORKDIR="$PWD" \
+        CC_W_OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
+        CC_W_OPENCODE_AGENT="${CC_W_OPENCODE_AGENT:-ifc-explorer}" \
+        CC_W_OPENCODE_MODEL="${CC_W_OPENCODE_MODEL:-openai/gpt-5.4}" \
+        CC_W_OPENCODE_DISCOVER_MODELS="${CC_W_OPENCODE_DISCOVER_MODELS:-1}" \
+        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-45000}" \
+        cargo run -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server -- --root crates/cc-w-platform-web/artifacts/viewer --port 8001
+
+opencode-smoke prompt="Say hello in one short sentence and return no tool calls.":
+    test -x .tools/opencode/bin/opencode
+    mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
+    HOME="$PWD/.tools/opencode/home" XDG_CACHE_HOME="$PWD/.tools/opencode/cache" XDG_DATA_HOME="$PWD/.tools/opencode/data" XDG_CONFIG_HOME="$PWD/.tools/opencode/config" XDG_STATE_HOME="$PWD/.tools/opencode/state" OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" .tools/opencode/bin/opencode run --agent "${CC_W_OPENCODE_AGENT:-ifc-explorer}" --format json --title "ccw smoke" --pure "{{prompt}}"
+
+opencode-acp:
+    test -x .tools/opencode/bin/opencode
+    mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
+    HOME="$PWD/.tools/opencode/home" XDG_CACHE_HOME="$PWD/.tools/opencode/cache" XDG_DATA_HOME="$PWD/.tools/opencode/data" XDG_CONFIG_HOME="$PWD/.tools/opencode/config" XDG_STATE_HOME="$PWD/.tools/opencode/state" OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" CC_W_OPENCODE_ACP_HOSTNAME="${CC_W_OPENCODE_ACP_HOSTNAME:-127.0.0.1}" CC_W_OPENCODE_ACP_PORT="${CC_W_OPENCODE_ACP_PORT:-0}" .tools/opencode/bin/opencode acp --pure --hostname "${CC_W_OPENCODE_ACP_HOSTNAME:-127.0.0.1}" --port "${CC_W_OPENCODE_ACP_PORT:-0}"
