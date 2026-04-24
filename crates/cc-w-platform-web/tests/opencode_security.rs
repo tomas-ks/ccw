@@ -245,3 +245,164 @@ fn strict_ifc_agent_config_is_deny_by_default_and_mentions_only_canonical_ifc_to
         "the strict agent body should tell the agent to answer direct factual questions directly"
     );
 }
+
+#[test]
+fn answer_42_debug_agent_is_deny_by_default_and_forces_literal_42() {
+    let agent = read_repo_file(".opencode/agents/ifc-answer-42.md");
+    let (frontmatter, body) = split_frontmatter(&agent);
+    let permissions = parse_permission_map(frontmatter);
+
+    assert_eq!(
+        permissions.get("*").map(String::as_str),
+        Some("deny"),
+        "the 42 debug agent should stay deny-by-default"
+    );
+    assert!(
+        permissions.iter().all(|(key, value)| key == "*" || value == "deny"),
+        "the 42 debug agent should not grant any extra permissions"
+    );
+
+    let backticked_tokens = backticked_tokens(body);
+    assert!(
+        body.contains("respond with exactly `42` and nothing else"),
+        "the 42 debug agent should force a literal 42 response"
+    );
+    assert!(
+        body.contains("Do not call any tools."),
+        "the 42 debug agent should forbid tool use"
+    );
+    assert!(
+        !backticked_tokens.contains("ifc_*")
+            && !backticked_tokens.contains("entity_search")
+            && !backticked_tokens.contains("properties"),
+        "the 42 debug agent should not mention any IFC tool names"
+    );
+}
+
+#[test]
+fn readonly_cypher_only_debug_agent_is_deny_by_default_and_uses_one_tool() {
+    let agent = read_repo_file(".opencode/agents/ifc-readonly-cypher-only.md");
+    let (frontmatter, body) = split_frontmatter(&agent);
+    let permissions = parse_permission_map(frontmatter);
+
+    assert_eq!(
+        permissions.get("*").map(String::as_str),
+        Some("deny"),
+        "the one-tool debug agent should stay deny-by-default"
+    );
+    assert_eq!(
+        permissions.get("ifc_readonly_cypher").map(String::as_str),
+        Some("allow"),
+        "the one-tool debug agent should allow read-only Cypher"
+    );
+    assert!(
+        permissions.iter().all(|(key, value)| key == "*" || key == "ifc_readonly_cypher" || value == "deny"),
+        "the one-tool debug agent should not grant any extra permissions"
+    );
+
+    let backticked_tokens = backticked_tokens(body);
+    assert!(
+        body.contains("Use only `ifc_readonly_cypher`."),
+        "the one-tool debug agent should require the single canonical tool"
+    );
+    assert!(
+        body.contains("Do not call any other tool."),
+        "the one-tool debug agent should forbid all other tools"
+    );
+    assert!(
+        backticked_tokens.contains("ifc_readonly_cypher"),
+        "the one-tool debug agent should mention the only allowed tool"
+    );
+    assert!(
+        !backticked_tokens.contains("ifc_query_playbook")
+            && !backticked_tokens.contains("ifc_entity_reference")
+            && !backticked_tokens.contains("ifc_relation_reference")
+            && !backticked_tokens.contains("ifc_node_relations")
+            && !backticked_tokens.contains("ifc_properties_show_node"),
+        "the one-tool debug agent should not mention any additional IFC tools"
+    );
+}
+
+#[test]
+fn playbook_and_cypher_debug_agent_is_deny_by_default_and_uses_two_tools() {
+    let agent = read_repo_file(".opencode/agents/ifc-playbook-cypher-only.md");
+    let (frontmatter, body) = split_frontmatter(&agent);
+    let permissions = parse_permission_map(frontmatter);
+
+    assert_eq!(
+        permissions.get("*").map(String::as_str),
+        Some("deny"),
+        "the two-tool debug agent should stay deny-by-default"
+    );
+    assert_eq!(
+        permissions.get("ifc_query_playbook").map(String::as_str),
+        Some("allow"),
+        "the two-tool debug agent should allow query playbooks"
+    );
+    assert_eq!(
+        permissions.get("ifc_readonly_cypher").map(String::as_str),
+        Some("allow"),
+        "the two-tool debug agent should allow read-only Cypher"
+    );
+    assert!(
+        permissions
+            .iter()
+            .all(|(key, value)| key == "*" || key == "ifc_query_playbook" || key == "ifc_readonly_cypher" || value == "deny"),
+        "the two-tool debug agent should not grant any extra permissions"
+    );
+
+    let backticked_tokens = backticked_tokens(body);
+    assert!(
+        body.contains("Use only `ifc_query_playbook` and `ifc_readonly_cypher`."),
+        "the two-tool debug agent should require the exact tool pair"
+    );
+    assert!(
+        body.contains("For any question about the model, you may call `ifc_query_playbook` once"),
+        "the two-tool debug agent should prescribe the tool order"
+    );
+    assert!(
+        body.contains("For material questions like \"What are the walls made of?\""),
+        "the two-tool debug agent should include a concrete material-query example"
+    );
+    assert!(
+        body.contains("The user question is already complete. Never ask the user to provide their question again."),
+        "the two-tool debug agent should forbid clarification follow-ups"
+    );
+    assert!(
+        body.contains("Never call `ifc_query_playbook` more than once for the same user question."),
+        "the two-tool debug agent should forbid repeated playbook lookups"
+    );
+    assert!(
+        body.contains("Do not respond to the playbook result with a clarification request."),
+        "the two-tool debug agent should treat the playbook result as a query-shape hint, not a prompt for more user input"
+    );
+    assert!(
+        body.contains("MATCH (wall:IfcWall)--(:IfcRelAssociatesMaterial)--(material:IfcMaterial)"),
+        "the two-tool debug agent should include the exact wall-material traversal"
+    );
+    assert!(
+        body.contains("Treat `IfcRelAssociatesMaterial` as the middle node label in the graph shape, not as a relationship type."),
+        "the two-tool debug agent should explain the graph shape clearly"
+    );
+    assert!(
+        body.contains("Do not use `IFC_REL_ASSOCIATES_MATERIAL`, `HAS_MATERIAL`"),
+        "the two-tool debug agent should forbid invented relationship labels"
+    );
+    assert!(
+        backticked_tokens.contains("ifc_query_playbook")
+            && backticked_tokens.contains("ifc_readonly_cypher"),
+        "the two-tool debug agent should mention both allowed tools"
+    );
+    assert!(
+        !backticked_tokens.contains("ifc_entity_reference")
+            && !backticked_tokens.contains("ifc_relation_reference")
+            && !backticked_tokens.contains("ifc_node_relations")
+            && !backticked_tokens.contains("ifc_properties_show_node")
+            && !backticked_tokens.contains("ifc_graph_set_seeds")
+            && !backticked_tokens.contains("ifc_elements_hide")
+            && !backticked_tokens.contains("ifc_elements_show")
+            && !backticked_tokens.contains("ifc_elements_select")
+            && !backticked_tokens.contains("ifc_viewer_frame_visible"),
+        "the two-tool debug agent should not mention any other IFC tools"
+    );
+}

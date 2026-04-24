@@ -167,9 +167,15 @@ web-viewer-opencode:
     just web-viewer-build
     test -x .tools/opencode/bin/opencode
     mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
-    # Model discovery stays narrowed by tools/opencode/provider-whitelist.json and the
-    # repo-local agent defaults to ifc-explorer unless CC_W_OPENCODE_AGENT overrides it.
+    # Model discovery stays narrowed by tools/opencode/provider-whitelist.json.
+    # The repo-local agent defaults to ifc-explorer for OpenAI-like models and to
+    # ifc-playbook-cypher-only for Gemma-like models unless CC_W_OPENCODE_AGENT overrides it.
     real_home="$HOME"; \
+    model_default="${CC_W_OPENCODE_MODEL:-openai/gpt-5.4}"; \
+    case "$model_default" in \
+        ollama/gemma4:*) agent_default="${CC_W_OPENCODE_AGENT:-ifc-playbook-cypher-only}" ;; \
+        *) agent_default="${CC_W_OPENCODE_AGENT:-ifc-explorer}" ;; \
+    esac; \
     env HOME="$PWD/.tools/opencode/home" \
         CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}" \
         RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}" \
@@ -182,8 +188,8 @@ web-viewer-opencode:
         CC_W_OPENCODE_EXECUTABLE="$PWD/.tools/opencode/bin/opencode" \
         CC_W_OPENCODE_WORKDIR="$PWD" \
         CC_W_OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
-        CC_W_OPENCODE_AGENT="${CC_W_OPENCODE_AGENT:-ifc-explorer}" \
-        CC_W_OPENCODE_MODEL="${CC_W_OPENCODE_MODEL:-openai/gpt-5.4}" \
+        CC_W_OPENCODE_AGENT="$agent_default" \
+        CC_W_OPENCODE_MODEL="$model_default" \
         CC_W_OPENCODE_DISCOVER_MODELS="${CC_W_OPENCODE_DISCOVER_MODELS:-1}" \
         CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-45000}" \
         cargo run -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server -- --root crates/cc-w-platform-web/artifacts/viewer --port 8001
@@ -231,6 +237,54 @@ web-viewer-opencode-42:
         CC_W_OPENCODE_WORKDIR="$PWD" \
         CC_W_OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
         CC_W_OPENCODE_AGENT="${CC_W_OPENCODE_AGENT:-ifc-answer-42}" \
+        CC_W_OPENCODE_MODEL="${CC_W_OPENCODE_MODEL:-ollama/gemma4:e4b}" \
+        CC_W_OPENCODE_DISCOVER_MODELS="${CC_W_OPENCODE_DISCOVER_MODELS:-1}" \
+        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-45000}" \
+        cargo run -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server -- --root crates/cc-w-platform-web/artifacts/viewer --port 8001
+
+web-viewer-opencode-cypher-only:
+    just web-viewer-build
+    test -x .tools/opencode/bin/opencode
+    mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
+    # Debug agent: only `ifc_readonly_cypher` is allowed.
+    real_home="$HOME"; \
+    env HOME="$PWD/.tools/opencode/home" \
+        CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}" \
+        RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}" \
+        XDG_CACHE_HOME="$PWD/.tools/opencode/cache" \
+        XDG_DATA_HOME="$PWD/.tools/opencode/data" \
+        XDG_CONFIG_HOME="$PWD/.tools/opencode/config" \
+        XDG_STATE_HOME="$PWD/.tools/opencode/state" \
+        OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
+        CC_W_AGENT_BACKEND=opencode \
+        CC_W_OPENCODE_EXECUTABLE="$PWD/.tools/opencode/bin/opencode" \
+        CC_W_OPENCODE_WORKDIR="$PWD" \
+        CC_W_OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
+        CC_W_OPENCODE_AGENT="${CC_W_OPENCODE_AGENT:-ifc-readonly-cypher-only}" \
+        CC_W_OPENCODE_MODEL="${CC_W_OPENCODE_MODEL:-ollama/gemma4:e4b}" \
+        CC_W_OPENCODE_DISCOVER_MODELS="${CC_W_OPENCODE_DISCOVER_MODELS:-1}" \
+        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-45000}" \
+        cargo run -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server -- --root crates/cc-w-platform-web/artifacts/viewer --port 8001
+
+web-viewer-opencode-playbook-cypher:
+    just web-viewer-build
+    test -x .tools/opencode/bin/opencode
+    mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
+    # Debug agent: only query playbooks and read-only Cypher are allowed.
+    real_home="$HOME"; \
+    env HOME="$PWD/.tools/opencode/home" \
+        CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}" \
+        RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}" \
+        XDG_CACHE_HOME="$PWD/.tools/opencode/cache" \
+        XDG_DATA_HOME="$PWD/.tools/opencode/data" \
+        XDG_CONFIG_HOME="$PWD/.tools/opencode/config" \
+        XDG_STATE_HOME="$PWD/.tools/opencode/state" \
+        OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
+        CC_W_AGENT_BACKEND=opencode \
+        CC_W_OPENCODE_EXECUTABLE="$PWD/.tools/opencode/bin/opencode" \
+        CC_W_OPENCODE_WORKDIR="$PWD" \
+        CC_W_OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
+        CC_W_OPENCODE_AGENT="${CC_W_OPENCODE_AGENT:-ifc-playbook-cypher-only}" \
         CC_W_OPENCODE_MODEL="${CC_W_OPENCODE_MODEL:-ollama/gemma4:e4b}" \
         CC_W_OPENCODE_DISCOVER_MODELS="${CC_W_OPENCODE_DISCOVER_MODELS:-1}" \
         CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-45000}" \

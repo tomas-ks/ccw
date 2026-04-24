@@ -150,9 +150,10 @@ The Rust adapter:
   [.opencode/tools/ifc.ts](/Users/tomas/cartesian/codex/cc-renderer-w/.opencode/tools/ifc.ts)
 - creates a native OpenCode session per viewer AI session and streams progress from OpenCode's server events
 
-The launcher defaults to `CC_W_OPENCODE_AGENT=ifc-explorer`. Set
-`CC_W_OPENCODE_AGENT` before `just web-viewer-opencode` if you want a different
-repo-local agent profile.
+The launcher defaults to `CC_W_OPENCODE_AGENT=ifc-explorer` for OpenAI-like
+models and to `CC_W_OPENCODE_AGENT=ifc-playbook-cypher-only` for Gemma-like
+models. Set `CC_W_OPENCODE_AGENT` before `just web-viewer-opencode` if you want
+a different repo-local agent profile.
 
 For a strict Gemma-friendly profile that uses only the canonical `ifc_*`
 tool names, run:
@@ -165,9 +166,39 @@ That launcher defaults to `CC_W_OPENCODE_AGENT=ifc-explorer-strict` and
 `CC_W_OPENCODE_MODEL=ollama/gemma4:e4b`, while still allowing overrides from
 your shell.
 
+For a one-line instruction-delivery smoke test that should reply only `42`,
+run:
+
+```bash
+just web-viewer-opencode-42
+```
+
+That launcher defaults to `CC_W_OPENCODE_AGENT=ifc-answer-42` and
+`CC_W_OPENCODE_MODEL=ollama/gemma4:e4b`.
+
+For a one-tool smoke test that only allows `ifc_readonly_cypher`, run:
+
+```bash
+just web-viewer-opencode-cypher-only
+```
+
+That launcher defaults to `CC_W_OPENCODE_AGENT=ifc-readonly-cypher-only` and
+`CC_W_OPENCODE_MODEL=ollama/gemma4:e4b`.
+
+For the Gemma-friendly two-tool debug profile that allows `ifc_query_playbook`
+and `ifc_readonly_cypher`, run:
+
+```bash
+just web-viewer-opencode-playbook-cypher
+```
+
+That launcher defaults to `CC_W_OPENCODE_AGENT=ifc-playbook-cypher-only` and
+`CC_W_OPENCODE_MODEL=ollama/gemma4:e4b`.
+
 By default, `just web-viewer-opencode` now pins the provider/model seed and lets
-OpenCode/provider metadata describe the available models and real provider-supported
-reasoning variants. The viewer only shows providers listed in:
+OpenCode/provider metadata describe the available models and real
+provider-supported reasoning variants. The viewer only shows providers listed
+in:
 
 - [tools/opencode/provider-whitelist.json](/Users/tomas/cartesian/codex/cc-renderer-w/tools/opencode/provider-whitelist.json)
 
@@ -177,6 +208,12 @@ To override the default model seed for one run:
 
 ```bash
 CC_W_OPENCODE_MODEL=openai/gpt-5.4 just web-viewer-opencode
+```
+
+To use the Gemma-friendly default profile explicitly:
+
+```bash
+just web-viewer-opencode-playbook-cypher
 ```
 
 You can still override `CC_W_OPENCODE_MODEL` in your shell before launching the

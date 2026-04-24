@@ -1001,6 +1001,25 @@
         return `${open}${sanitizeTerminalText(text)}\x1b[0m`;
       }
 
+      function terminalAssistantMarkup(text) {
+        const source = String(text);
+        const parts = [];
+        let cursor = 0;
+        const boldPattern = /\*\*([^*\r\n](?:.*?[^*\r\n])?)\*\*/g;
+        for (const match of source.matchAll(boldPattern)) {
+          const start = match.index ?? 0;
+          if (start > cursor) {
+            parts.push(sanitizeTerminalText(source.slice(cursor, start)));
+          }
+          parts.push(`\x1b[1m${sanitizeTerminalText(match[1])}\x1b[22m`);
+          cursor = start + match[0].length;
+        }
+        if (cursor < source.length) {
+          parts.push(sanitizeTerminalText(source.slice(cursor)));
+        }
+        return parts.join("");
+      }
+
       function terminalPromptMarkup() {
         return (
           `\x1b[1m${terminalAnsiRgb(TERMINAL_ACCENT_RGB)}W\x1b[0m` +
@@ -3710,7 +3729,7 @@
               writeBlankLine();
               continue;
             }
-            writeRawLine(sanitizeTerminalText(line));
+            writeRawLine(terminalAssistantMarkup(line));
           }
         };
 
