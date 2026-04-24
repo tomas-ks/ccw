@@ -128,7 +128,7 @@ fn opencode_config_is_deny_by_default_and_seeded_with_gpt_5_4() {
 }
 
 #[test]
-fn ifc_agent_config_is_deny_by_default_and_mentions_only_ifc_tools() {
+fn ifc_agent_config_is_deny_by_default_and_allows_compatibility_aliases() {
     let agent = read_repo_file(".opencode/agents/ifc-explorer.md");
     let (frontmatter, body) = split_frontmatter(&agent);
     let permissions = parse_permission_map(frontmatter);
@@ -141,20 +141,107 @@ fn ifc_agent_config_is_deny_by_default_and_mentions_only_ifc_tools() {
     assert_eq!(
         permissions.get("ifc_*").map(String::as_str),
         Some("allow"),
-        "the IFC agent should only allow the IFC tool family"
+        "the IFC agent should allow the IFC tool family"
+    );
+    assert_eq!(
+        permissions.get("entity_search").map(String::as_str),
+        Some("allow"),
+        "the IFC agent should allow the entity_search compatibility alias"
+    );
+    assert_eq!(
+        permissions.get("properties").map(String::as_str),
+        Some("allow"),
+        "the IFC agent should allow the properties compatibility alias"
     );
 
     assert!(
         permissions
             .iter()
-            .all(|(key, value)| key == "*" || key == "ifc_*" || value == "deny"),
-        "the IFC agent should not grant any extra permissions"
+            .all(|(key, value)| key == "*" || key == "ifc_*" || key == "entity_search" || key == "properties" || value == "deny"),
+        "the IFC agent should not grant any extra permissions beyond the canonical IFC tools and the two compatibility aliases"
     );
 
     let backticked_tokens = backticked_tokens(body);
+    for token in [
+        "ifc_*",
+        "entity_search",
+        "properties",
+        "ifc_entity_reference",
+        "ifc_query_playbook",
+        "ifc_readonly_cypher",
+        "ifc_node_relations",
+        "ifc_properties_show_node",
+    ] {
+        assert!(
+            backticked_tokens.contains(token),
+            "the agent body should mention `{token}`"
+        );
+    }
+}
+
+#[test]
+fn strict_ifc_agent_config_is_deny_by_default_and_mentions_only_canonical_ifc_tools() {
+    let agent = read_repo_file(".opencode/agents/ifc-explorer-strict.md");
+    let (frontmatter, body) = split_frontmatter(&agent);
+    let permissions = parse_permission_map(frontmatter);
+
     assert_eq!(
-        backticked_tokens,
-        BTreeSet::from([String::from("ifc_*")]),
-        "the agent body should only refer to the IFC tool family"
+        permissions.get("*").map(String::as_str),
+        Some("deny"),
+        "the strict IFC agent should stay deny-by-default"
+    );
+    assert_eq!(
+        permissions.get("ifc_*").map(String::as_str),
+        Some("allow"),
+        "the strict IFC agent should allow the IFC tool family"
+    );
+    assert!(
+        !permissions.contains_key("entity_search"),
+        "the strict IFC agent should not expose the compatibility alias"
+    );
+    assert!(
+        !permissions.contains_key("properties"),
+        "the strict IFC agent should not expose the compatibility alias"
+    );
+    assert!(
+        permissions.iter().all(|(key, value)| key == "*" || key == "ifc_*" || value == "deny"),
+        "the strict IFC agent should not grant any extra permissions"
+    );
+
+    let backticked_tokens = backticked_tokens(body);
+    for token in [
+        "ifc_*",
+        "ifc_entity_reference",
+        "ifc_relation_reference",
+        "ifc_query_playbook",
+        "ifc_readonly_cypher",
+        "ifc_node_relations",
+        "ifc_properties_show_node",
+        "ifc_graph_set_seeds",
+        "ifc_elements_hide",
+        "ifc_elements_show",
+        "ifc_elements_select",
+        "ifc_viewer_frame_visible",
+    ] {
+        assert!(
+            backticked_tokens.contains(token),
+            "the strict agent body should mention `{token}`"
+        );
+    }
+    assert!(
+        !backticked_tokens.contains("entity_search") && !backticked_tokens.contains("properties"),
+        "the strict agent body should not mention compatibility aliases"
+    );
+    assert!(
+        body.contains("What schema are we using?"),
+        "the strict agent body should include the schema example"
+    );
+    assert!(
+        body.contains("We are using IFC4X3_ADD2."),
+        "the strict agent body should include the direct-answer example"
+    );
+    assert!(
+        body.contains("Keep direct factual replies short."),
+        "the strict agent body should tell the agent to answer direct factual questions directly"
     );
 }

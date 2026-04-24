@@ -16,10 +16,10 @@ use std::{
     env,
     error::Error,
     fs,
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -56,7 +56,8 @@ use crate::agent_executor::{
 use crate::agent_error_log::{AgentErrorLogEntry, AgentErrorLogger};
 use crate::agent_query_log::{AgentQueryLogEntry, AgentQueryLogger};
 use crate::opencode_executor::{
-    OpencodeDiscoveredModel, OpencodeExecutor, OpencodeExecutorConfig, discover_opencode_models,
+    OpencodeDiscoveredModel, OpencodeExecutor, OpencodeExecutorConfig, OpencodeNativeServer,
+    discover_opencode_models,
 };
 use crate::schema_reference::{
     load_entity_references, load_query_playbooks, load_relation_references, load_schema_context,
@@ -103,6 +104,8 @@ const ANSI_RED_BOLD: &str = "\x1b[1;31m";
 const ANSI_YELLOW_BOLD: &str = "\x1b[1;33m";
 const ANSI_MAGENTA_BOLD: &str = "\x1b[1;35m";
 
+static SHOULD_STOP: AtomicBool = AtomicBool::new(false);
+
 #[derive(Clone, Copy)]
 enum ConsoleLogKind {
     Error,
@@ -138,11 +141,46 @@ fn console_log(kind: ConsoleLogKind, message: impl AsRef<str>) {
     );
 }
 
+extern "C" fn handle_shutdown_signal(_signal: libc::c_int) {
+    SHOULD_STOP.store(true, Ordering::SeqCst);
+}
+
+fn install_shutdown_signal_handlers() -> Result<(), std::io::Error> {
+    unsafe {
+        install_single_shutdown_signal(libc::SIGINT)?;
+        install_single_shutdown_signal(libc::SIGTERM)?;
+    }
+    Ok(())
+}
+
+unsafe fn install_single_shutdown_signal(signal: libc::c_int) -> Result<(), std::io::Error> {
+    let previous = unsafe { libc::signal(signal, handle_shutdown_signal as libc::sighandler_t) };
+    if previous == libc::SIG_ERR {
+        return Err(std::io::Error::other(format!(
+            "could not install shutdown handler for signal {signal}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn should_stop_requested() -> bool {
+    SHOULD_STOP.load(Ordering::SeqCst)
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse(env::args().skip(1))?;
+    install_shutdown_signal_handlers()?;
     let root = fs::canonicalize(&args.root)
         .map_err(|error| format!("w web server could not resolve {:?}: {error}", args.root))?;
-    let agent_runtime = AgentRuntimeConfig::from_env()?;
+    let mut agent_runtime = AgentRuntimeConfig::from_env()?;
+    let (listener, bound_port) = bind_listener(&args.host, args.port)?;
+    listener.set_nonblocking(true)?;
+    let url = format!("http://{}:{}/", args.host, bound_port);
+    if agent_runtime.native_server.is_none() {
+        if let AgentBackend::Opencode(config) = &agent_runtime.backend {
+            agent_runtime.native_server = Some(OpencodeNativeServer::start(config, Some(&url))?);
+        }
+    }
     let server_state = Arc::new(ServerState {
         root,
         ifc_artifacts_root: args.ifc_artifacts_root,
@@ -151,8 +189,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         agent_turns: Arc::new(Mutex::new(AgentTurnStore::default())),
         agent_runtime,
     });
-    let (listener, bound_port) = bind_listener(&args.host, args.port)?;
-    let url = format!("http://{}:{}/", args.host, bound_port);
 
     println!("w web viewer serving {}", server_state.root.display());
     println!(
@@ -193,15 +229,31 @@ println!(
     }
     println!("open {}", url);
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    loop {
+        if should_stop_requested() {
+            console_log(
+                ConsoleLogKind::Warn,
+                "shutdown requested; stopping OpenCode child and viewer",
+            );
+            if let Some(native_server) = server_state.agent_runtime.native_server.as_ref() {
+                native_server.shutdown();
+            }
+            break;
+        }
+
+        match listener.accept() {
+            Ok((stream, _)) => {
                 if let Err(error) = handle_connection(stream, &server_state) {
                     console_log(
                         ConsoleLogKind::Error,
                         format!("server request failed: {error}"),
                     );
                 }
+            }
+            Err(error)
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
+            {
+                thread::sleep(Duration::from_millis(50));
             }
             Err(error) => console_log(
                 ConsoleLogKind::Error,
@@ -236,6 +288,7 @@ struct AgentWorkerState {
     agent_sessions: Arc<Mutex<AgentSessionStore>>,
     agent_turns: Arc<Mutex<AgentTurnStore>>,
     agent_runtime: AgentRuntimeConfig,
+    native_server: Option<Arc<OpencodeNativeServer>>,
 }
 
 #[derive(Debug, Default)]
@@ -256,6 +309,7 @@ struct AgentSession {
     resource: String,
     schema_id: String,
     schema_slug: Option<String>,
+    opencode_session_id: Option<String>,
     turn_count: u64,
     transcript: Vec<AgentTranscriptEvent>,
 }
@@ -277,6 +331,7 @@ struct AgentTurnState {
 #[derive(Debug, Clone)]
 struct AgentRuntimeConfig {
     backend: AgentBackend,
+    native_server: Option<Arc<OpencodeNativeServer>>,
     models: Vec<AgentCapabilityOption>,
     levels: Vec<AgentCapabilityOption>,
     levels_by_model: BTreeMap<String, Vec<AgentCapabilityOption>>,
@@ -715,6 +770,7 @@ impl AgentRuntimeConfig {
 
         Ok(Self {
             backend,
+            native_server: None,
             models,
             levels,
             levels_by_model,
@@ -1335,6 +1391,9 @@ fn candidate_ports(start: u16) -> impl Iterator<Item = u16> {
 }
 
 fn handle_connection(mut stream: TcpStream, state: &Arc<ServerState>) -> Result<(), String> {
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| error.to_string())?;
     let request = read_request(&mut stream)?;
     let request_path = request_path_only(&request.target);
 
@@ -2139,6 +2198,14 @@ fn create_agent_session_api(
     let schema = resolve_agent_resource_schema(&request.resource, &state.ifc_artifacts_root)?;
     let schema_id = schema.canonical_name().to_owned();
     let schema_slug = schema.generated_artifact_stem().map(ToOwned::to_owned);
+    let opencode_session_id = match &state.agent_runtime.native_server {
+        Some(native_server) => Some(
+            native_server
+                .create_session(&format!("ccw {}", request.resource))
+                .map_err(|error| format!("could not create opencode session: {error}"))?,
+        ),
+        None => None,
+    };
     let mut store = state
         .agent_sessions
         .lock()
@@ -2156,6 +2223,7 @@ fn create_agent_session_api(
             resource: request.resource.clone(),
             schema_id: schema_id.clone(),
             schema_slug: schema_slug.clone(),
+            opencode_session_id,
             turn_count: 0,
             transcript: transcript.clone(),
         },
@@ -2199,6 +2267,8 @@ fn execute_agent_turn_api(
         request.backend_id.as_deref(),
         request.model_id.as_deref(),
         request.level_id.as_deref(),
+        session.opencode_session_id.as_deref(),
+        state.agent_runtime.native_server.clone(),
         &session_history,
         state,
         progress,
@@ -2252,6 +2322,8 @@ fn execute_agent_turn_api_in_worker(
         request.backend_id.as_deref(),
         request.model_id.as_deref(),
         request.level_id.as_deref(),
+        session.opencode_session_id.as_deref(),
+        state.agent_runtime.native_server.clone(),
         &session_history,
         state,
         progress,
@@ -2360,6 +2432,7 @@ fn start_agent_turn_api(
         agent_sessions: Arc::clone(&state.agent_sessions),
         agent_turns: Arc::clone(&state.agent_turns),
         agent_runtime: state.agent_runtime.clone(),
+        native_server: state.agent_runtime.native_server.clone(),
     };
     let turn_id_for_thread = turn_id.clone();
     thread::spawn(move || {
@@ -2599,6 +2672,8 @@ fn execute_agent_backend_turn(
     backend_id: Option<&str>,
     model_id: Option<&str>,
     level_id: Option<&str>,
+    native_session_id: Option<&str>,
+    native_server: Option<Arc<OpencodeNativeServer>>,
     session_history: &[BackendAgentTranscriptEvent],
     state: &ServerState,
     progress: &mut dyn BackendAgentProgressSink,
@@ -2620,7 +2695,17 @@ fn execute_agent_backend_turn(
             executor.execute_turn(&request, &mut runtime, progress)
         }
         AgentBackend::Opencode(config) => {
-            let mut executor = OpencodeExecutor::new(config);
+            let native_server = native_server
+                .or_else(|| state.agent_runtime.native_server.clone())
+                .ok_or_else(|| "native opencode server is not available".to_owned())?;
+            let native_session_id = native_session_id.ok_or_else(|| {
+                "native opencode session is not available for this turn".to_owned()
+            })?;
+            let mut executor = OpencodeExecutor::with_native_server(
+                config,
+                native_server,
+                Some(native_session_id.to_owned()),
+            );
             executor.execute_turn(&request, &mut runtime, progress)
         }
     }?;
@@ -2906,6 +2991,8 @@ fn execute_agent_backend_turn_in_worker(
     backend_id: Option<&str>,
     model_id: Option<&str>,
     level_id: Option<&str>,
+    native_session_id: Option<&str>,
+    native_server: Option<Arc<OpencodeNativeServer>>,
     session_history: &[BackendAgentTranscriptEvent],
     state: &AgentWorkerState,
     progress: &mut dyn BackendAgentProgressSink,
@@ -2927,7 +3014,17 @@ fn execute_agent_backend_turn_in_worker(
             executor.execute_turn(&request, &mut runtime, progress)
         }
         AgentBackend::Opencode(config) => {
-            let mut executor = OpencodeExecutor::new(config);
+            let native_server = native_server
+                .or_else(|| state.native_server.clone())
+                .ok_or_else(|| "native opencode server is not available".to_owned())?;
+            let native_session_id = native_session_id.ok_or_else(|| {
+                "native opencode session is not available for this turn".to_owned()
+            })?;
+            let mut executor = OpencodeExecutor::with_native_server(
+                config,
+                native_server,
+                Some(native_session_id.to_owned()),
+            );
             executor.execute_turn(&request, &mut runtime, progress)
         }
     }?;
@@ -5126,6 +5223,7 @@ mod tests {
             agent_turns: Arc::new(Mutex::new(crate::AgentTurnStore::default())),
             agent_runtime: AgentRuntimeConfig {
                 backend: AgentBackend::Stub,
+                native_server: None,
                 models: vec![AgentCapabilityOption {
                     id: "stub/default".to_owned(),
                     label: "stub".to_owned(),
@@ -5506,6 +5604,7 @@ mod tests {
             resource: "ifc/building-architecture".to_owned(),
             schema_id: "IFC4X3_ADD2".to_owned(),
             schema_slug: Some("ifc4x3_add2".to_owned()),
+            opencode_session_id: None,
             turn_count: 3,
             transcript: vec![
                 AgentTranscriptEvent::system(

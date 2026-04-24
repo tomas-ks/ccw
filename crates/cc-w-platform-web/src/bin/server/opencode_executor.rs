@@ -6,6 +6,7 @@ use super::agent_executor::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use reqwest::blocking::Client;
 use std::{
     collections::{BTreeMap, HashMap},
     env,
@@ -14,8 +15,8 @@ use std::{
     fmt,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
-    sync::{Arc, Mutex},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -259,6 +260,8 @@ pub enum PlannedUiAction {
 #[derive(Debug, Clone)]
 pub struct OpencodeExecutor {
     config: OpencodeExecutorConfig,
+    native_server: Option<Arc<OpencodeNativeServer>>,
+    native_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,9 +270,413 @@ pub struct OpencodeDiscoveredModel {
     pub variants: Vec<String>,
 }
 
+#[derive(Debug)]
+pub struct OpencodeNativeServer {
+    base_url: String,
+    client: Client,
+    process: Mutex<Option<Child>>,
+    working_directory: Option<PathBuf>,
+    event_bus: Arc<NativeEventBus>,
+}
+
+impl OpencodeNativeServer {
+    pub fn start(
+        config: &OpencodeExecutorConfig,
+        viewer_api_base: Option<&str>,
+    ) -> Result<Arc<Self>, String> {
+        let executable = resolve_executable(&config.executable)
+            .map_err(|error| error.to_string())?;
+        let mut command = Command::new(&executable);
+        command.arg("serve");
+        command.arg("--pure");
+        command.arg("--hostname");
+        command.arg("127.0.0.1");
+        command.arg("--port");
+        command.arg("0");
+        if let Some(working_directory) = &config.working_directory {
+            command.current_dir(working_directory);
+        }
+        if let Some(config_path) = &config.config_path {
+            command.env("OPENCODE_CONFIG", config_path);
+        }
+        if let Some(viewer_api_base) = viewer_api_base.filter(|value| !value.trim().is_empty()) {
+            command.env("CC_W_VIEWER_API_BASE", viewer_api_base.trim());
+        }
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let mut child = command
+            .spawn()
+            .map_err(|source| format!("could not start opencode serve process: {source}"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "opencode serve did not expose stdout".to_owned())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "opencode serve did not expose stderr".to_owned())?;
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<String, String>>();
+        let startup_timeout = config.timeout.max(Duration::from_secs(10));
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            let mut output = Vec::new();
+            loop {
+                line.clear();
+                let Ok(bytes_read) = reader.read_line(&mut line) else {
+                    let _ = ready_tx.send(Err("failed to read opencode serve startup output".to_owned()));
+                    return;
+                };
+                if bytes_read == 0 {
+                    let message = String::from_utf8_lossy(&output).trim().to_owned();
+                    let _ = ready_tx.send(Err(if message.is_empty() {
+                        "opencode serve exited before announcing a listening URL".to_owned()
+                    } else {
+                        format!(
+                            "opencode serve exited before announcing a listening URL; output: {message}"
+                        )
+                    }));
+                    return;
+                }
+                output.extend_from_slice(line.as_bytes());
+                let trimmed = line.trim();
+                if trimmed.starts_with("opencode server listening") {
+                    if let Some(url) = trimmed
+                        .split_whitespace()
+                        .find(|segment| segment.starts_with("http://") || segment.starts_with("https://"))
+                    {
+                        let _ = ready_tx.send(Ok(url.to_owned()));
+                        return;
+                    }
+                    let _ = ready_tx.send(Err(format!(
+                        "failed to parse opencode serve URL from startup line: {trimmed}"
+                    )));
+                    return;
+                }
+            }
+        });
+
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    println!("w web opencode serve {}", trimmed);
+                }
+                line.clear();
+            }
+        });
+
+        let started = Instant::now();
+        let base_url = loop {
+            if crate::should_stop_requested() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("opencode serve startup interrupted by shutdown request".to_owned());
+            }
+
+            if started.elapsed() >= startup_timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "timed out waiting for opencode serve to start after {} ms",
+                    startup_timeout.as_millis()
+                ));
+            }
+
+            let remaining = startup_timeout - started.elapsed();
+            match ready_rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                Ok(Ok(url)) => break url,
+                Ok(Err(error)) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("opencode serve startup channel disconnected".to_owned());
+                }
+            }
+        };
+
+        let client = Client::builder()
+            .build()
+            .map_err(|error| format!("could not create opencode HTTP client: {error}"))?;
+        let server = Arc::new(Self {
+            base_url,
+            client,
+            process: Mutex::new(Some(child)),
+            working_directory: config.working_directory.clone(),
+            event_bus: Arc::new(NativeEventBus::default()),
+        });
+        server.wait_until_healthy(startup_timeout)?;
+        if crate::should_stop_requested() {
+            server.shutdown();
+            return Err("opencode serve startup interrupted by shutdown request".to_owned());
+        }
+        server.start_event_router();
+        Ok(server)
+    }
+
+    fn wait_until_healthy(&self, timeout: Duration) -> Result<(), String> {
+        let started = Instant::now();
+        loop {
+            if crate::should_stop_requested() {
+                return Err("opencode serve startup interrupted by shutdown request".to_owned());
+            }
+            match self.client.get(self.url("/global/health")).send() {
+                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(_) | Err(_) => {
+                    if started.elapsed() >= timeout {
+                        return Err(format!(
+                            "timed out waiting for opencode health check after {} ms",
+                            timeout.as_millis()
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url.trim_end_matches('/'), path)
+    }
+
+    fn query_pairs(&self) -> Vec<(String, String)> {
+        self.working_directory
+            .as_ref()
+            .map(|working_directory| {
+                vec![(
+                    "directory".to_owned(),
+                    working_directory.display().to_string(),
+                )]
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn create_session(&self, title: &str) -> Result<String, String> {
+        let mut body = serde_json::Map::new();
+        if !title.trim().is_empty() {
+            body.insert("title".to_owned(), Value::String(title.trim().to_owned()));
+        }
+        let response = self
+            .client
+            .post(self.url("/session"))
+            .query(&self.query_pairs())
+            .json(&Value::Object(body))
+            .send()
+            .map_err(|error| format!("could not create opencode session: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("could not create opencode session: {error}"))?;
+        let value: Value = response
+            .json()
+            .map_err(|error| format!("could not parse opencode session response: {error}"))?;
+        value
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "opencode session response did not include an id".to_owned())
+    }
+
+    pub fn subscribe_session_events(
+        self: &Arc<Self>,
+        session_id: &str,
+    ) -> NativeSessionEventSubscription {
+        let receiver = self.event_bus.subscribe(session_id);
+        NativeSessionEventSubscription {
+            session_id: session_id.to_owned(),
+            event_bus: Arc::clone(&self.event_bus),
+            receiver,
+        }
+    }
+
+    pub fn prompt_async(
+        &self,
+        session_id: &str,
+        agent: Option<&str>,
+        model: Option<&str>,
+        variant: Option<&str>,
+        text: &str,
+    ) -> Result<(), String> {
+        let mut body = serde_json::Map::new();
+        if let Some(agent) = agent.filter(|value| !value.trim().is_empty()) {
+            body.insert("agent".to_owned(), Value::String(agent.trim().to_owned()));
+        }
+        if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
+            if let Some((provider_id, model_id)) = split_provider_model_id(model) {
+                body.insert(
+                    "model".to_owned(),
+                    serde_json::json!({
+                        "providerID": provider_id,
+                        "modelID": model_id,
+                    }),
+                );
+            }
+        }
+        if let Some(variant) = variant.filter(|value| !value.trim().is_empty()) {
+            body.insert("variant".to_owned(), Value::String(variant.trim().to_owned()));
+        }
+        body.insert(
+            "parts".to_owned(),
+            serde_json::json!([
+                {
+                    "type": "text",
+                    "text": text,
+                }
+            ]),
+        );
+
+        self.client
+            .post(self.url(&format!("/session/{session_id}/prompt_async")))
+            .query(&self.query_pairs())
+            .json(&Value::Object(body))
+            .send()
+            .map_err(|error| format!("could not submit opencode prompt: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("could not submit opencode prompt: {error}"))?;
+        Ok(())
+    }
+
+    pub fn abort_session(&self, session_id: &str) -> Result<(), String> {
+        self.client
+            .delete(self.url(&format!("/session/{session_id}/abort")))
+            .query(&self.query_pairs())
+            .send()
+            .map_err(|error| format!("could not abort opencode session: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("could not abort opencode session: {error}"))?;
+        Ok(())
+    }
+
+    pub fn subscribe_events(&self) -> Result<reqwest::blocking::Response, String> {
+        self.client
+            .get(self.url("/event"))
+            .query(&self.query_pairs())
+            .send()
+            .map_err(|error| format!("could not subscribe to opencode events: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("could not subscribe to opencode events: {error}"))
+    }
+
+    fn start_event_router(self: &Arc<Self>) {
+        let server = Arc::clone(self);
+        thread::spawn(move || {
+            let response = match server.subscribe_events() {
+                Ok(response) => response,
+                Err(error) => {
+                    println!("w web opencode event router failed to subscribe: {}", error);
+                    return;
+                }
+            };
+            let (event_rx, reader_join) = spawn_native_event_reader(response);
+            loop {
+                match event_rx.recv() {
+                    Ok(NativeStreamEvent::Value(value)) => server.event_bus.publish(value),
+                    Ok(NativeStreamEvent::End) => break,
+                    Ok(NativeStreamEvent::Error(error)) => {
+                        println!("w web opencode event router error: {}", error);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = reader_join.join();
+        });
+    }
+
+    pub fn shutdown(&self) {
+        if let Ok(mut process) = self.process.lock() {
+            if let Some(mut child) = process.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+impl Drop for OpencodeNativeServer {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[derive(Debug, Default)]
+struct NativeEventBus {
+    subscribers: Mutex<HashMap<String, mpsc::Sender<Value>>>,
+}
+
+impl NativeEventBus {
+    fn subscribe(&self, session_id: &str) -> mpsc::Receiver<Value> {
+        let (sender, receiver) = mpsc::channel();
+        if let Ok(mut subscribers) = self.subscribers.lock() {
+            subscribers.insert(session_id.to_owned(), sender);
+        }
+        receiver
+    }
+
+    fn unsubscribe(&self, session_id: &str) {
+        if let Ok(mut subscribers) = self.subscribers.lock() {
+            subscribers.remove(session_id);
+        }
+    }
+
+    fn publish(&self, event: Value) {
+        let Some(session_id) = native_event_session_id(&event).map(ToOwned::to_owned) else {
+            return;
+        };
+        let Some(sender) = self.subscribers.lock().ok().and_then(|subscribers| {
+            subscribers.get(&session_id).cloned()
+        }) else {
+            return;
+        };
+        if sender.send(event).is_err() {
+            self.unsubscribe(&session_id);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct NativeSessionEventSubscription {
+    session_id: String,
+    event_bus: Arc<NativeEventBus>,
+    receiver: mpsc::Receiver<Value>,
+}
+
+impl NativeSessionEventSubscription {
+    fn receiver(&self) -> &mpsc::Receiver<Value> {
+        &self.receiver
+    }
+}
+
+impl Drop for NativeSessionEventSubscription {
+    fn drop(&mut self) {
+        self.event_bus.unsubscribe(&self.session_id);
+    }
+}
+
 impl OpencodeExecutor {
     pub fn new(config: OpencodeExecutorConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            native_server: None,
+            native_session_id: None,
+        }
+    }
+
+    pub fn with_native_server(
+        config: OpencodeExecutorConfig,
+        native_server: Arc<OpencodeNativeServer>,
+        native_session_id: Option<String>,
+    ) -> Self {
+        Self {
+            config,
+            native_server: Some(native_server),
+            native_session_id,
+        }
     }
 
     pub fn config(&self) -> &OpencodeExecutorConfig {
@@ -305,6 +712,85 @@ impl OpencodeExecutor {
         }
     }
 
+    fn execute_turn_native(
+        &self,
+        request: &AgentBackendTurnRequest,
+        progress: &mut dyn AgentProgressSink,
+        native_server: Arc<OpencodeNativeServer>,
+        native_session_id: String,
+    ) -> Result<AgentBackendTurnResponse, String> {
+        let model = self.config.model.as_deref();
+        let variant = self.config.variant.as_deref();
+        let agent = self.config.agent.as_deref();
+
+        println!(
+            "w web opencode native agent={} model={} variant={}",
+            agent.unwrap_or("ifc-explorer"),
+            model.unwrap_or("-"),
+            variant.unwrap_or("-"),
+        );
+
+        let event_subscription = native_server.subscribe_session_events(&native_session_id);
+        let prompt = build_native_turn_prompt(request, agent);
+
+        native_server
+            .prompt_async(
+                &native_session_id,
+                agent,
+                model,
+                variant,
+                &prompt,
+            )
+            .map_err(|error| format!("opencode prompt submission failed: {error}"))?;
+
+        let mut collector = NativeTurnCollector::new();
+        let mut last_activity = Instant::now();
+        let idle_timeout = self.config.timeout;
+
+        loop {
+            if crate::should_stop_requested() {
+                native_server.shutdown();
+                return Err("opencode turn interrupted by shutdown request".to_owned());
+            }
+            match event_subscription
+                .receiver()
+                .recv_timeout(Duration::from_millis(CHILD_POLL_INTERVAL_MS))
+            {
+                Ok(value) => {
+                    let events = native_turn_progress_events_from_value(&value, &mut collector);
+                    if !events.is_empty() {
+                        last_activity = Instant::now();
+                    }
+                    for event in events {
+                        println!("w web opencode progress {}", summarize_agent_transcript_event(&event));
+                        progress.emit(event.clone());
+                        collector.transcript.push(event);
+                    }
+                    if collector.done {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if last_activity.elapsed() >= idle_timeout {
+                        return Err(format!(
+                            "opencode executable timed out after {} ms without progress",
+                            idle_timeout.as_millis()
+                        ));
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        collector.finish(&native_session_id, progress);
+
+        Ok(AgentBackendTurnResponse {
+            transcript: collector.transcript,
+            action_candidates: collector.action_candidates,
+            queries_executed: collector.queries_executed,
+        })
+    }
+
     fn run_step_once(
         &self,
         request: &OpencodeTurnRequest,
@@ -323,14 +809,14 @@ impl OpencodeExecutor {
         if self.config.args.is_empty() {
             if let Some(agent) = agent {
                 println!(
-                    "w web opencode run agent={} model={} variant={}",
+                    "w web opencode subprocess agent={} model={} variant={}",
                     agent,
                     self.config.model.as_deref().unwrap_or("-"),
                     self.config.variant.as_deref().unwrap_or("-"),
                 );
             } else {
                 println!(
-                    "w web opencode run model={} variant={}",
+                    "w web opencode subprocess model={} variant={}",
                     self.config.model.as_deref().unwrap_or("-"),
                     self.config.variant.as_deref().unwrap_or("-"),
                 );
@@ -344,14 +830,14 @@ impl OpencodeExecutor {
         } else {
             if let Some(agent) = agent {
                 println!(
-                    "w web opencode run custom_args=1 agent_selection_ignored={} model_selection_ignored={} variant_selection_ignored={}",
+                    "w web opencode subprocess custom_args=1 agent_selection_ignored={} model_selection_ignored={} variant_selection_ignored={}",
                     agent,
                     self.config.model.as_deref().unwrap_or("-"),
                     self.config.variant.as_deref().unwrap_or("-"),
                 );
             } else {
                 println!(
-                    "w web opencode run custom_args=1 model_selection_ignored={} variant_selection_ignored={}",
+                    "w web opencode subprocess custom_args=1 model_selection_ignored={} variant_selection_ignored={}",
                     self.config.model.as_deref().unwrap_or("-"),
                     self.config.variant.as_deref().unwrap_or("-"),
                 );
@@ -442,6 +928,13 @@ impl OpencodeExecutor {
         });
 
         let exit_status = loop {
+            if crate::should_stop_requested() {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_capture(stdout_handle, &executable, "stdout");
+                let _ = join_capture(stderr_handle, &executable, "stderr");
+                return Err(OpencodeExecutorError::Interrupted { executable });
+            }
             drain_progress_events(&progress_events, progress, &executable)?;
             if let Some(status) =
                 child
@@ -563,6 +1056,13 @@ pub fn discover_opencode_models(
 
     let start = Instant::now();
     let exit_status = loop {
+        if crate::should_stop_requested() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = join_capture(stdout_handle, &executable, "stdout");
+            let _ = join_capture(stderr_handle, &executable, "stderr");
+            return Err(OpencodeExecutorError::Interrupted { executable });
+        }
         if let Some(status) =
             child
                 .try_wait()
@@ -612,6 +1112,18 @@ impl AgentExecutor for OpencodeExecutor {
         runtime: &mut dyn AgentReadonlyCypherRuntime,
         progress: &mut dyn AgentProgressSink,
     ) -> Result<AgentBackendTurnResponse, String> {
+        if let (Some(native_server), Some(native_session_id)) = (
+            self.native_server.as_ref().cloned(),
+            self.native_session_id.as_deref(),
+        ) {
+            return self.execute_turn_native(
+                request,
+                progress,
+                native_server,
+                native_session_id.to_owned(),
+            );
+        }
+
         let mut transcript = Vec::new();
         let mut action_candidates = Vec::new();
         let mut tool_results = Vec::new();
@@ -1180,6 +1692,9 @@ pub enum OpencodeExecutorError {
         stdout_excerpt: String,
         stderr_excerpt: String,
     },
+    Interrupted {
+        executable: PathBuf,
+    },
     ExitedBadly {
         executable: PathBuf,
         status: ExitStatus,
@@ -1253,6 +1768,11 @@ impl fmt::Display for OpencodeExecutorError {
                 timeout.as_millis(),
                 format_excerpt_suffix(stderr_excerpt)
             ),
+            Self::Interrupted { executable } => write!(
+                f,
+                "opencode executable `{}` was interrupted by shutdown request",
+                executable.display()
+            ),
             Self::ExitedBadly {
                 executable,
                 status,
@@ -1308,6 +1828,645 @@ impl Error for OpencodeExecutorError {
 #[derive(Debug)]
 struct OutputCapture {
     bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum NativeStreamEvent {
+    Value(Value),
+    End,
+    Error(String),
+}
+
+#[derive(Debug, Default)]
+struct NativeTurnCollector {
+    transcript: Vec<AgentTranscriptEvent>,
+    action_candidates: Vec<AgentActionCandidate>,
+    queries_executed: usize,
+    done: bool,
+    final_text: Option<String>,
+    last_tool_snapshot_by_call_id: HashMap<String, String>,
+    last_tool_status_by_call_id: HashMap<String, String>,
+    last_tool_call_emitted_by_call_id: HashMap<String, bool>,
+}
+
+impl NativeTurnCollector {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn handle_event(&mut self, event: &Value) -> Vec<AgentTranscriptEvent> {
+        let event_type = native_event_type(event);
+        let payload = native_event_payload(event);
+        match event_type.as_deref() {
+            Some("message.part.updated") | Some("message.part.updated.1") => {
+                if let Some(part) = native_event_part(payload) {
+                    self.handle_part(part)
+                } else {
+                    Vec::new()
+                }
+            }
+            Some("message.part.delta") | Some("message.part.delta.1") => {
+                self.handle_part_delta(payload);
+                Vec::new()
+            }
+            Some("session.status") => {
+                if native_session_is_idle(payload) {
+                    self.done = true;
+                }
+                Vec::new()
+            }
+            Some("session.idle") => {
+                self.done = true;
+                Vec::new()
+            }
+            Some("session.error") => {
+                self.done = true;
+                vec![AgentTranscriptEvent::system(
+                    native_session_error_summary(payload)
+                        .unwrap_or_else(|| "OpenCode session reported an error.".to_owned()),
+                )]
+            }
+            Some("message.updated") | Some("message.updated.1") => Vec::new(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn finish(&mut self, session_id: &str, progress: &mut dyn AgentProgressSink) {
+        if let Some(final_text) = self.final_text.as_deref().map(str::trim) {
+            if !final_text.is_empty() {
+                let event = AgentTranscriptEvent::assistant(final_text.to_owned());
+                progress.emit(event.clone());
+                self.transcript.push(event);
+            }
+        }
+        if self.transcript.is_empty() {
+            let event = AgentTranscriptEvent::system(format!(
+                "OpenCode session {} completed.",
+                session_id
+            ));
+            progress.emit(event.clone());
+            self.transcript.push(event);
+        }
+        self.done = true;
+    }
+
+    fn handle_part(&mut self, part: &Value) -> Vec<AgentTranscriptEvent> {
+        let Some(part_type) = part.get("type").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        match part_type {
+            "tool" => self.handle_tool_part(part),
+            "text" => {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        self.final_text = Some(trimmed.to_owned());
+                    }
+                }
+                Vec::new()
+            }
+            "reasoning" => {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        self.final_text = Some(trimmed.to_owned());
+                    }
+                }
+                Vec::new()
+            }
+            "step-start" => {
+                let snapshot = native_part_snapshot(part);
+                if native_record_part_snapshot(
+                    &mut self.last_tool_snapshot_by_call_id,
+                    part,
+                    snapshot,
+                ) {
+                    vec![AgentTranscriptEvent::system(
+                        "opencode progress: step started".to_owned(),
+                    )]
+                } else {
+                    Vec::new()
+                }
+            }
+            "step-finish" => {
+                let snapshot = native_part_snapshot(part);
+                if native_record_part_snapshot(
+                    &mut self.last_tool_snapshot_by_call_id,
+                    part,
+                    snapshot,
+                ) {
+                    vec![AgentTranscriptEvent::system(
+                        "opencode progress: step finished".to_owned(),
+                    )]
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn handle_part_delta(&mut self, payload: &Value) {
+        let Some(part_id) = native_part_id(payload) else {
+            return;
+        };
+        let Some(field) = payload.get("field").and_then(Value::as_str) else {
+            return;
+        };
+        if field != "text" && field != "reasoning" {
+            return;
+        }
+        let Some(delta) = payload.get("delta").and_then(Value::as_str) else {
+            return;
+        };
+        if delta.trim().is_empty() {
+            return;
+        }
+        let mut current = self.final_text.take().unwrap_or_default();
+        if current.is_empty() {
+            current = delta.to_owned();
+        } else if !current.ends_with(delta) {
+            current.push_str(delta);
+        }
+        let _ = part_id;
+        self.final_text = Some(current);
+    }
+
+    fn handle_tool_part(&mut self, part: &Value) -> Vec<AgentTranscriptEvent> {
+        let Some(tool_name) = native_tool_name(part) else {
+            return Vec::new();
+        };
+        let Some(call_id) = native_tool_call_id(part) else {
+            return Vec::new();
+        };
+        let state = part.get("state").and_then(Value::as_object);
+        let status = state
+            .and_then(|state| state.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("running")
+            .trim()
+            .to_owned();
+        let snapshot = native_tool_state_snapshot(part);
+        if !native_record_tool_snapshot(
+            &mut self.last_tool_snapshot_by_call_id,
+            &call_id,
+            snapshot,
+        ) {
+            return Vec::new();
+        }
+        self.last_tool_status_by_call_id
+            .insert(call_id.clone(), status.clone());
+        let state_value = state
+            .map(|state| Value::Object(state.clone()))
+            .unwrap_or(Value::Null);
+        let input = state
+            .and_then(|state| state.get("input"))
+            .or_else(|| state.and_then(|state| state.get("args")))
+            .or_else(|| state.and_then(|state| state.get("arguments")))
+            .or_else(|| state.and_then(|state| state.get("request")));
+        let mut events = Vec::new();
+        let call_events = opencode_tool_progress_call_events(
+            &tool_name,
+            state.and_then(|state| state.get("title").and_then(Value::as_str)),
+            &status,
+            input,
+        );
+        let call_already_emitted = *self
+            .last_tool_call_emitted_by_call_id
+            .get(&call_id)
+            .unwrap_or(&false);
+
+        match status.as_str() {
+            "pending" | "running" | "started" | "streaming" | "in_progress" => {
+                if !call_events.is_empty() {
+                    self.last_tool_call_emitted_by_call_id
+                        .insert(call_id.clone(), true);
+                    events.extend(call_events);
+                }
+            }
+            "completed" => {
+                if !call_already_emitted {
+                    if !call_events.is_empty() {
+                        self.last_tool_call_emitted_by_call_id
+                            .insert(call_id.clone(), true);
+                        events.extend(call_events);
+                    }
+                    events.push(AgentTranscriptEvent::tool(opencode_tool_progress_output_summary(
+                        &tool_name,
+                        state.and_then(|state| state.get("output")),
+                    )));
+                } else {
+                    events.push(AgentTranscriptEvent::tool(opencode_tool_progress_output_summary(
+                        &tool_name,
+                        state.and_then(|state| state.get("output")),
+                    )));
+                }
+            }
+            "error" => {
+                if !call_already_emitted {
+                    if !call_events.is_empty() {
+                        self.last_tool_call_emitted_by_call_id
+                            .insert(call_id.clone(), true);
+                        events.extend(call_events);
+                    }
+                    events.push(AgentTranscriptEvent::tool(opencode_tool_progress_error_summary(
+                        &tool_name,
+                        state
+                            .and_then(|state| state.get("error"))
+                            .unwrap_or(&state_value),
+                    )));
+                } else {
+                    events.push(AgentTranscriptEvent::tool(opencode_tool_progress_error_summary(
+                        &tool_name,
+                        state
+                            .and_then(|state| state.get("error"))
+                            .unwrap_or(&state_value),
+                    )));
+                }
+            }
+            _ => {
+                events.extend(opencode_tool_progress_events(&serde_json::json!({
+                    "part": part,
+                })));
+            }
+        }
+
+        if matches!(status.as_str(), "completed") {
+            if let Some(action_candidate) =
+                native_action_candidate_from_tool_call(&tool_name, state)
+            {
+                self.action_candidates.push(action_candidate);
+            }
+            if is_native_readonly_cypher_tool_name(&tool_name) {
+                self.queries_executed = self.queries_executed.saturating_add(1);
+            }
+        }
+
+        events
+    }
+}
+
+fn native_record_part_snapshot(
+    snapshots: &mut HashMap<String, String>,
+    part: &Value,
+    snapshot: String,
+) -> bool {
+    let Some(part_id) = native_part_id(part) else {
+        return false;
+    };
+    native_record_snapshot(snapshots, &part_id, snapshot)
+}
+
+fn native_record_tool_snapshot(
+    snapshots: &mut HashMap<String, String>,
+    call_id: &str,
+    snapshot: String,
+) -> bool {
+    native_record_snapshot(snapshots, call_id, snapshot)
+}
+
+fn native_record_snapshot(
+    snapshots: &mut HashMap<String, String>,
+    key: &str,
+    snapshot: String,
+) -> bool {
+    match snapshots.get(key) {
+        Some(previous) if previous == &snapshot => false,
+        _ => {
+            snapshots.insert(key.to_owned(), snapshot);
+            true
+        }
+    }
+}
+
+fn native_part_id(part: &Value) -> Option<String> {
+    part.get("id")
+        .and_then(Value::as_str)
+        .or_else(|| part.get("callID").and_then(Value::as_str))
+        .or_else(|| part.get("callId").and_then(Value::as_str))
+        .or_else(|| part.get("messageID").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+}
+
+fn native_part_snapshot(part: &Value) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "type": part.get("type").and_then(Value::as_str),
+        "reason": part.get("reason").and_then(Value::as_str),
+        "status": part.get("status").and_then(Value::as_str),
+        "title": part.get("title").and_then(Value::as_str),
+        "reasonCode": part.get("reasonCode").and_then(Value::as_str),
+    }))
+    .unwrap_or_default()
+}
+
+fn native_tool_state_snapshot(part: &Value) -> String {
+    let state = part.get("state").cloned().unwrap_or(Value::Null);
+    serde_json::to_string(&serde_json::json!({
+        "tool": native_tool_name(part),
+        "callID": native_tool_call_id(part),
+        "status": state.get("status").and_then(Value::as_str),
+        "input": state.get("input"),
+        "output": state.get("output"),
+        "error": state.get("error"),
+        "title": state.get("title").and_then(Value::as_str),
+    }))
+    .unwrap_or_default()
+}
+
+fn native_turn_progress_events_from_value(
+    value: &Value,
+    collector: &mut NativeTurnCollector,
+) -> Vec<AgentTranscriptEvent> {
+    let event_type = native_event_type(value);
+    let payload = native_event_payload(value);
+    match event_type.as_deref() {
+        Some("message.part.updated") | Some("message.part.updated.1") => {
+            if let Some(part) = native_event_part(payload) {
+                collector.handle_part(part)
+            } else {
+                Vec::new()
+            }
+        }
+        Some("message.part.delta") | Some("message.part.delta.1") => {
+            collector.handle_part_delta(payload);
+            Vec::new()
+        }
+        Some("session.status") => {
+            if native_session_is_idle(payload) {
+                collector.done = true;
+            }
+            Vec::new()
+        }
+        Some("session.idle") => {
+            collector.done = true;
+            Vec::new()
+        }
+        Some("session.error") => {
+            collector.done = true;
+            vec![AgentTranscriptEvent::system(
+                native_session_error_summary(payload)
+                    .unwrap_or_else(|| "OpenCode session reported an error.".to_owned()),
+            )]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn native_event_type(value: &Value) -> Option<String> {
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| value.get("name").and_then(Value::as_str).map(ToOwned::to_owned))
+}
+
+fn native_event_payload(value: &Value) -> &Value {
+    value
+        .get("properties")
+        .or_else(|| value.get("data"))
+        .unwrap_or(value)
+}
+
+fn native_event_part(value: &Value) -> Option<&Value> {
+    value
+        .get("part")
+        .or_else(|| value.get("info"))
+        .or_else(|| value.get("message"))
+        .or_else(|| value.get("properties").and_then(|properties| properties.get("part")))
+}
+
+fn native_event_session_id(value: &Value) -> Option<&str> {
+    value
+        .get("sessionID")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("sessionId").and_then(Value::as_str))
+        .or_else(|| value.get("properties").and_then(|value| value.get("sessionID")).and_then(Value::as_str))
+        .or_else(|| value.get("data").and_then(|value| value.get("sessionID")).and_then(Value::as_str))
+}
+
+fn native_session_is_idle(value: &Value) -> bool {
+    matches!(
+        value
+            .get("status")
+            .and_then(Value::as_object)
+            .and_then(|status| status.get("type"))
+            .and_then(Value::as_str),
+        Some("idle")
+    ) || matches!(
+        value.get("status").and_then(Value::as_str),
+        Some("idle")
+    )
+}
+
+fn native_session_error_summary(value: &Value) -> Option<String> {
+    let error = value.get("error").or_else(|| value.get("properties")?.get("error"))?;
+    let message = error
+        .get("data")
+        .and_then(|data| data.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| error.get("message").and_then(Value::as_str))
+        .or_else(|| error.get("name").and_then(Value::as_str))
+        .unwrap_or("session error");
+    Some(message.trim().to_owned())
+}
+
+fn native_tool_name(part: &Value) -> Option<String> {
+    part.get("tool")
+        .and_then(Value::as_str)
+        .or_else(|| part.get("name").and_then(Value::as_str))
+        .map(|value| canonical_native_tool_name(value).to_owned())
+}
+
+fn native_tool_call_id(part: &Value) -> Option<String> {
+    part.get("callID")
+        .and_then(Value::as_str)
+        .or_else(|| part.get("callId").and_then(Value::as_str))
+        .or_else(|| part.get("id").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+}
+
+fn canonical_native_tool_name(tool_name: &str) -> &str {
+    let trimmed = tool_name.trim();
+    trimmed.strip_prefix("ifc_").unwrap_or(trimmed)
+}
+
+fn split_provider_model_id(model_id: &str) -> Option<(&str, &str)> {
+    let (provider_id, model_id) = model_id.split_once('/')?;
+    let provider_id = provider_id.trim();
+    let model_id = model_id.trim();
+    (!provider_id.is_empty() && !model_id.is_empty()).then_some((provider_id, model_id))
+}
+
+fn display_native_tool_name(tool_name: &str) -> String {
+    match canonical_native_tool_name(tool_name) {
+        "schema_context" => "ifc_schema_context".to_owned(),
+        "model_details" => "ifc_model_details".to_owned(),
+        "entity_reference" => "ifc_entity_reference".to_owned(),
+        "relation_reference" => "ifc_relation_reference".to_owned(),
+        "query_playbook" => "ifc_query_playbook".to_owned(),
+        "readonly_cypher" => "ifc_readonly_cypher".to_owned(),
+        "node_relations" => "ifc_node_relations".to_owned(),
+        "renderable_descendants" => "ifc_renderable_descendants".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn is_native_readonly_cypher_tool_name(tool_name: &str) -> bool {
+    matches!(
+        canonical_native_tool_name(tool_name),
+        "readonly_cypher" | "run_readonly_cypher"
+    )
+}
+
+fn native_action_candidate_from_tool_call(
+    tool_name: &str,
+    state: Option<&serde_json::Map<String, Value>>,
+) -> Option<AgentActionCandidate> {
+    let state = state?;
+    let input = state.get("input")?.as_object()?;
+    match canonical_native_tool_name(tool_name) {
+        "graph_set_seeds" => native_db_node_ids_from_input(input).map(AgentActionCandidate::graph_set_seeds),
+        "properties_show_node" => native_db_node_id_from_input(input)
+            .map(AgentActionCandidate::properties_show_node),
+        "elements_hide" => native_semantic_ids_from_input(input)
+            .map(AgentActionCandidate::elements_hide),
+        "elements_show" => native_semantic_ids_from_input(input)
+            .map(AgentActionCandidate::elements_show),
+        "elements_select" => native_semantic_ids_from_input(input)
+            .map(AgentActionCandidate::elements_select),
+        "viewer_frame_visible" | "frame" => Some(AgentActionCandidate::viewer_frame_visible()),
+        _ => None,
+    }
+}
+
+fn native_db_node_ids_from_input(input: &serde_json::Map<String, Value>) -> Option<Vec<i64>> {
+    let ids = input
+        .get("db_node_ids")
+        .or_else(|| input.get("dbNodeIds"))
+        .or_else(|| input.get("nodeIds"))
+        .or_else(|| input.get("ids"))?
+        .as_array()?;
+    let ids = ids
+        .iter()
+        .filter_map(|value| match value {
+            Value::Number(number) => number.as_i64(),
+            Value::String(text) => text.trim().parse::<i64>().ok(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    (!ids.is_empty()).then_some(ids)
+}
+
+fn native_db_node_id_from_input(input: &serde_json::Map<String, Value>) -> Option<i64> {
+    input
+        .get("db_node_id")
+        .or_else(|| input.get("dbNodeId"))
+        .or_else(|| input.get("nodeId"))
+        .or_else(|| input.get("id"))
+        .and_then(|value| match value {
+            Value::Number(number) => number.as_i64(),
+            Value::String(text) => text.trim().parse::<i64>().ok(),
+            _ => None,
+        })
+}
+
+fn native_semantic_ids_from_input(input: &serde_json::Map<String, Value>) -> Option<Vec<String>> {
+    let ids = input
+        .get("semantic_ids")
+        .or_else(|| input.get("semanticIds"))
+        .or_else(|| input.get("elementIds"))
+        .or_else(|| input.get("ids"))?
+        .as_array()?;
+    let ids = ids
+        .iter()
+        .filter_map(|value| value.as_str().map(str::trim).map(ToOwned::to_owned))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    (!ids.is_empty()).then_some(ids)
+}
+
+fn spawn_native_event_reader(
+    response: reqwest::blocking::Response,
+) -> (mpsc::Receiver<NativeStreamEvent>, thread::JoinHandle<()>) {
+    let (sender, receiver) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut reader = BufReader::new(response);
+        let mut line = String::new();
+        let mut event_name = None::<String>;
+        let mut data_lines = Vec::<String>::new();
+
+        let flush_event = |event_name: &mut Option<String>,
+                           data_lines: &mut Vec<String>,
+                           sender: &mpsc::Sender<NativeStreamEvent>| {
+            if data_lines.is_empty() {
+                event_name.take();
+                return;
+            }
+            let payload_text = data_lines.join("\n");
+            data_lines.clear();
+            event_name.take();
+            let payload = if payload_text.trim_start().starts_with('{')
+                || payload_text.trim_start().starts_with('[')
+            {
+                serde_json::from_str::<Value>(&payload_text)
+            } else {
+                serde_json::from_str::<Value>(payload_text.trim())
+            };
+            match payload {
+                Ok(value) => {
+                    let _ = sender.send(NativeStreamEvent::Value(value));
+                }
+                Err(error) => {
+                    let _ = sender.send(NativeStreamEvent::Error(format!(
+                        "could not parse opencode event stream payload: {error}"
+                    )));
+                }
+            }
+        };
+
+        loop {
+            line.clear();
+            let bytes_read = match reader.read_line(&mut line) {
+                Ok(bytes_read) => bytes_read,
+                Err(error) => {
+                    let _ = sender.send(NativeStreamEvent::Error(format!(
+                        "could not read opencode event stream: {error}"
+                    )));
+                    return;
+                }
+            };
+            if bytes_read == 0 {
+                flush_event(&mut event_name, &mut data_lines, &sender);
+                let _ = sender.send(NativeStreamEvent::End);
+                return;
+            }
+
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                flush_event(&mut event_name, &mut data_lines, &sender);
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix("event:") {
+                event_name = Some(rest.trim().to_owned());
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix("data:") {
+                data_lines.push(rest.trim_start().to_owned());
+                continue;
+            }
+            if trimmed.starts_with(':') {
+                continue;
+            }
+
+            if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+                let _ = sender.send(NativeStreamEvent::Value(value));
+            } else {
+                data_lines.push(trimmed.to_owned());
+            }
+        }
+    });
+
+    (receiver, handle)
 }
 
 fn map_planned_ui_action(action: PlannedUiAction) -> AgentActionCandidate {
@@ -1487,6 +2646,39 @@ fn default_opencode_run_args(
     args
 }
 
+fn turn_context_block(resource: &str, schema_id: &str, schema_slug: Option<&str>) -> Vec<String> {
+    let resource = resource.trim();
+    let schema_id = schema_id.trim();
+    let schema_slug = schema_slug.map(str::trim).filter(|value| !value.is_empty());
+
+    let mut lines = vec![format!("Bound IFC resource for this turn: {}.", resource)];
+    if let Some(slug) = schema_slug {
+        lines.push(format!("Bound IFC schema for this turn: {} ({}).", schema_id, slug));
+    } else {
+        lines.push(format!("Bound IFC schema for this turn: {}.", schema_id));
+    }
+    lines.push(
+        "Use the exact resource string above in any `ifc_*` tool call. Do not swap in a placeholder or `/api`."
+            .to_owned(),
+    );
+    lines
+}
+
+fn build_native_turn_prompt(request: &AgentBackendTurnRequest, agent: Option<&str>) -> String {
+    let mut prompt = turn_context_block(
+        &request.resource,
+        &request.schema_id,
+        request.schema_slug.as_deref(),
+    );
+    if let Some(agent) = agent.filter(|value| !value.trim().is_empty()) {
+        prompt.push(format!("Selected native OpenCode agent: `{}`.", agent.trim()));
+    }
+    prompt.push(String::new());
+    prompt.push("User request:".to_owned());
+    prompt.push(request.input.trim().to_owned());
+    prompt.join("\n")
+}
+
 fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
     let prompt = vec![
         "You are the ccw IFC viewer AI execution layer.".to_owned(),
@@ -1500,6 +2692,12 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
         } else {
             "Return only JSON, with no markdown fences or commentary.".to_owned()
         },
+        turn_context_block(
+            &request.resource,
+            &request.schema_id,
+            request.schema_slug.as_deref(),
+        )
+        .join("\n"),
         "Return one JSON object matching this exact schema:".to_owned(),
         serde_json::to_string_pretty(&serde_json::json!({
             "transcript": [{ "kind": "assistant", "text": "short progress note" }],
@@ -2671,37 +3869,30 @@ fn opencode_tool_progress_call_events(
     if is_cypher_tool_name(tool_name) {
         return opencode_cypher_progress_call_events(title, status, input);
     }
+    let tool_name = display_native_tool_name(tool_name);
 
-    let title = title
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(ToOwned::to_owned);
     let input_summary = input.and_then(|input| {
-        let summary = summarize_tool_input(tool_name, input);
+        let summary = summarize_tool_input(&tool_name, input);
         if summary.is_empty() {
             None
         } else {
             Some(summary)
         }
     });
-    let reason = title
+    let title = title
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToOwned::to_owned);
+    let reason = input_summary
         .clone()
-        .or_else(|| input_summary.clone())
+        .or(title.clone())
         .unwrap_or_else(|| "tool call".to_owned());
 
-    let mut lines = vec![format!("{tool_name} : {reason}")];
-    if let Some(title) = title {
-        if title != reason {
-            lines.push(title);
-        }
-    }
-    if let Some(summary) = input_summary {
-        if summary != reason {
-            lines.push(summary);
-        }
+    if is_placeholder_tool_reason(&reason) {
+        return Vec::new();
     }
 
-    vec![AgentTranscriptEvent::tool(lines.join("\n"))]
+    vec![AgentTranscriptEvent::tool(format!("{tool_name} : {reason}"))]
 }
 
 fn opencode_cypher_progress_call_events(
@@ -2725,11 +3916,6 @@ fn opencode_cypher_progress_call_events(
         .unwrap_or_else(|| "read-only Cypher".to_owned());
 
     let mut lines = vec![format!("ifc_readonly_cypher : {why}")];
-    if let Some(title) = title {
-        if title != why {
-            lines.push(title);
-        }
-    }
     if let Some(Value::Object(object)) = input {
         if let Some(cypher) = get_first_string(object, &["cypher", "query"]) {
             let trimmed = cypher.trim();
@@ -2743,6 +3929,9 @@ fn opencode_cypher_progress_call_events(
             lines.push(summary);
         }
     }
+    if lines.len() == 1 && why == "read-only Cypher" {
+        return Vec::new();
+    }
     vec![AgentTranscriptEvent::tool(lines.join("\n"))]
 }
 
@@ -2752,6 +3941,44 @@ fn summarize_tool_input(tool_name: &str, input: &Value) -> String {
     }
     match input {
         Value::Object(object) => {
+            if let Some(reason) =
+                get_first_string(object, &["why", "reason", "goal", "task", "prompt", "message", "text"])
+            {
+                let trimmed = reason.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_owned();
+                }
+            }
+            if let Some(schema) = get_first_string(object, &["schema"]) {
+                let trimmed = schema.trim();
+                if !trimmed.is_empty() {
+                    return format!("schema {trimmed}");
+                }
+            }
+            if let Some(entity_names) = get_first_value(object, &["entity_names"]) {
+                return format!(
+                    "entity_names: {}",
+                    format_progress_value(&entity_names, 120)
+                );
+            }
+            if let Some(relation_names) = get_first_value(object, &["relation_names"]) {
+                return format!(
+                    "relation_names: {}",
+                    format_progress_value(&relation_names, 120)
+                );
+            }
+            if let Some(db_node_ids) = get_first_value(object, &["db_node_id", "db_node_ids"]) {
+                return format!(
+                    "db_node_ids: {}",
+                    format_progress_value(&db_node_ids, 120)
+                );
+            }
+            if let Some(semantic_ids) = get_first_value(object, &["semantic_ids"]) {
+                return format!(
+                    "semantic_ids: {}",
+                    format_progress_value(&semantic_ids, 120)
+                );
+            }
             let keys = object.keys().take(6).cloned().collect::<Vec<_>>();
             if keys.is_empty() {
                 String::new()
@@ -2762,6 +3989,14 @@ fn summarize_tool_input(tool_name: &str, input: &Value) -> String {
         Value::String(text) => shorten_for_progress(text, 240),
         _ => format_progress_value(input, 240),
     }
+}
+
+fn is_placeholder_tool_reason(reason: &str) -> bool {
+    let lowered = reason.trim().to_ascii_lowercase();
+    lowered.is_empty()
+        || lowered.starts_with("tool call")
+        || lowered.starts_with("input keys:")
+        || lowered == "tool event"
 }
 
 fn summarize_cypher_tool_input(input: &Value) -> String {
@@ -2791,6 +4026,7 @@ fn opencode_tool_progress_output_summary(tool_name: &str, output: Option<&Value>
     if is_cypher_tool_name(tool_name) {
         return summarize_cypher_tool_output(output);
     }
+    let tool_name = canonical_native_tool_name(tool_name);
     match output {
         Some(value) => {
             let normalized = normalize_progress_payload(value);
@@ -2854,12 +4090,12 @@ fn summarize_tool_output(tool_name: &str, value: &Value) -> String {
     if is_cypher_tool_name(tool_name) {
         return summarize_cypher_tool_output(Some(value));
     }
-    match tool_name {
-        "ifc_schema_context" => summarize_schema_context_output(value),
-        "ifc_model_details" => summarize_model_details_output(value),
-        "ifc_entity_reference" => summarize_collection_output("Entity reference lookup", value),
-        "ifc_relation_reference" => summarize_collection_output("Relation reference lookup", value),
-        "ifc_query_playbook" => summarize_collection_output("Query playbook lookup", value),
+    match canonical_native_tool_name(tool_name) {
+        "schema_context" => summarize_schema_context_output(value),
+        "model_details" => summarize_model_details_output(value),
+        "entity_reference" => summarize_collection_output("Entity reference lookup", value),
+        "relation_reference" => summarize_collection_output("Relation reference lookup", value),
+        "query_playbook" => summarize_collection_output("Query playbook lookup", value),
         _ => summarize_generic_tool_output(value),
     }
 }
@@ -2962,7 +4198,7 @@ fn summarize_generic_tool_output(value: &Value) -> String {
             if let Some(text) = get_first_string(object, &["message", "title", "text", "output"]) {
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
-                    return "returned data".to_owned();
+                    return shorten_for_progress(trimmed, 280);
                 }
             }
             if let Some(count) = count_collection_items(value) {
@@ -2984,10 +4220,10 @@ fn summarize_generic_tool_output(value: &Value) -> String {
                 if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
                     summarize_generic_tool_output(&parsed)
                 } else {
-                    "returned text".to_owned()
+                    shorten_for_progress(trimmed, 280)
                 }
             } else {
-                "returned text".to_owned()
+                shorten_for_progress(trimmed, 280)
             }
         }
         Value::Null => "returned null".to_owned(),
@@ -4189,6 +5425,9 @@ mod tests {
     fn prompt_includes_session_history_and_id_guidance() {
         let prompt = build_prompt(&sample_step_request(), false);
 
+        assert!(prompt.contains("Bound IFC resource for this turn: ifc/building-architecture."));
+        assert!(prompt.contains("Bound IFC schema for this turn: IFC4X3_ADD2"));
+        assert!(prompt.contains("Do not swap in a placeholder or `/api`."));
         assert!(prompt.contains("sessionHistory"));
         assert!(prompt.contains("show me the relations"));
         assert!(prompt.contains("Never use `toString(id(...))` in Cypher."));
@@ -4206,6 +5445,27 @@ mod tests {
         assert!(prompt.contains("ifc-explorer"));
         assert!(prompt.contains("native OpenCode access"));
         assert!(prompt.contains("Use the native `ifc_*` tools directly"));
+        assert!(prompt.contains("Bound IFC resource for this turn: ifc/building-architecture."));
         assert!(!prompt.contains("You do not have direct tools."));
+    }
+
+    #[test]
+    fn native_turn_prompt_includes_bound_resource_and_schema() {
+        let request = AgentBackendTurnRequest {
+            resource: "ifc/building-architecture".to_owned(),
+            schema_id: "IFC4X3_ADD2".to_owned(),
+            schema_slug: Some("ifc4x3_add2".to_owned()),
+            input: "what can you tell me about the model?".to_owned(),
+            session_history: Vec::new(),
+        };
+
+        let prompt = build_native_turn_prompt(&request, Some("ifc-explorer-strict"));
+
+        assert!(prompt.contains("Bound IFC resource for this turn: ifc/building-architecture."));
+        assert!(prompt.contains("Bound IFC schema for this turn: IFC4X3_ADD2 (ifc4x3_add2)."));
+        assert!(prompt.contains("Use the exact resource string above in any `ifc_*` tool call."));
+        assert!(prompt.contains("Selected native OpenCode agent: `ifc-explorer-strict`."));
+        assert!(prompt.contains("User request:"));
+        assert!(prompt.contains("what can you tell me about the model?"));
     }
 }

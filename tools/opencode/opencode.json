@@ -10,6 +10,9 @@
         "baseURL": "http://localhost:11434/v1"
       },
       "models": {
+        "gemma4:26b": {
+          "name": "Gemma 4 26B"
+        },
         "gemma4:e4b": {
           "name": "Gemma 4 4B"
         },

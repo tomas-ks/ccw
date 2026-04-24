@@ -404,17 +404,17 @@ repo-local launcher at `.tools/opencode/bin/opencode`, and redirects writable ca
 into `.tools/opencode/`. That gives us a stable binary path for the project without depending on
 shell profile edits.
 
-The current project integration calls the real `opencode` CLI directly from the Rust server.
+The current project integration speaks to the repo-local OpenCode server directly from the Rust server.
 
 The Rust adapter:
 
-- builds the planner prompt from the server-owned `OpencodeTurnRequest`
-- invokes `opencode run --agent "${CC_W_OPENCODE_AGENT:-ifc-explorer}" --format json`
+- starts a native `opencode serve` process with the locked-down repo-local config
+- creates one OpenCode session per viewer AI session
+- submits turns through `POST /session/{sessionID}/prompt_async`
+- streams progress from the OpenCode `/event` feed
 - uses the locked-down config at
   [tools/opencode/opencode.json](/Users/tomas/cartesian/codex/cc-renderer-w/tools/opencode/opencode.json)
-- scrubs unrelated provider credentials from the child environment so ambient
-  Cloudflare or other provider vars do not override the authenticated OpenAI account path
-- normalizes the assistant output back into the server-owned `OpencodeTurnResponse` schema
+- keeps the repo-local `ifc-explorer` agent and `ifc_*` tools as the only allow-listed interface
 
 `CC_W_OPENCODE_AGENT` is optional. If it is unset, the launcher defaults to
 `ifc-explorer`.
@@ -423,4 +423,4 @@ The Rust adapter:
 If it is unset, the adapter lets OpenCode choose the default model for the
 current authenticated account.
 
-This keeps the Rust server policy boundary intact while avoiding a separate JS bridge runtime.
+This keeps the Rust server policy boundary intact while avoiding the older one-shot bridge runtime.

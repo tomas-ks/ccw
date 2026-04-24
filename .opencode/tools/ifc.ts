@@ -9,6 +9,32 @@ type ToolContext = {
 const DEFAULT_SCHEMA = "IFC4X3_ADD2";
 const DEFAULT_API_BASE = "http://127.0.0.1:8001";
 
+function resolveViewerApiBase(apiBase?: string): string {
+  const envBase = process.env.CC_W_VIEWER_API_BASE?.trim();
+  const candidate = (apiBase ?? envBase ?? DEFAULT_API_BASE).trim();
+  if (candidate) {
+    try {
+      const url = new URL(candidate);
+      if (url.protocol === "http:" || url.protocol === "https:") {
+        return url.toString();
+      }
+    } catch {
+      // ignore invalid or relative values
+    }
+  }
+  if (envBase) {
+    try {
+      const url = new URL(envBase);
+      if (url.protocol === "http:" || url.protocol === "https:") {
+        return url.toString();
+      }
+    } catch {
+      // ignore invalid or relative values
+    }
+  }
+  return DEFAULT_API_BASE;
+}
+
 function repoRoot(context: ToolContext): string {
   return context.worktree ?? context.directory ?? process.cwd();
 }
@@ -69,7 +95,7 @@ async function runReadonlyCypher(
   why?: string,
   apiBase?: string,
 ): Promise<string> {
-  const resolvedApiBase = (apiBase ?? DEFAULT_API_BASE).trim() || DEFAULT_API_BASE;
+  const resolvedApiBase = resolveViewerApiBase(apiBase);
   const response = await fetch(new URL("/api/cypher", resolvedApiBase), {
     method: "POST",
     headers: {
@@ -106,7 +132,7 @@ async function postViewerJson(
   path: string,
   body: Record<string, unknown>,
 ): Promise<string> {
-  const resolvedApiBase = (apiBase ?? DEFAULT_API_BASE).trim() || DEFAULT_API_BASE;
+  const resolvedApiBase = resolveViewerApiBase(apiBase);
   const response = await fetch(new URL(path, resolvedApiBase), {
     method: "POST",
     headers: {
@@ -247,5 +273,122 @@ export const renderable_descendants = tool({
       resource: args.resource,
       cypher,
     });
+  },
+});
+
+export const graph_set_seeds = tool({
+  description: "Ask the host viewer to seed the graph from one or more DB node ids.",
+  args: {
+    db_node_ids: tool.schema
+      .array(tool.schema.number())
+      .min(1)
+      .describe("Database node ids to seed in the graph"),
+    why: tool.schema.string().optional().describe("Short reason for the viewer action"),
+  },
+  async execute(args) {
+    const count = args.db_node_ids.length;
+    const reason = args.why?.trim();
+    return [
+      `Prepared graph.set_seeds for ${count} node${count === 1 ? "" : "s"}.`,
+      reason ? `Why: ${reason}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  },
+});
+
+export const properties_show_node = tool({
+  description: "Ask the host viewer to open the Properties panel for one DB node.",
+  args: {
+    db_node_id: tool.schema.number().describe("Database node id to inspect"),
+    why: tool.schema.string().optional().describe("Short reason for the viewer action"),
+  },
+  async execute(args) {
+    const reason = args.why?.trim();
+    return [
+      `Prepared properties.show_node for node ${Math.trunc(args.db_node_id)}.`,
+      reason ? `Why: ${reason}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  },
+});
+
+export const elements_hide = tool({
+  description: "Ask the host viewer to hide one or more renderable semantic ids.",
+  args: {
+    semantic_ids: tool.schema
+      .array(tool.schema.string())
+      .min(1)
+      .describe("Renderable semantic ids to hide"),
+    why: tool.schema.string().optional().describe("Short reason for the viewer action"),
+  },
+  async execute(args) {
+    const count = args.semantic_ids.length;
+    const reason = args.why?.trim();
+    return [
+      `Prepared elements.hide for ${count} element${count === 1 ? "" : "s"}.`,
+      reason ? `Why: ${reason}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  },
+});
+
+export const elements_show = tool({
+  description: "Ask the host viewer to show one or more renderable semantic ids.",
+  args: {
+    semantic_ids: tool.schema
+      .array(tool.schema.string())
+      .min(1)
+      .describe("Renderable semantic ids to show"),
+    why: tool.schema.string().optional().describe("Short reason for the viewer action"),
+  },
+  async execute(args) {
+    const count = args.semantic_ids.length;
+    const reason = args.why?.trim();
+    return [
+      `Prepared elements.show for ${count} element${count === 1 ? "" : "s"}.`,
+      reason ? `Why: ${reason}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  },
+});
+
+export const elements_select = tool({
+  description: "Ask the host viewer to select one or more renderable semantic ids.",
+  args: {
+    semantic_ids: tool.schema
+      .array(tool.schema.string())
+      .min(1)
+      .describe("Renderable semantic ids to select"),
+    why: tool.schema.string().optional().describe("Short reason for the viewer action"),
+  },
+  async execute(args) {
+    const count = args.semantic_ids.length;
+    const reason = args.why?.trim();
+    return [
+      `Prepared elements.select for ${count} element${count === 1 ? "" : "s"}.`,
+      reason ? `Why: ${reason}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  },
+});
+
+export const viewer_frame_visible = tool({
+  description: "Ask the host viewer to frame the visible scene.",
+  args: {
+    why: tool.schema.string().optional().describe("Short reason for the viewer action"),
+  },
+  async execute(args) {
+    const reason = args.why?.trim();
+    return [
+      "Prepared viewer.frame_visible.",
+      reason ? `Why: ${reason}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
   },
 });

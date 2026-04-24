@@ -188,10 +188,76 @@ web-viewer-opencode:
         CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-45000}" \
         cargo run -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server -- --root crates/cc-w-platform-web/artifacts/viewer --port 8001
 
-opencode-smoke prompt="Say hello in one short sentence and return no tool calls.":
+web-viewer-opencode-strict:
+    just web-viewer-build
     test -x .tools/opencode/bin/opencode
     mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
-    HOME="$PWD/.tools/opencode/home" XDG_CACHE_HOME="$PWD/.tools/opencode/cache" XDG_DATA_HOME="$PWD/.tools/opencode/data" XDG_CONFIG_HOME="$PWD/.tools/opencode/config" XDG_STATE_HOME="$PWD/.tools/opencode/state" OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" .tools/opencode/bin/opencode run --agent "${CC_W_OPENCODE_AGENT:-ifc-explorer}" --format json --title "ccw smoke" --pure "{{prompt}}"
+    # Strict IFC agent profile for Gemma-like models: canonical `ifc_*` tools only.
+    real_home="$HOME"; \
+    env HOME="$PWD/.tools/opencode/home" \
+        CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}" \
+        RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}" \
+        XDG_CACHE_HOME="$PWD/.tools/opencode/cache" \
+        XDG_DATA_HOME="$PWD/.tools/opencode/data" \
+        XDG_CONFIG_HOME="$PWD/.tools/opencode/config" \
+        XDG_STATE_HOME="$PWD/.tools/opencode/state" \
+        OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
+        CC_W_AGENT_BACKEND=opencode \
+        CC_W_OPENCODE_EXECUTABLE="$PWD/.tools/opencode/bin/opencode" \
+        CC_W_OPENCODE_WORKDIR="$PWD" \
+        CC_W_OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
+        CC_W_OPENCODE_AGENT="${CC_W_OPENCODE_AGENT:-ifc-explorer-strict}" \
+        CC_W_OPENCODE_MODEL="${CC_W_OPENCODE_MODEL:-ollama/gemma4:e4b}" \
+        CC_W_OPENCODE_DISCOVER_MODELS="${CC_W_OPENCODE_DISCOVER_MODELS:-1}" \
+        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-45000}" \
+        cargo run -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server -- --root crates/cc-w-platform-web/artifacts/viewer --port 8001
+
+web-viewer-opencode-42:
+    just web-viewer-build
+    test -x .tools/opencode/bin/opencode
+    mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
+    # Debug agent: literal `42` smoke test with no tools.
+    real_home="$HOME"; \
+    env HOME="$PWD/.tools/opencode/home" \
+        CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}" \
+        RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}" \
+        XDG_CACHE_HOME="$PWD/.tools/opencode/cache" \
+        XDG_DATA_HOME="$PWD/.tools/opencode/data" \
+        XDG_CONFIG_HOME="$PWD/.tools/opencode/config" \
+        XDG_STATE_HOME="$PWD/.tools/opencode/state" \
+        OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
+        CC_W_AGENT_BACKEND=opencode \
+        CC_W_OPENCODE_EXECUTABLE="$PWD/.tools/opencode/bin/opencode" \
+        CC_W_OPENCODE_WORKDIR="$PWD" \
+        CC_W_OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
+        CC_W_OPENCODE_AGENT="${CC_W_OPENCODE_AGENT:-ifc-answer-42}" \
+        CC_W_OPENCODE_MODEL="${CC_W_OPENCODE_MODEL:-ollama/gemma4:e4b}" \
+        CC_W_OPENCODE_DISCOVER_MODELS="${CC_W_OPENCODE_DISCOVER_MODELS:-1}" \
+        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-45000}" \
+        cargo run -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server -- --root crates/cc-w-platform-web/artifacts/viewer --port 8001
+
+opencode-smoke:
+    test -x .tools/opencode/bin/opencode
+    mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
+    log_file="$PWD/.tools/opencode/state/opencode-smoke.log"; \
+    rm -f "$log_file"; \
+    HOME="$PWD/.tools/opencode/home" XDG_CACHE_HOME="$PWD/.tools/opencode/cache" XDG_DATA_HOME="$PWD/.tools/opencode/data" XDG_CONFIG_HOME="$PWD/.tools/opencode/config" XDG_STATE_HOME="$PWD/.tools/opencode/state" OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" .tools/opencode/bin/opencode serve --pure --hostname 127.0.0.1 --port 0 >"$log_file" 2>&1 & \
+    pid=$!; \
+    for _ in $(seq 1 100); do \
+        if grep -q "opencode server listening" "$log_file"; then \
+            break; \
+        fi; \
+        sleep 0.1; \
+    done; \
+    if ! grep -q "opencode server listening" "$log_file"; then \
+        cat "$log_file"; \
+        kill "$pid" || true; \
+        wait "$pid" || true; \
+        exit 1; \
+    fi; \
+    kill "$pid" || true; \
+    wait "$pid" || true; \
+    cat "$log_file"
 
 opencode-acp:
     test -x .tools/opencode/bin/opencode

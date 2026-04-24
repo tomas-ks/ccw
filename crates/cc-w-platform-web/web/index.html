@@ -3617,6 +3617,20 @@
         return null;
       }
 
+      function isPlaceholderToolTranscript(text) {
+        const lines = String(text || "")
+          .split(/\r?\n/)
+          .map((line) => line.trimEnd())
+          .filter((line) => line.trim().length > 0);
+        if (lines.length !== 1) {
+          return false;
+        }
+        const lowered = lines[0].trim().toLowerCase();
+        return (
+          /:\s*tool call$/.test(lowered) || /:\s*input keys:\s*[^:]+$/.test(lowered)
+        );
+      }
+
       function looksLikeCypherLine(text) {
         return /^(MATCH|RETURN|WHERE|WITH|UNION|ORDER BY|LIMIT|OPTIONAL MATCH|CALL|UNWIND)\b/i.test(
           String(text || "").trim()
@@ -3783,6 +3797,9 @@
             continue;
           }
           if (kind === "tool" || kind === "tool_call") {
+            if (text && isPlaceholderToolTranscript(text)) {
+              continue;
+            }
             stopLiveStatus({ persist: false });
             const toolName = tryGetFirst(item, ["name", "tool", "toolName"]);
             const input = tryGetFirst(item, ["input", "args", "arguments"]);

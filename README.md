@@ -124,7 +124,7 @@ OpenCode agent and the allow-listed `ifc_*` tools:
 just web-viewer-opencode
 ```
 
-Smoke-test the authenticated OpenCode runtime outside the viewer:
+Start the repo-local OpenCode server outside the viewer:
 
 ```bash
 just opencode-smoke
@@ -138,7 +138,7 @@ This gives the project a stable launcher at:
 
 and keeps writable cache/config/data/state under `.tools/opencode/`.
 
-The web viewer now launches the real `opencode` binary directly from the Rust server.
+The web viewer now talks to the repo-local OpenCode server directly from the Rust server.
 The Rust adapter:
 
 - keeps OpenCode state under `.tools/opencode/`
@@ -148,10 +148,22 @@ The Rust adapter:
   [.opencode/agents/ifc-explorer.md](/Users/tomas/cartesian/codex/cc-renderer-w/.opencode/agents/ifc-explorer.md)
 - exposes only the allow-listed `ifc_*` tools from
   [.opencode/tools/ifc.ts](/Users/tomas/cartesian/codex/cc-renderer-w/.opencode/tools/ifc.ts)
+- creates a native OpenCode session per viewer AI session and streams progress from OpenCode's server events
 
 The launcher defaults to `CC_W_OPENCODE_AGENT=ifc-explorer`. Set
 `CC_W_OPENCODE_AGENT` before `just web-viewer-opencode` if you want a different
 repo-local agent profile.
+
+For a strict Gemma-friendly profile that uses only the canonical `ifc_*`
+tool names, run:
+
+```bash
+just web-viewer-opencode-strict
+```
+
+That launcher defaults to `CC_W_OPENCODE_AGENT=ifc-explorer-strict` and
+`CC_W_OPENCODE_MODEL=ollama/gemma4:e4b`, while still allowing overrides from
+your shell.
 
 By default, `just web-viewer-opencode` now pins the provider/model seed and lets
 OpenCode/provider metadata describe the available models and real provider-supported
