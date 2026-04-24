@@ -1677,6 +1677,7 @@ struct WebViewerApp {
     _mouse_move: Closure<dyn FnMut(MouseEvent)>,
     _mouse_up: Closure<dyn FnMut(MouseEvent)>,
     _mouse_leave: Closure<dyn FnMut(MouseEvent)>,
+    _click: Closure<dyn FnMut(MouseEvent)>,
     _wheel: Closure<dyn FnMut(WheelEvent)>,
     _resize: Closure<dyn FnMut(Event)>,
     _animation_frame: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>,
@@ -1842,9 +1843,29 @@ impl WebViewerApp {
             .add_event_listener_with_callback("mouseup", mouse_up.as_ref().unchecked_ref())
             .map_err(js_error)?;
 
+        let click_state = state.clone();
+        let click = Closure::wrap(Box::new(move |event: MouseEvent| {
+            let request = click_state
+                .borrow_mut()
+                .click_pick_request(event.client_x() as f32, event.client_y() as f32);
+            if let Some(request) = request {
+                let click_state = click_state.clone();
+                spawn_local(async move {
+                    if let Err(error) = pick_region_in_state(click_state, request).await {
+                        log_viewer_error(&error);
+                    }
+                });
+            }
+        }) as Box<dyn FnMut(MouseEvent)>);
+        canvas
+            .add_event_listener_with_callback("click", click.as_ref().unchecked_ref())
+            .map_err(js_error)?;
+
         let mouse_leave_state = state.clone();
-        let mouse_leave = Closure::wrap(Box::new(move |_event: MouseEvent| {
-            mouse_leave_state.borrow_mut().cancel_drag();
+        let mouse_leave = Closure::wrap(Box::new(move |event: MouseEvent| {
+            if event.buttons() == 0 {
+                mouse_leave_state.borrow_mut().cancel_drag();
+            }
         }) as Box<dyn FnMut(MouseEvent)>);
         canvas
             .add_event_listener_with_callback("mouseleave", mouse_leave.as_ref().unchecked_ref())
@@ -1905,6 +1926,7 @@ impl WebViewerApp {
             _mouse_move: mouse_move,
             _mouse_up: mouse_up,
             _mouse_leave: mouse_leave,
+            _click: click,
             _wheel: wheel,
             _resize: resize,
             _animation_frame: animation_frame,
@@ -2026,10 +2048,12 @@ impl WebViewerState {
 
     fn begin_drag(&mut self, x: f32, y: f32) {
         self.drag.active = true;
+        self.drag.suppress_next_click = false;
         self.drag.start_x = x;
         self.drag.start_y = y;
         self.drag.last_x = x;
         self.drag.last_y = y;
+        let _ = dispatch_json_event(&self.window, "w-viewer-drag-start", r#"{}"#);
     }
 
     fn drag_to(&mut self, x: f32, y: f32) -> Result<(), String> {
@@ -2037,11 +2061,12 @@ impl WebViewerState {
             return Ok(());
         }
 
+        let mode = self.interaction_mode();
         let dx = x - self.drag.last_x;
         let dy = y - self.drag.last_y;
         self.drag.last_x = x;
         self.drag.last_y = y;
-        if self.interaction_mode() == WebInteractionMode::Pick {
+        if !mode.can_orbit() {
             return Ok(());
         }
         self.orbit.orbit_by_pixels(dx, dy);
@@ -2051,17 +2076,30 @@ impl WebViewerState {
     }
 
     fn end_drag(&mut self) -> Option<WebPickRequest> {
-        let request = if self.drag.active && self.interaction_mode() == WebInteractionMode::Pick {
-            Some(self.drag_pick_request())
+        let request = if self.drag.active {
+            let mode = self.interaction_mode();
+            let is_box_select = self.drag.is_box_select();
+            self.drag.suppress_next_click = is_box_select;
+            if mode == WebInteractionMode::Pick && is_box_select {
+                Some(self.drag_pick_request())
+            } else {
+                None
+            }
         } else {
             None
         };
         self.drag.active = false;
+        let _ = dispatch_json_event(&self.window, "w-viewer-drag-end", r#"{}"#);
         request
     }
 
     fn cancel_drag(&mut self) {
+        let was_active = self.drag.active;
         self.drag.active = false;
+        self.drag.suppress_next_click = false;
+        if was_active {
+            let _ = dispatch_json_event(&self.window, "w-viewer-drag-end", r#"{}"#);
+        }
     }
 
     fn zoom(&mut self, delta_y: f32) -> Result<(), String> {
@@ -2078,6 +2116,14 @@ impl WebViewerState {
 
     fn interaction_mode(&self) -> WebInteractionMode {
         WebInteractionMode::from_picker_value(&self.tool_picker.value())
+    }
+
+    fn click_pick_request(&mut self, x: f32, y: f32) -> Option<WebPickRequest> {
+        if self.drag.take_suppress_next_click() || !self.interaction_mode().can_pick() {
+            return None;
+        }
+        let (x, y) = self.client_to_canvas_css(x, y);
+        Some(WebPickRequest::Point { x, y })
     }
 
     fn drag_pick_request(&self) -> WebPickRequest {
@@ -2522,7 +2568,9 @@ impl WebViewerState {
     }
 
     fn draw_pick_drag_overlay(&self) -> Result<(), String> {
-        if self.interaction_mode() != WebInteractionMode::Pick
+        let mode = self.interaction_mode();
+        if !mode.can_pick()
+            || mode.can_orbit()
             || !self.drag.active
             || !self.drag.is_box_select()
         {
@@ -2561,6 +2609,7 @@ impl WebViewerState {
 #[derive(Clone, Copy, Debug, Default)]
 struct DragState {
     active: bool,
+    suppress_next_click: bool,
     start_x: f32,
     start_y: f32,
     last_x: f32,
@@ -2576,22 +2625,40 @@ impl DragState {
         let dy = self.last_y - self.start_y;
         dx.hypot(dy) >= Self::PICK_DRAG_THRESHOLD_PIXELS
     }
+
+    fn take_suppress_next_click(&mut self) -> bool {
+        let suppress = self.suppress_next_click;
+        self.suppress_next_click = false;
+        suppress
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WebInteractionMode {
+    None,
     Orbit,
     Pick,
+    OrbitPick,
 }
 
 #[cfg(target_arch = "wasm32")]
 impl WebInteractionMode {
     fn from_picker_value(value: &str) -> Self {
         match value {
+            "none" => Self::None,
             "pick" => Self::Pick,
+            "orbit-pick" | "pick-orbit" => Self::OrbitPick,
             _ => Self::Orbit,
         }
+    }
+
+    fn can_orbit(self) -> bool {
+        matches!(self, Self::Orbit | Self::OrbitPick)
+    }
+
+    fn can_pick(self) -> bool {
+        matches!(self, Self::Pick | Self::OrbitPick)
     }
 }
 

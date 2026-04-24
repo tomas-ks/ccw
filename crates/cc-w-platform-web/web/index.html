@@ -218,6 +218,11 @@
         display: none;
       }
 
+      body.terminal-hidden .terminal,
+      body.terminal-hidden #terminal-resizer {
+        display: none;
+      }
+
       .splitter {
         position: relative;
         flex: 0 0 auto;
@@ -437,16 +442,17 @@
         position: absolute;
         z-index: 20;
         --arrow-y: 50%;
-        width: min(342px, calc(100% - 24px));
+        width: min(308px, calc(100% - 24px));
         max-height: min(420px, calc(100% - 24px));
         display: flex;
         flex-direction: column;
         overflow: visible;
         border: 1px solid rgba(255, 255, 255, 0.12);
         border-radius: 8px;
-        background: rgba(18, 24, 39, 0.96);
+        background: rgba(18, 24, 39, 0.88);
         box-shadow: 0 18px 38px rgba(0, 0, 0, 0.32);
         backdrop-filter: blur(10px);
+        pointer-events: none;
       }
 
       .properties-balloon[hidden] {
@@ -478,7 +484,7 @@
         left: -11px;
         border-top: 8px solid transparent;
         border-bottom: 8px solid transparent;
-        border-right: 11px solid rgba(18, 24, 39, 0.96);
+        border-right: 11px solid rgba(18, 24, 39, 0.88);
       }
 
       .properties-balloon[data-side="left"]::before {
@@ -492,7 +498,7 @@
         right: -11px;
         border-top: 8px solid transparent;
         border-bottom: 8px solid transparent;
-        border-left: 11px solid rgba(18, 24, 39, 0.96);
+        border-left: 11px solid rgba(18, 24, 39, 0.88);
       }
 
       .properties-balloon[data-side="center"]::before,
@@ -536,6 +542,7 @@
         background: rgba(141, 182, 255, 0.08);
         color: rgba(243, 246, 255, 0.76);
         cursor: pointer;
+        pointer-events: auto;
       }
 
       .properties-graph-button:hover {
@@ -570,11 +577,17 @@
         background: rgba(255, 255, 255, 0.04);
         color: rgba(243, 246, 255, 0.72);
         cursor: pointer;
+        pointer-events: auto;
       }
 
       .properties-close:hover {
         color: #f3f6ff;
         border-color: rgba(141, 182, 255, 0.34);
+      }
+
+      body.viewer-dragging .properties-close,
+      body.viewer-dragging .properties-graph-button {
+        pointer-events: none;
       }
 
       .pick-anchor-marker {
@@ -700,6 +713,18 @@
         flex: 0 0 auto;
         width: 40px;
         padding: 6px 0;
+      }
+
+      .terminal-close-button {
+        width: 24px;
+        height: 22px;
+        margin: 0 auto 8px;
+        flex: 0 0 auto;
+      }
+
+      .terminal-close-button svg {
+        width: 14px;
+        height: 14px;
       }
 
       .terminal-tool-tab {
@@ -870,12 +895,14 @@
       }
     </style>
   </head>
-  <body class="graph-hidden">
+  <body class="graph-hidden terminal-hidden">
     <header class="viewer-header" aria-label="Viewer tools">
       <div class="header-tools" role="toolbar" aria-label="3D tools">
-        <select id="tool-picker" class="visually-hidden" aria-label="Active 3D tool">
-          <option value="orbit" selected>Orbit</option>
+        <select id="tool-picker" class="visually-hidden" aria-label="Active 3D tools">
+          <option value="none">No tools</option>
+          <option value="orbit">Rotate</option>
           <option value="pick">Pick</option>
+          <option value="orbit-pick" selected>Rotate and pick</option>
         </select>
         <button
           class="icon-button tool-button active"
@@ -891,11 +918,11 @@
           </svg>
         </button>
         <button
-          class="icon-button tool-button"
+          class="icon-button tool-button active"
           data-tool-button="pick"
           type="button"
           aria-label="Pick model elements"
-          aria-pressed="false"
+          aria-pressed="true"
           title="Pick"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -908,6 +935,20 @@
         </button>
       </div>
       <div class="header-actions" aria-label="Viewer panels">
+        <button
+          class="icon-button terminal-toggle-button"
+          id="terminal-toggle-button"
+          type="button"
+          aria-label="Toggle terminal panel"
+          aria-pressed="false"
+          title="Terminal"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <rect x="4" y="5" width="16" height="14" rx="2" />
+            <path d="M7.5 9.5l3 2.5-3 2.5" />
+            <path d="M12.5 15h4" />
+          </svg>
+        </button>
         <button
           class="icon-button graph-toggle-button"
           id="graph-toggle-button"
@@ -1041,31 +1082,43 @@
     <section class="terminal">
       <div class="terminal-screen" id="repl-screen">
         <div class="terminal-side">
+          <button
+            class="icon-button terminal-close-button"
+            id="terminal-close-button"
+            type="button"
+            aria-label="Close terminal panel"
+            title="Close terminal"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M6 6l12 12" />
+              <path d="M18 6L6 18" />
+            </svg>
+          </button>
           <div class="terminal-tools" role="tablist" aria-label="Terminal tools">
             <button
               class="terminal-tool-tab active"
-              id="terminal-tool-js"
-              type="button"
-              role="tab"
-              aria-selected="true"
-              data-terminal-tool="js"
-            >
-              JS
-            </button>
-            <button
-              class="terminal-tool-tab"
               id="terminal-tool-ai"
               type="button"
               role="tab"
-              aria-selected="false"
+              aria-selected="true"
               data-terminal-tool="ai"
             >
               AI
             </button>
+            <button
+              class="terminal-tool-tab"
+              id="terminal-tool-js"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              data-terminal-tool="js"
+            >
+              JS
+            </button>
           </div>
         </div>
-        <div class="terminal-host active" id="repl-terminal" aria-label="JavaScript terminal"></div>
-        <div class="terminal-host" id="agent-terminal" aria-label="AI agent terminal"></div>
+        <div class="terminal-host" id="repl-terminal" aria-label="JavaScript terminal"></div>
+        <div class="terminal-host active" id="agent-terminal" aria-label="AI agent terminal"></div>
       </div>
     </section>
     <footer class="viewer-footer" aria-label="Viewer controls and status">
@@ -1178,6 +1231,27 @@
         curvatureAttribute: "curvature",
         drawLabel: DrawCurvedGraphEdgeLabel,
       });
+
+      function parseViewerToolValue(value) {
+        const tokens = new Set(String(value || "").split("-").filter(Boolean));
+        return {
+          orbit: tokens.has("orbit"),
+          pick: tokens.has("pick"),
+        };
+      }
+
+      function viewerToolsToPickerValue(tools) {
+        if (tools?.orbit && tools?.pick) {
+          return "orbit-pick";
+        }
+        if (tools?.orbit) {
+          return "orbit";
+        }
+        if (tools?.pick) {
+          return "pick";
+        }
+        return "none";
+      }
 
       function createViewerApi() {
         const parseViewState = (json) => JSON.parse(json);
@@ -1552,7 +1626,9 @@
 
         window.addEventListener("resize", () => {
           applySidePanelWidth(constrainSidePanelWidth(sidePanel.getBoundingClientRect().width));
-          applyTerminalHeight(constrainTerminalHeight(terminal.getBoundingClientRect().height));
+          if (!body.classList.contains("terminal-hidden")) {
+            applyTerminalHeight(constrainTerminalHeight(terminal.getBoundingClientRect().height));
+          }
           syncResizerAria();
           schedulePaneRefresh();
         });
@@ -1567,18 +1643,21 @@
         const toolPicker = document.getElementById("tool-picker");
         const toolButtons = Array.from(document.querySelectorAll("[data-tool-button]"));
         const graphToggleButton = document.getElementById("graph-toggle-button");
-        const activeTool = () => (toolPicker?.value === "pick" ? "pick" : "orbit");
+        const terminalToggleButton = document.getElementById("terminal-toggle-button");
+        const terminalCloseButton = document.getElementById("terminal-close-button");
+        const activeTools = () => parseViewerToolValue(toolPicker?.value || "none");
 
         const syncToolButtons = () => {
-          const nextTool = activeTool();
+          const nextTools = activeTools();
+          const nextTool = viewerToolsToPickerValue(nextTools);
           for (const button of toolButtons) {
-            const active = button.dataset.toolButton === nextTool;
+            const active = Boolean(nextTools[button.dataset.toolButton]);
             button.classList.toggle("active", active);
             button.setAttribute("aria-pressed", String(active));
           }
           window.dispatchEvent(
             new CustomEvent("w-viewer-tool-change", {
-              detail: { tool: nextTool },
+              detail: { tool: nextTool, tools: nextTools },
             })
           );
         };
@@ -1588,9 +1667,13 @@
             if (!toolPicker) {
               return;
             }
-            toolPicker.value = button.dataset.toolButton || "orbit";
+            const nextTools = activeTools();
+            const tool = button.dataset.toolButton;
+            if (tool === "orbit" || tool === "pick") {
+              nextTools[tool] = !nextTools[tool];
+            }
+            toolPicker.value = viewerToolsToPickerValue(nextTools);
             toolPicker.dispatchEvent(new Event("change", { bubbles: true }));
-            syncToolButtons();
           });
         }
         toolPicker?.addEventListener("change", syncToolButtons);
@@ -1611,12 +1694,41 @@
           setGraphVisible(document.body.classList.contains("graph-hidden"));
         });
 
+        const setTerminalVisible = (visible) => {
+          document.body.classList.toggle("terminal-hidden", !visible);
+          terminalToggleButton?.classList.toggle("active", visible);
+          terminalToggleButton?.setAttribute("aria-pressed", String(visible));
+          requestAnimationFrame(() => {
+            graphShell?.resize?.();
+            viewer?.resizeViewport?.();
+            window.dispatchEvent(
+              new CustomEvent("w-terminal-visibility-change", {
+                detail: { visible },
+              })
+            );
+          });
+          return visible;
+        };
+
+        terminalToggleButton?.addEventListener("click", () => {
+          setTerminalVisible(document.body.classList.contains("terminal-hidden"));
+        });
+        terminalCloseButton?.addEventListener("click", () => {
+          setTerminalVisible(false);
+        });
+
         return {
-          activeTool,
+          activeTool: () => viewerToolsToPickerValue(activeTools()),
+          activeTools,
           setGraphVisible,
           showGraph: () => setGraphVisible(true),
           hideGraph: () => setGraphVisible(false),
           toggleGraph: () => setGraphVisible(document.body.classList.contains("graph-hidden")),
+          setTerminalVisible,
+          showTerminal: () => setTerminalVisible(true),
+          hideTerminal: () => setTerminalVisible(false),
+          toggleTerminal: () =>
+            setTerminalVisible(document.body.classList.contains("terminal-hidden")),
         };
       }
 
@@ -2407,7 +2519,7 @@
 
         const state = {
           activeTab: "graph",
-          interactionTool: dom.toolPicker?.value === "pick" ? "pick" : "orbit",
+          interactionTools: parseViewerToolValue(dom.toolPicker?.value || "none"),
           selectionOrigin: "none",
           mode: "semantic",
           nodes: [],
@@ -2418,6 +2530,7 @@
           pickedDbNodeId: null,
           pickDetailsRequestId: 0,
           activePickHasHit: false,
+          propertiesBalloonDismissed: false,
           expandedNodeIds: new Set(),
           expansionPinnedNodeIds: new Set(),
           layoutPositions: new Map(),
@@ -2541,6 +2654,11 @@
           }
         };
 
+        const dismissPropertiesBalloon = () => {
+          state.propertiesBalloonDismissed = true;
+          hidePropertiesBalloon();
+        };
+
         const hidePickAnchorMarker = () => {
           if (dom.pickAnchorMarker) {
             dom.pickAnchorMarker.hidden = true;
@@ -2555,6 +2673,7 @@
           if (!dom.propertiesBalloon || !dom.viewport) {
             return;
           }
+          state.propertiesBalloonDismissed = false;
           const viewportRect = dom.viewport.getBoundingClientRect();
           dom.propertiesBalloon.hidden = false;
           const balloonRect = dom.propertiesBalloon.getBoundingClientRect();
@@ -2643,19 +2762,18 @@
         const currentSelectedNode = () =>
           state.selectedNodeId ? state.nodesById.get(state.selectedNodeId) || null : null;
 
-        const activeInteractionTool = () =>
-          state.interactionTool === "pick" ? "pick" : "orbit";
+        const pickInteractionEnabled = () => Boolean(state.interactionTools?.pick);
 
-        const graphSelectionShouldShowBalloon = () => activeInteractionTool() === "pick";
+        const graphSelectionShouldShowBalloon = () => pickInteractionEnabled();
 
-        const syncInteractionTool = (tool) => {
-          state.interactionTool = tool === "pick" ? "pick" : "orbit";
-          if (state.interactionTool !== "pick") {
+        const syncInteractionTool = (tool, tools = null) => {
+          state.interactionTools = tools || parseViewerToolValue(tool);
+          if (!state.interactionTools.pick) {
             state.activePickHasHit = false;
             hidePickAnchorMarker();
             hidePropertiesBalloon();
           }
-          return state.interactionTool;
+          return state.interactionTools;
         };
 
         const selectedRenderableId = () => {
@@ -2987,7 +3105,9 @@
             dom.propertiesEmptyState.textContent = "No visible IFC element was found at that pixel.";
             resetPropertySections();
             syncActionButtons();
-            return;
+            hidePropertiesBalloon();
+            hidePickAnchorMarker();
+            return false;
           }
 
           dom.propertiesTitle.textContent = "Loading IFC properties";
@@ -2996,6 +3116,7 @@
           resetPropertySections();
           void loadPickedElementDetails(hit, requestId);
           syncActionButtons();
+          return true;
         };
 
         const renderFallbackList = () => {
@@ -4031,7 +4152,9 @@
           if (!patchedInPlace) {
             syncGraphSurface();
           }
-          renderProperties();
+          if (!options.preserveProperties) {
+            renderProperties();
+          }
 
           const summary =
             payload.status ||
@@ -4108,12 +4231,12 @@
             }
             return api.snapshot();
           },
-          setData(payload) {
-            updateGraphData(payload || {}, { merge: false });
+          setData(payload, options = {}) {
+            updateGraphData(payload || {}, { ...options, merge: false });
             return api.snapshot();
           },
-          mergeData(payload) {
-            updateGraphData(payload || {}, { merge: true });
+          mergeData(payload, options = {}) {
+            updateGraphData(payload || {}, { ...options, merge: true });
             return api.snapshot();
           },
           setSelectedNode(nodeId, options = {}) {
@@ -4121,20 +4244,26 @@
               nodeId === null || nodeId === undefined ? null : String(nodeId);
             state.selectedNodeId = nextId && state.nodesById.has(nextId) ? nextId : null;
             state.selectionOrigin = state.selectedNodeId ? options.origin || "graph" : "none";
-            state.activePickHasHit = false;
-            state.pickedSemanticId = null;
-            state.pickedDbNodeId = null;
-            setPickedGraphButtonVisible(false);
-            hidePickAnchorMarker();
+            const preserveProperties = options.preserveProperties === true;
+            if (!preserveProperties) {
+              state.activePickHasHit = false;
+              state.pickedSemanticId = null;
+              state.pickedDbNodeId = null;
+              setPickedGraphButtonVisible(false);
+              hidePickAnchorMarker();
+            }
             renderFallbackList();
             applySelectionToSigma(state.selectedNodeId);
-            renderProperties();
+            if (!preserveProperties) {
+              renderProperties();
+            }
             syncActionButtons();
             const shouldRevealProperties =
-              options.revealProperties === true ||
-              (options.revealProperties !== false &&
-                state.selectionOrigin === "graph" &&
-                graphSelectionShouldShowBalloon());
+              !preserveProperties &&
+              (options.revealProperties === true ||
+                (options.revealProperties !== false &&
+                  state.selectionOrigin === "graph" &&
+                  graphSelectionShouldShowBalloon()));
             if (shouldRevealProperties) {
               if (state.selectedNodeId) {
                 if (Number.isFinite(options.clientX) && Number.isFinite(options.clientY)) {
@@ -4146,7 +4275,9 @@
                 hidePropertiesBalloon();
               }
             } else if (state.selectionOrigin === "graph" || !state.selectedNodeId) {
-              hidePropertiesBalloon();
+              if (!preserveProperties) {
+                hidePropertiesBalloon();
+              }
             }
             if (options.syncViewer) {
               performSelectedViewerAction("select");
@@ -4311,9 +4442,9 @@
             if (result && (Array.isArray(result.nodes) || Array.isArray(result.edges))) {
               api.markExpanded(state.selectedNodeId);
               if (options.replace) {
-                api.setData(result);
+                api.setData(result, { preserveProperties: options.preserveProperties });
               } else {
-                api.mergeData(result);
+                api.mergeData(result, { preserveProperties: options.preserveProperties });
               }
             }
             return result ?? api.snapshot();
@@ -4350,9 +4481,9 @@
             if (result && (Array.isArray(result.nodes) || Array.isArray(result.edges))) {
               api.markExpanded(ids);
               if (options.replace) {
-                api.setData(result);
+                api.setData(result, { preserveProperties: options.preserveProperties });
               } else {
-                api.mergeData(result);
+                api.mergeData(result, { preserveProperties: options.preserveProperties });
               }
             }
             return result ?? api.snapshot();
@@ -4375,8 +4506,13 @@
               hops: options.hops ?? 2,
               maxNodes: options.maxNodes ?? 80,
               maxEdges: options.maxEdges ?? 160,
+              preserveProperties: options.preserveProperties === true,
             });
-            api.setSelectedNode(numericNodeId);
+            api.setSelectedNode(numericNodeId, {
+              origin: "graph",
+              revealProperties: options.revealProperties ?? false,
+              preserveProperties: options.preserveProperties === true,
+            });
             await waitForAnimationFrames(2);
             requestGraphResize();
             focusSelectedNode({ instant: true, ratio: options.ratio ?? 0.55 });
@@ -4442,15 +4578,25 @@
             setStatus("Pick an IFC element before opening its graph neighborhood.", "warn");
             return;
           }
-          void api.seedFromNode(nodeId).catch((error) => {
+          void api.seedFromNode(nodeId, {
+            preserveProperties: Boolean(state.activePickHasHit),
+            revealProperties: false,
+          }).catch((error) => {
             setStatus(`Graph lookup failed: ${error.message || error}`, "error");
           });
         });
 
-        dom.propertiesCloseButton?.addEventListener("click", hidePropertiesBalloon);
+        dom.propertiesCloseButton?.addEventListener("click", dismissPropertiesBalloon);
+
+        window.addEventListener("w-viewer-drag-start", () => {
+          document.body.classList.add("viewer-dragging");
+        });
+        window.addEventListener("w-viewer-drag-end", () => {
+          document.body.classList.remove("viewer-dragging");
+        });
 
         window.addEventListener("w-viewer-tool-change", (event) => {
-          syncInteractionTool(event.detail?.tool);
+          syncInteractionTool(event.detail?.tool, event.detail?.tools);
         });
         dom.toolPicker?.addEventListener("change", () => {
           syncInteractionTool(dom.toolPicker.value);
@@ -4458,10 +4604,13 @@
         syncInteractionTool(dom.toolPicker?.value);
 
         window.addEventListener("w-viewer-pick", (event) => {
-          if (activeInteractionTool() !== "pick") {
+          if (!pickInteractionEnabled()) {
             return;
           }
-          renderPickProperties(event.detail || {});
+          const hasHit = renderPickProperties(event.detail || {});
+          if (!hasHit) {
+            return;
+          }
           const anchor = pickRegionClientCenter(event.detail || {});
           if (anchor) {
             showPropertiesBalloonAtClientPoint(anchor.x, anchor.y);
@@ -4472,7 +4621,7 @@
 
         window.addEventListener("w-viewer-anchor", (event) => {
           const detail = event.detail || {};
-          if (activeInteractionTool() !== "pick") {
+          if (!pickInteractionEnabled()) {
             hidePickAnchorMarker();
             return;
           }
@@ -4481,6 +4630,10 @@
             if (state.activePickHasHit) {
               hidePropertiesBalloon();
             }
+            return;
+          }
+          if (state.propertiesBalloonDismissed) {
+            hidePickAnchorMarker();
             return;
           }
           showPropertiesBalloonAtClientPoint(detail.clientX, detail.clientY, {
@@ -5503,6 +5656,15 @@
         );
       }
 
+      async function revealGraphPanelForAgentAction() {
+        window.wHeader?.showGraph?.();
+        await new Promise((resolve) => {
+          requestAnimationFrame(() => {
+            requestAnimationFrame(resolve);
+          });
+        });
+      }
+
       async function applyAgentAction(action, viewer, graph) {
         if (!action || typeof action !== "object") {
           return null;
@@ -5518,6 +5680,7 @@
           if (!dbNodeIds.length || !isIfcResource(resource)) {
             return null;
           }
+          await revealGraphPanelForAgentAction();
           const snapshot = await graph.snapshot();
           const payload = await viewer.queryGraphSubgraph(
             dbNodeIds,
@@ -5545,6 +5708,7 @@
           if (!dbNodeIds.length || !isIfcResource(resource)) {
             return null;
           }
+          await revealGraphPanelForAgentAction();
           const snapshot = await graph.snapshot();
           const payload = await viewer.queryGraphSubgraph(
             dbNodeIds,
@@ -6588,9 +6752,14 @@
           const replShell = installRepl(repl);
           const agentShell = installAgentTerminal(viewer, graphShell.api);
           const terminalShell = installTerminalToolSelector([
-            { id: "js", shell: replShell, defaultActive: true },
-            { id: "ai", shell: agentShell },
+            { id: "ai", shell: agentShell, defaultActive: true },
+            { id: "js", shell: replShell },
           ]);
+          window.addEventListener("w-terminal-visibility-change", () => {
+            terminalShell?.resize();
+            viewer.resizeViewport();
+            graphShell.resize();
+          });
           document.getElementById("resource-picker")?.addEventListener("change", (event) => {
             const nextResource = event?.target?.value;
             void agentShell?.handleResourceSwitch?.(nextResource);
