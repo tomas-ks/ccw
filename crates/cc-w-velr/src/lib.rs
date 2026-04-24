@@ -35,7 +35,7 @@ query {
 }
 "#;
 
-const BODY_PACKAGE_CACHE_VERSION: u32 = 8;
+const BODY_PACKAGE_CACHE_VERSION: u32 = 10;
 const BODY_PACKAGE_CACHE_FILE: &str = "prepared-package.json";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -884,7 +884,6 @@ impl VelrIfcModel {
         let placement_transforms = self.resolve_local_placement_transforms()?;
         let mut records = self.query_body_triangulated_records()?;
         records.extend(self.query_body_extruded_records()?);
-        records.retain(|record| !is_non_render_helper_body(record));
         imported_scene_resource_from_body_records(records, &placement_transforms)
     }
 
@@ -1388,17 +1387,11 @@ fn ifc_body_source_space() -> SourceSpace {
     SourceSpace::new(CoordinateFrame::w_world(), LengthUnit::Millimeter)
 }
 
-fn is_non_render_helper_body(record: &IfcBodyRecord) -> bool {
-    match record.declared_entity.as_str() {
-        // Keep spaces and zones in Velr for semantic queries, but do not include
-        // them in the default physical render package.
-        "IfcSpace" | "IfcSpatialZone" => true,
-        "IfcBuildingElementProxy" => matches!(
-            record.name.as_deref().map(|name| name.trim().to_ascii_lowercase()),
-            Some(name) if name == "origin" || name == "geo-reference"
-        ),
-        _ => false,
-    }
+fn is_ifc_building_element_proxy_helper(record: &IfcBodyRecord) -> bool {
+    matches!(
+        record.name.as_deref().map(|name| name.trim().to_ascii_lowercase()),
+        Some(name) if name == "origin" || name == "geo-reference"
+    )
 }
 
 fn parse_optional_string_cell(cell: Option<&String>) -> Option<String> {
@@ -1520,7 +1513,7 @@ fn imported_scene_resource_from_body_records(
                     .clone()
                     .unwrap_or_else(|| record.declared_entity.clone()),
                 declared_entity: record.declared_entity.clone(),
-                default_render_class: default_render_class_for_ifc_entity(&record.declared_entity),
+                default_render_class: default_render_class_for_ifc_body_record(record),
                 display_color: record.display_color,
             },
         )
@@ -1541,11 +1534,13 @@ fn ifc_element_id_for_record(record: &IfcBodyRecord) -> SemanticElementId {
     }
 }
 
-fn default_render_class_for_ifc_entity(declared_entity: &str) -> DefaultRenderClass {
-    match declared_entity {
+fn default_render_class_for_ifc_body_record(record: &IfcBodyRecord) -> DefaultRenderClass {
+    match record.declared_entity.as_str() {
         "IfcSpace" => DefaultRenderClass::Space,
         "IfcSpatialZone" => DefaultRenderClass::Zone,
-        "IfcBuildingElementProxy" => DefaultRenderClass::Helper,
+        "IfcBuildingElementProxy" if is_ifc_building_element_proxy_helper(record) => {
+            DefaultRenderClass::Helper
+        }
         _ => DefaultRenderClass::Physical,
     }
 }
@@ -2716,7 +2711,7 @@ mod tests {
     }
 
     #[test]
-    fn helper_proxy_filter_skips_origin_and_geo_reference_markers() {
+    fn helper_proxy_classification_only_marks_origin_and_geo_reference_markers() {
         let helper = |name: &str| IfcBodyRecord {
             product_id: 1,
             placement_id: None,
@@ -2739,13 +2734,22 @@ mod tests {
             ),
         };
 
-        assert!(is_non_render_helper_body(&helper("origin")));
-        assert!(is_non_render_helper_body(&helper("geo-reference")));
-        assert!(!is_non_render_helper_body(&helper("real proxy")));
+        assert_eq!(
+            default_render_class_for_ifc_body_record(&helper("origin")),
+            DefaultRenderClass::Helper
+        );
+        assert_eq!(
+            default_render_class_for_ifc_body_record(&helper("geo-reference")),
+            DefaultRenderClass::Helper
+        );
+        assert_eq!(
+            default_render_class_for_ifc_body_record(&helper("underground - road")),
+            DefaultRenderClass::Physical
+        );
     }
 
     #[test]
-    fn spatial_semantic_bodies_are_hidden_from_default_render_package() {
+    fn spatial_semantic_bodies_keep_default_view_classification() {
         let semantic_body = |declared_entity: &str| IfcBodyRecord {
             product_id: 1,
             placement_id: None,
@@ -2768,9 +2772,74 @@ mod tests {
             ),
         };
 
-        assert!(is_non_render_helper_body(&semantic_body("IfcSpace")));
-        assert!(is_non_render_helper_body(&semantic_body("IfcSpatialZone")));
-        assert!(!is_non_render_helper_body(&semantic_body("IfcWall")));
+        assert_eq!(
+            default_render_class_for_ifc_body_record(&semantic_body("IfcSpace")),
+            DefaultRenderClass::Space
+        );
+        assert_eq!(
+            default_render_class_for_ifc_body_record(&semantic_body("IfcSpatialZone")),
+            DefaultRenderClass::Zone
+        );
+        assert_eq!(
+            default_render_class_for_ifc_body_record(&semantic_body("IfcWall")),
+            DefaultRenderClass::Physical
+        );
+    }
+
+    #[test]
+    fn body_scene_resource_exports_hidden_default_classes() {
+        let triangle_primitive = || {
+            GeometryPrimitive::Tessellated(
+                TessellatedGeometry::new(
+                    vec![
+                        DVec3::ZERO,
+                        DVec3::new(1.0, 0.0, 0.0),
+                        DVec3::new(0.0, 1.0, 0.0),
+                    ],
+                    vec![IndexedPolygon::new(vec![0, 1, 2], vec![], 3).expect("triangle")],
+                )
+                .expect("geometry"),
+            )
+        };
+        let body_record =
+            |product_id: u64, item_id: u64, declared_entity: &str, name: &str| -> IfcBodyRecord {
+                IfcBodyRecord {
+                    product_id,
+                    placement_id: None,
+                    item_id,
+                    global_id: Some(format!("global-{product_id}")),
+                    name: Some(name.to_string()),
+                    display_color: None,
+                    declared_entity: declared_entity.to_string(),
+                    item_transform: DMat4::IDENTITY,
+                    primitive: triangle_primitive(),
+                }
+            };
+
+        let scene = imported_scene_resource_from_body_records(
+            vec![
+                body_record(1, 11, "IfcWall", "wall"),
+                body_record(2, 12, "IfcSpace", "room volume"),
+                body_record(3, 13, "IfcBuildingElementProxy", "origin"),
+            ],
+            &HashMap::new(),
+        )
+        .expect("scene resource");
+
+        assert_eq!(scene.definitions.len(), 3);
+        assert_eq!(scene.instances.len(), 3);
+        assert_eq!(
+            scene
+                .instances
+                .iter()
+                .map(|instance| instance.default_render_class)
+                .collect::<Vec<_>>(),
+            vec![
+                DefaultRenderClass::Physical,
+                DefaultRenderClass::Space,
+                DefaultRenderClass::Helper
+            ]
+        );
     }
 
     #[test]
@@ -3365,10 +3434,9 @@ mod tests {
         let handle =
             VelrIfcModel::open(IfcArtifactLayout::new(default_ifc_artifacts_root(), &model))
                 .expect("open imported model");
-        let mut records = handle
+        let records = handle
             .query_body_triangulated_records()
             .expect("triangulated records");
-        records.retain(|record| !is_non_render_helper_body(record));
 
         for record in records {
             let GeometryPrimitive::Tessellated(geometry) = &record.primitive else {

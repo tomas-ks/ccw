@@ -1,13 +1,13 @@
-#[path = "server/agent_executor.rs"]
-mod agent_executor;
 #[path = "server/agent_error_log.rs"]
 mod agent_error_log;
+#[path = "server/agent_executor.rs"]
+mod agent_executor;
 #[path = "server/agent_query_log.rs"]
 mod agent_query_log;
-#[path = "server/opencode_executor.rs"]
-mod opencode_executor;
 #[path = "server/opencode_acp.rs"]
 mod opencode_acp;
+#[path = "server/opencode_executor.rs"]
+mod opencode_executor;
 #[path = "server/schema_reference.rs"]
 mod schema_reference;
 
@@ -19,21 +19,28 @@ use std::{
     io::{ErrorKind, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use cc_w_backend::{GeometryBackend, available_demo_resources};
 use cc_w_platform_web::{
+    WebGeometryCatalogRequest, WebGeometryCatalogResponse, WebGeometryDefinitionBatch,
+    WebGeometryDefinitionBatchRequest, WebGeometryInstanceBatch, WebGeometryInstanceBatchRequest,
     WebPreparedGeometryPackage, WebPreparedPackageResponse, WebResourceCatalog,
 };
+use cc_w_types::{GeometryDefinitionBatch, GeometryInstanceBatch, PreparedGeometryPackage};
 use cc_w_velr::{
     IfcArtifactLayout, IfcSchemaId, VelrIfcModel, available_ifc_body_resources,
     default_ifc_artifacts_root, parse_ifc_body_resource,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::agent_error_log::{AgentErrorLogEntry, AgentErrorLogger};
 use crate::agent_executor::{
     AgentBackendTurnRequest as BackendAgentTurnRequest,
     AgentEntityReference as BackendAgentEntityReference, AgentExecutor as BackendAgentExecutor,
@@ -53,7 +60,6 @@ use crate::agent_executor::{
     validate_agent_action_candidates as validate_backend_agent_action_candidates,
     validate_agent_readonly_cypher as validate_backend_agent_readonly_cypher,
 };
-use crate::agent_error_log::{AgentErrorLogEntry, AgentErrorLogger};
 use crate::agent_query_log::{AgentQueryLogEntry, AgentQueryLogger};
 use crate::opencode_executor::{
     OpencodeDiscoveredModel, OpencodeExecutor, OpencodeExecutorConfig, OpencodeNativeServer,
@@ -71,6 +77,12 @@ const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 const PORT_SEARCH_LIMIT: u16 = 32;
 const RESOURCES_API_PATH: &str = "/api/resources";
 const PACKAGE_API_PATH: &str = "/api/package";
+const GEOMETRY_CATALOG_API_PATH: &str = "/api/geometry/catalog";
+const GEOMETRY_INSTANCES_API_PATH: &str = "/api/geometry/instances";
+const GEOMETRY_DEFINITIONS_API_PATH: &str = "/api/geometry/definitions";
+const MAX_GEOMETRY_BATCH_IDS: usize = 5_000;
+const GEOMETRY_INSTANCE_IDS_FIELD: &str = "instance_ids";
+const GEOMETRY_DEFINITION_IDS_FIELD: &str = "definition_ids";
 const CYPHER_API_PATH: &str = "/api/cypher";
 const GRAPH_SUBGRAPH_API_PATH: &str = "/api/graph/subgraph";
 const GRAPH_NODE_PROPERTIES_API_PATH: &str = "/api/graph/node-properties";
@@ -195,7 +207,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "w web query artifacts {}",
         server_state.ifc_artifacts_root.display()
     );
-println!(
+    println!(
         "w web AI backend {}",
         server_state.agent_runtime.backend.label()
     );
@@ -468,7 +480,9 @@ fn agent_level_options_from_env(
         .or_else(|| env_list("CC_W_OPENCODE_VARIANTS"))
         .unwrap_or(defaults);
     values.retain(|value| is_visible_agent_level_id(value));
-    if let Some(default_level_id) = default_level_id.filter(|value| is_visible_agent_level_id(value)) {
+    if let Some(default_level_id) =
+        default_level_id.filter(|value| is_visible_agent_level_id(value))
+    {
         values.push(default_level_id.to_owned());
     }
     capability_options(values, label_for_agent_level)
@@ -643,7 +657,10 @@ fn opencode_model_discovery_providers(
 }
 
 fn load_opencode_provider_whitelist(config: &OpencodeExecutorConfig) -> Option<Vec<String>> {
-    let whitelist_path = config.config_path.as_ref()?.with_file_name("provider-whitelist.json");
+    let whitelist_path = config
+        .config_path
+        .as_ref()?
+        .with_file_name("provider-whitelist.json");
     let Ok(contents) = fs::read_to_string(&whitelist_path) else {
         return None;
     };
@@ -1173,6 +1190,46 @@ struct ApiErrorResponse {
     error: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct GeometryBatchMetadata {
+    id_field: &'static str,
+    ids: Vec<u64>,
+    count: usize,
+}
+
+impl GeometryBatchMetadata {
+    fn new(id_field: &'static str, ids: Vec<u64>) -> Self {
+        Self {
+            count: ids.len(),
+            id_field,
+            ids,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct GeometryInstanceBatchApiResponse {
+    resource: String,
+    batch: WebGeometryInstanceBatch,
+    request: GeometryBatchMetadata,
+    returned: GeometryBatchMetadata,
+    missing_instance_ids: Vec<u64>,
+    skipped_instance_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct GeometryDefinitionBatchApiResponse {
+    resource: String,
+    batch: WebGeometryDefinitionBatch,
+    request: GeometryBatchMetadata,
+    returned: GeometryBatchMetadata,
+    missing_definition_ids: Vec<u64>,
+    skipped_definition_ids: Vec<u64>,
+}
+
 #[derive(Debug, Clone)]
 struct PackageApiMetrics {
     kind: &'static str,
@@ -1405,6 +1462,9 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<ServerState>) -> Result<
                 serve_agent_capabilities_api(&mut stream, request.method == "HEAD", state)
             } else if request_path == CYPHER_API_PATH
                 || request_path == PACKAGE_API_PATH
+                || request_path == GEOMETRY_CATALOG_API_PATH
+                || request_path == GEOMETRY_INSTANCES_API_PATH
+                || request_path == GEOMETRY_DEFINITIONS_API_PATH
                 || request_path == GRAPH_SUBGRAPH_API_PATH
                 || request_path == GRAPH_NODE_PROPERTIES_API_PATH
                 || request_path == AGENT_CAPABILITIES_API_PATH
@@ -1416,7 +1476,7 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<ServerState>) -> Result<
                 write_json_error(
                     &mut stream,
                     "405 Method Not Allowed",
-                    "use POST for package, cypher, graph, and agent API routes",
+                    "use POST for package, geometry, cypher, graph, and agent API routes",
                 )
             } else {
                 serve_path(
@@ -1429,6 +1489,15 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<ServerState>) -> Result<
         }
         "POST" if request_path == PACKAGE_API_PATH => {
             serve_package_api(&mut stream, &request, state)
+        }
+        "POST" if request_path == GEOMETRY_CATALOG_API_PATH => {
+            serve_geometry_catalog_api(&mut stream, &request, state)
+        }
+        "POST" if request_path == GEOMETRY_INSTANCES_API_PATH => {
+            serve_geometry_instances_api(&mut stream, &request, state)
+        }
+        "POST" if request_path == GEOMETRY_DEFINITIONS_API_PATH => {
+            serve_geometry_definitions_api(&mut stream, &request, state)
         }
         "POST" if request_path == CYPHER_API_PATH => serve_cypher_api(&mut stream, &request, state),
         "POST" if request_path == GRAPH_SUBGRAPH_API_PATH => {
@@ -1555,6 +1624,80 @@ fn request_path_only(target: &str) -> &str {
     target.split('?').next().unwrap_or("/")
 }
 
+fn validate_geometry_batch_id_count(
+    field_name: &str,
+    requested_count: usize,
+) -> Result<(), String> {
+    if requested_count > MAX_GEOMETRY_BATCH_IDS {
+        return Err(format!(
+            "{field_name} accepts at most {MAX_GEOMETRY_BATCH_IDS} ids per request; received {requested_count}"
+        ));
+    }
+
+    Ok(())
+}
+
+fn skipped_geometry_batch_ids(requested_ids: &[u64], returned_ids: &[u64]) -> Vec<u64> {
+    let mut returned_index = 0;
+    let mut skipped_ids = Vec::new();
+
+    for requested_id in requested_ids {
+        if returned_ids.get(returned_index) == Some(requested_id) {
+            returned_index += 1;
+        } else {
+            skipped_ids.push(*requested_id);
+        }
+    }
+
+    skipped_ids
+}
+
+fn geometry_instance_batch_api_response(
+    resource: &str,
+    requested_ids: &[u64],
+    batch: &GeometryInstanceBatch,
+) -> GeometryInstanceBatchApiResponse {
+    let returned_ids = batch
+        .instances
+        .iter()
+        .map(|instance| instance.id.0)
+        .collect::<Vec<_>>();
+    let skipped_ids = skipped_geometry_batch_ids(requested_ids, &returned_ids);
+
+    GeometryInstanceBatchApiResponse {
+        resource: resource.to_owned(),
+        batch: WebGeometryInstanceBatch::from_geometry_instance_batch(batch),
+        request: GeometryBatchMetadata::new(GEOMETRY_INSTANCE_IDS_FIELD, requested_ids.to_vec()),
+        returned: GeometryBatchMetadata::new(GEOMETRY_INSTANCE_IDS_FIELD, returned_ids),
+        // Current batch lookup skips only IDs that are not present in the catalog.
+        missing_instance_ids: skipped_ids.clone(),
+        skipped_instance_ids: skipped_ids,
+    }
+}
+
+fn geometry_definition_batch_api_response(
+    resource: &str,
+    requested_ids: &[u64],
+    batch: &GeometryDefinitionBatch,
+) -> GeometryDefinitionBatchApiResponse {
+    let returned_ids = batch
+        .definitions
+        .iter()
+        .map(|definition| definition.id.0)
+        .collect::<Vec<_>>();
+    let skipped_ids = skipped_geometry_batch_ids(requested_ids, &returned_ids);
+
+    GeometryDefinitionBatchApiResponse {
+        resource: resource.to_owned(),
+        batch: WebGeometryDefinitionBatch::from_geometry_definition_batch(batch),
+        request: GeometryBatchMetadata::new(GEOMETRY_DEFINITION_IDS_FIELD, requested_ids.to_vec()),
+        returned: GeometryBatchMetadata::new(GEOMETRY_DEFINITION_IDS_FIELD, returned_ids),
+        // Current batch lookup skips only IDs that are not present in the package.
+        missing_definition_ids: skipped_ids.clone(),
+        skipped_definition_ids: skipped_ids,
+    }
+}
+
 fn serve_resources_api(
     stream: &mut TcpStream,
     head_only: bool,
@@ -1622,6 +1765,278 @@ fn serve_package_api(
                     load_ms,
                     write_ms,
                     request_started.elapsed().as_millis(),
+                    error,
+                ),
+            );
+            write_result
+        }
+    }
+}
+
+fn serve_geometry_catalog_api(
+    stream: &mut TcpStream,
+    request: &HttpRequest,
+    state: &ServerState,
+) -> Result<(), String> {
+    let request_started = Instant::now();
+    let parse_started = Instant::now();
+    let api_request: WebGeometryCatalogRequest = serde_json::from_slice(&request.body)
+        .map_err(|error| format!("invalid /api/geometry/catalog JSON body: {error}"))?;
+    let parse_ms = parse_started.elapsed().as_millis();
+
+    let load_started = Instant::now();
+    match load_prepared_package_with_metrics(&api_request.resource, &state.ifc_artifacts_root) {
+        Ok((package, metrics)) => {
+            let catalog = package.catalog();
+            let response =
+                WebGeometryCatalogResponse::from_geometry_catalog(&api_request.resource, &catalog);
+            let load_ms = load_started.elapsed().as_millis();
+            let write_started = Instant::now();
+            let write_result = write_json_response(stream, "200 OK", &response);
+            let write_ms = write_started.elapsed().as_millis();
+            println!(
+                "[w web timing] geometry_catalog resource={} kind={} cache_status={} parse_ms={} load_ms={} write_ms={} total_ms={} definitions={} elements={} instances={}",
+                api_request.resource,
+                metrics.kind,
+                metrics.cache_status.unwrap_or("-"),
+                parse_ms,
+                load_ms,
+                write_ms,
+                request_started.elapsed().as_millis(),
+                response.catalog.definitions.len(),
+                response.catalog.elements.len(),
+                response.catalog.instances.len(),
+            );
+            write_result
+        }
+        Err(error) => {
+            let load_ms = load_started.elapsed().as_millis();
+            let write_started = Instant::now();
+            let write_result = write_json_error(stream, "400 Bad Request", &error);
+            let write_ms = write_started.elapsed().as_millis();
+            console_log(
+                ConsoleLogKind::Error,
+                format!(
+                    "geometry_catalog resource={} parse_ms={} load_ms={} write_ms={} total_ms={} error={}",
+                    api_request.resource,
+                    parse_ms,
+                    load_ms,
+                    write_ms,
+                    request_started.elapsed().as_millis(),
+                    error,
+                ),
+            );
+            write_result
+        }
+    }
+}
+
+fn serve_geometry_instances_api(
+    stream: &mut TcpStream,
+    request: &HttpRequest,
+    state: &ServerState,
+) -> Result<(), String> {
+    let request_started = Instant::now();
+    let parse_started = Instant::now();
+    let api_request: WebGeometryInstanceBatchRequest = serde_json::from_slice(&request.body)
+        .map_err(|error| format!("invalid /api/geometry/instances JSON body: {error}"))?;
+    let parse_ms = parse_started.elapsed().as_millis();
+    let requested_count = api_request.instance_ids.len();
+
+    if let Err(error) = validate_geometry_batch_id_count("instance_ids", requested_count) {
+        let write_started = Instant::now();
+        let write_result = write_json_error(stream, "400 Bad Request", &error);
+        let write_ms = write_started.elapsed().as_millis();
+        console_log(
+            ConsoleLogKind::Error,
+            format!(
+                "geometry_instances resource={} parse_ms={} load_ms=0 write_ms={} total_ms={} requested={} max_ids={} error={}",
+                api_request.resource,
+                parse_ms,
+                write_ms,
+                request_started.elapsed().as_millis(),
+                requested_count,
+                MAX_GEOMETRY_BATCH_IDS,
+                error,
+            ),
+        );
+        return write_result;
+    }
+
+    if requested_count == 0 {
+        let response = geometry_instance_batch_api_response(
+            &api_request.resource,
+            &api_request.instance_ids,
+            &GeometryInstanceBatch::default(),
+        );
+        let write_started = Instant::now();
+        let write_result = write_json_response(stream, "200 OK", &response);
+        let write_ms = write_started.elapsed().as_millis();
+        println!(
+            "[w web timing] geometry_instances resource={} kind=empty cache_status=skipped parse_ms={} load_ms=0 write_ms={} total_ms={} requested=0 returned=0 skipped=0 missing=0",
+            api_request.resource,
+            parse_ms,
+            write_ms,
+            request_started.elapsed().as_millis(),
+        );
+        return write_result;
+    }
+
+    let load_started = Instant::now();
+    match load_prepared_package_with_metrics(&api_request.resource, &state.ifc_artifacts_root) {
+        Ok((package, metrics)) => {
+            let request = api_request.to_geometry_instance_batch_request();
+            let batch = package.catalog().instance_batch(&request);
+            let response = geometry_instance_batch_api_response(
+                &api_request.resource,
+                &api_request.instance_ids,
+                &batch,
+            );
+            let load_ms = load_started.elapsed().as_millis();
+            let write_started = Instant::now();
+            let write_result = write_json_response(stream, "200 OK", &response);
+            let write_ms = write_started.elapsed().as_millis();
+            println!(
+                "[w web timing] geometry_instances resource={} kind={} cache_status={} parse_ms={} load_ms={} write_ms={} total_ms={} requested={} returned={} skipped={} missing={} package_definitions={} package_elements={} package_instances={}",
+                api_request.resource,
+                metrics.kind,
+                metrics.cache_status.unwrap_or("-"),
+                parse_ms,
+                load_ms,
+                write_ms,
+                request_started.elapsed().as_millis(),
+                requested_count,
+                response.batch.instances.len(),
+                response.skipped_instance_ids.len(),
+                response.missing_instance_ids.len(),
+                metrics.definitions,
+                metrics.elements,
+                metrics.instances,
+            );
+            write_result
+        }
+        Err(error) => {
+            let load_ms = load_started.elapsed().as_millis();
+            let write_started = Instant::now();
+            let write_result = write_json_error(stream, "400 Bad Request", &error);
+            let write_ms = write_started.elapsed().as_millis();
+            console_log(
+                ConsoleLogKind::Error,
+                format!(
+                    "geometry_instances resource={} parse_ms={} load_ms={} write_ms={} total_ms={} requested={} error={}",
+                    api_request.resource,
+                    parse_ms,
+                    load_ms,
+                    write_ms,
+                    request_started.elapsed().as_millis(),
+                    requested_count,
+                    error,
+                ),
+            );
+            write_result
+        }
+    }
+}
+
+fn serve_geometry_definitions_api(
+    stream: &mut TcpStream,
+    request: &HttpRequest,
+    state: &ServerState,
+) -> Result<(), String> {
+    let request_started = Instant::now();
+    let parse_started = Instant::now();
+    let api_request: WebGeometryDefinitionBatchRequest = serde_json::from_slice(&request.body)
+        .map_err(|error| format!("invalid /api/geometry/definitions JSON body: {error}"))?;
+    let parse_ms = parse_started.elapsed().as_millis();
+    let requested_count = api_request.definition_ids.len();
+
+    if let Err(error) = validate_geometry_batch_id_count("definition_ids", requested_count) {
+        let write_started = Instant::now();
+        let write_result = write_json_error(stream, "400 Bad Request", &error);
+        let write_ms = write_started.elapsed().as_millis();
+        console_log(
+            ConsoleLogKind::Error,
+            format!(
+                "geometry_definitions resource={} parse_ms={} load_ms=0 write_ms={} total_ms={} requested={} max_ids={} error={}",
+                api_request.resource,
+                parse_ms,
+                write_ms,
+                request_started.elapsed().as_millis(),
+                requested_count,
+                MAX_GEOMETRY_BATCH_IDS,
+                error,
+            ),
+        );
+        return write_result;
+    }
+
+    if requested_count == 0 {
+        let response = geometry_definition_batch_api_response(
+            &api_request.resource,
+            &api_request.definition_ids,
+            &GeometryDefinitionBatch::default(),
+        );
+        let write_started = Instant::now();
+        let write_result = write_json_response(stream, "200 OK", &response);
+        let write_ms = write_started.elapsed().as_millis();
+        println!(
+            "[w web timing] geometry_definitions resource={} kind=empty cache_status=skipped parse_ms={} load_ms=0 write_ms={} total_ms={} requested=0 returned=0 skipped=0 missing=0",
+            api_request.resource,
+            parse_ms,
+            write_ms,
+            request_started.elapsed().as_millis(),
+        );
+        return write_result;
+    }
+
+    let load_started = Instant::now();
+    match load_prepared_package_with_metrics(&api_request.resource, &state.ifc_artifacts_root) {
+        Ok((package, metrics)) => {
+            let request = api_request.to_geometry_definition_batch_request();
+            let batch = package.definition_batch(&request);
+            let response = geometry_definition_batch_api_response(
+                &api_request.resource,
+                &api_request.definition_ids,
+                &batch,
+            );
+            let load_ms = load_started.elapsed().as_millis();
+            let write_started = Instant::now();
+            let write_result = write_json_response(stream, "200 OK", &response);
+            let write_ms = write_started.elapsed().as_millis();
+            println!(
+                "[w web timing] geometry_definitions resource={} kind={} cache_status={} parse_ms={} load_ms={} write_ms={} total_ms={} requested={} returned={} skipped={} missing={} package_definitions={} package_elements={} package_instances={}",
+                api_request.resource,
+                metrics.kind,
+                metrics.cache_status.unwrap_or("-"),
+                parse_ms,
+                load_ms,
+                write_ms,
+                request_started.elapsed().as_millis(),
+                requested_count,
+                response.batch.definitions.len(),
+                response.skipped_definition_ids.len(),
+                response.missing_definition_ids.len(),
+                metrics.definitions,
+                metrics.elements,
+                metrics.instances,
+            );
+            write_result
+        }
+        Err(error) => {
+            let load_ms = load_started.elapsed().as_millis();
+            let write_started = Instant::now();
+            let write_result = write_json_error(stream, "400 Bad Request", &error);
+            let write_ms = write_started.elapsed().as_millis();
+            console_log(
+                ConsoleLogKind::Error,
+                format!(
+                    "geometry_definitions resource={} parse_ms={} load_ms={} write_ms={} total_ms={} requested={} error={}",
+                    api_request.resource,
+                    parse_ms,
+                    load_ms,
+                    write_ms,
+                    request_started.elapsed().as_millis(),
+                    requested_count,
                     error,
                 ),
             );
@@ -2034,14 +2449,29 @@ fn load_package_response(
     resource: &str,
     ifc_artifacts_root: &Path,
 ) -> Result<(WebPreparedPackageResponse, PackageApiMetrics), String> {
-    let (package, metrics) = if let Some(model_slug) = parse_ifc_body_resource(resource) {
+    let (package, metrics) = load_prepared_package_with_metrics(resource, ifc_artifacts_root)?;
+
+    Ok((
+        WebPreparedPackageResponse {
+            resource: resource.to_string(),
+            package: WebPreparedGeometryPackage::from_prepared_package(&package),
+        },
+        metrics,
+    ))
+}
+
+fn load_prepared_package_with_metrics(
+    resource: &str,
+    ifc_artifacts_root: &Path,
+) -> Result<(PreparedGeometryPackage, PackageApiMetrics), String> {
+    if let Some(model_slug) = parse_ifc_body_resource(resource) {
         let load = VelrIfcModel::load_body_package_with_cache_status_from_artifacts_root(
             ifc_artifacts_root,
             model_slug,
         )
         .map_err(|error| format!("failed to load IFC package `{resource}`: {error}"))?;
         let summary = load.geometry_summary();
-        (
+        Ok((
             load.package,
             PackageApiMetrics {
                 kind: "ifc",
@@ -2050,7 +2480,7 @@ fn load_package_response(
                 elements: summary.elements,
                 instances: summary.instances,
             },
-        )
+        ))
     } else {
         let package = GeometryBackend::default()
             .build_demo_package_for(resource)
@@ -2062,16 +2492,8 @@ fn load_package_response(
             elements: package.elements.len(),
             instances: package.instances.len(),
         };
-        (package, metrics)
-    };
-
-    Ok((
-        WebPreparedPackageResponse {
-            resource: resource.to_string(),
-            package: WebPreparedGeometryPackage::from_prepared_package(&package),
-        },
-        metrics,
-    ))
+        Ok((package, metrics))
+    }
 }
 
 fn available_server_resources(ifc_artifacts_root: &Path) -> Vec<String> {
@@ -5167,18 +5589,19 @@ fn write_json_error(stream: &mut TcpStream, status: &str, error: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentActionCandidate, AgentReadonlyCypherResult, AgentSession, AgentSessionApiRequest,
-        AgentTranscriptEvent, AgentTranscriptEventKind, AgentTurnApiRequest, AgentUiAction,
-        AgentBackendErrorCategory, GraphSubgraphMode, ServerState, agent_capabilities_response,
-        agent_model_provider, candidate_ports, content_type_for_path, create_agent_session_api,
-        agent_turn_selection_summary, dedup_sorted_ids, default_level_for_model,
-        discovered_levels_by_model, execute_agent_turn_api, extract_db_node_ids,
-        extract_semantic_element_ids, format_user_facing_agent_error, graph_edge_id,
-        graph_mode_keeps_node,
-        opencode_model_discovery_providers, recent_agent_session_history, request_path_only,
-        resolve_agent_backend_for_turn, run_stub_agent_turn, sanitize_request_path,
-        summarize_agent_turn_response_transcript,
-        validate_agent_action_candidates, validate_agent_readonly_cypher, validate_graph_limit,
+        AgentActionCandidate, AgentBackendErrorCategory, AgentReadonlyCypherResult, AgentSession,
+        AgentSessionApiRequest, AgentTranscriptEvent, AgentTranscriptEventKind,
+        AgentTurnApiRequest, AgentUiAction, GraphSubgraphMode, ServerState,
+        agent_capabilities_response, agent_model_provider, agent_turn_selection_summary,
+        candidate_ports, content_type_for_path, create_agent_session_api, dedup_sorted_ids,
+        default_level_for_model, discovered_levels_by_model, execute_agent_turn_api,
+        extract_db_node_ids, extract_semantic_element_ids, format_user_facing_agent_error,
+        geometry_definition_batch_api_response, geometry_instance_batch_api_response,
+        graph_edge_id, graph_mode_keeps_node, opencode_model_discovery_providers,
+        recent_agent_session_history, request_path_only, resolve_agent_backend_for_turn,
+        run_stub_agent_turn, sanitize_request_path, skipped_geometry_batch_ids,
+        summarize_agent_turn_response_transcript, validate_agent_action_candidates,
+        validate_agent_readonly_cypher, validate_geometry_batch_id_count, validate_graph_limit,
     };
     use std::{
         collections::{BTreeMap, HashMap},
@@ -5188,12 +5611,17 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use crate::opencode_executor::{OpencodeDiscoveredModel, OpencodeExecutorConfig};
     use crate::{
         AgentBackend, AgentCapabilityOption, AgentErrorLogger, AgentQueryLogger,
         AgentRuntimeConfig, AgentSessionStore, DEFAULT_AGENT_MAX_READONLY_QUERIES_PER_TURN,
         DEFAULT_AGENT_MAX_ROWS_PER_QUERY, GraphSubgraphNode, NullAgentProgressSink,
     };
-    use crate::opencode_executor::{OpencodeDiscoveredModel, OpencodeExecutorConfig};
+    use cc_w_types::{
+        Bounds3, ExternalId, GeometryDefinitionBatch, GeometryDefinitionId, GeometryInstanceBatch,
+        GeometryInstanceCatalogEntry, GeometryInstanceId, PreparedGeometryDefinition, PreparedMesh,
+        SemanticElementId,
+    };
 
     fn test_server_state() -> ServerState {
         let nonce = SystemTime::now()
@@ -5247,6 +5675,31 @@ mod tests {
         }
     }
 
+    fn test_geometry_instance(id: u64) -> GeometryInstanceCatalogEntry {
+        GeometryInstanceCatalogEntry {
+            id: GeometryInstanceId(id),
+            element_id: SemanticElementId::new(format!("element-{id}")),
+            definition_id: GeometryDefinitionId(id * 10),
+            transform: glam::DMat4::IDENTITY,
+            bounds: Bounds3::zero(),
+            external_id: ExternalId::new(format!("external-{id}")),
+            label: format!("Instance {id}"),
+            display_color: None,
+        }
+    }
+
+    fn test_geometry_definition(id: u64) -> PreparedGeometryDefinition {
+        PreparedGeometryDefinition {
+            id: GeometryDefinitionId(id),
+            mesh: PreparedMesh {
+                local_origin: glam::DVec3::ZERO,
+                bounds: Bounds3::zero(),
+                vertices: Vec::new(),
+                indices: Vec::new(),
+            },
+        }
+    }
+
     #[test]
     fn request_root_maps_to_index() {
         assert_eq!(sanitize_request_path("/").unwrap(), Path::new("index.html"));
@@ -5287,7 +5740,10 @@ mod tests {
         let capabilities = agent_capabilities_response(&state.agent_runtime);
 
         assert_eq!(capabilities.default_backend_id, "stub");
-        assert_eq!(capabilities.default_model_id.as_deref(), Some("stub/default"));
+        assert_eq!(
+            capabilities.default_model_id.as_deref(),
+            Some("stub/default")
+        );
         assert_eq!(capabilities.default_level_id.as_deref(), Some("standard"));
         assert_eq!(capabilities.backends.len(), 1);
         assert_eq!(capabilities.backends[0].models[0].id, "stub/default");
@@ -5540,6 +5996,100 @@ mod tests {
         assert_eq!(validate_graph_limit(None, 12, 50, "maxNodes").unwrap(), 12);
         assert!(validate_graph_limit(Some(0), 12, 50, "maxNodes").is_err());
         assert!(validate_graph_limit(Some(51), 12, 50, "maxNodes").is_err());
+    }
+
+    #[test]
+    fn geometry_batch_id_count_validation_accepts_empty_and_limit() {
+        assert!(validate_geometry_batch_id_count("instance_ids", 0).is_ok());
+        assert!(
+            validate_geometry_batch_id_count("definition_ids", super::MAX_GEOMETRY_BATCH_IDS)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn geometry_batch_id_count_validation_rejects_oversized_requests() {
+        let error =
+            validate_geometry_batch_id_count("instance_ids", super::MAX_GEOMETRY_BATCH_IDS + 1)
+                .unwrap_err();
+
+        assert!(error.contains("instance_ids accepts at most"));
+        assert!(error.contains(&(super::MAX_GEOMETRY_BATCH_IDS + 1).to_string()));
+    }
+
+    #[test]
+    fn geometry_batch_skipped_ids_preserve_request_order_and_duplicates() {
+        assert_eq!(
+            skipped_geometry_batch_ids(&[3, 99, 1, 99], &[3, 1]),
+            vec![99, 99]
+        );
+        assert_eq!(
+            skipped_geometry_batch_ids(&[7, 7, 8], &[7, 7, 8]),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn geometry_instance_batch_response_includes_batch_metadata() {
+        let batch = GeometryInstanceBatch {
+            instances: vec![test_geometry_instance(3), test_geometry_instance(1)],
+        };
+        let response = geometry_instance_batch_api_response("demo/test", &[3, 99, 1, 99], &batch);
+        let value =
+            serde_json::to_value(&response).expect("instance response should serialize to JSON");
+
+        assert_eq!(
+            value["request"],
+            serde_json::json!({
+                "idField": "instance_ids",
+                "ids": [3, 99, 1, 99],
+                "count": 4
+            })
+        );
+        assert_eq!(
+            value["returned"],
+            serde_json::json!({
+                "idField": "instance_ids",
+                "ids": [3, 1],
+                "count": 2
+            })
+        );
+        assert_eq!(value["missingInstanceIds"], serde_json::json!([99, 99]));
+        assert_eq!(value["skippedInstanceIds"], serde_json::json!([99, 99]));
+        assert_eq!(value["batch"]["instances"][0]["id"], serde_json::json!(3));
+    }
+
+    #[test]
+    fn geometry_definition_batch_response_includes_batch_metadata() {
+        let batch = GeometryDefinitionBatch {
+            definitions: vec![test_geometry_definition(20), test_geometry_definition(10)],
+        };
+        let response = geometry_definition_batch_api_response("demo/test", &[20, 99, 10], &batch);
+        let value =
+            serde_json::to_value(&response).expect("definition response should serialize to JSON");
+
+        assert_eq!(
+            value["request"],
+            serde_json::json!({
+                "idField": "definition_ids",
+                "ids": [20, 99, 10],
+                "count": 3
+            })
+        );
+        assert_eq!(
+            value["returned"],
+            serde_json::json!({
+                "idField": "definition_ids",
+                "ids": [20, 10],
+                "count": 2
+            })
+        );
+        assert_eq!(value["missingDefinitionIds"], serde_json::json!([99]));
+        assert_eq!(value["skippedDefinitionIds"], serde_json::json!([99]));
+        assert_eq!(
+            value["batch"]["definitions"][0]["id"],
+            serde_json::json!(20)
+        );
     }
 
     #[test]

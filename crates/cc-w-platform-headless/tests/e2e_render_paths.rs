@@ -405,6 +405,7 @@ fn offscreen_renderer_uses_material_color() {
             }],
             instances: vec![PreparedRenderInstance {
                 id: GeometryInstanceId(1),
+                element_id: SemanticElementId::new("test/triangle"),
                 definition_id: GeometryDefinitionId(1),
                 model_from_object: DMat4::IDENTITY,
                 world_bounds: Bounds3::from_points(&[

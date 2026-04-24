@@ -1,5 +1,6 @@
 use bytemuck::{Pod, Zeroable};
 use glam::{DMat4, DVec2, DVec3, DVec4, Vec3};
+use std::collections::HashSet;
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -35,6 +36,44 @@ impl SemanticElementId {
 }
 
 impl From<&str> for SemanticElementId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GeometryLayerId(String);
+
+impl GeometryLayerId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for GeometryLayerId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GeometryResourceId(String);
+
+impl GeometryResourceId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for GeometryResourceId {
     fn from(value: &str) -> Self {
         Self::new(value)
     }
@@ -985,10 +1024,69 @@ pub struct PreparedRenderDefinition {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedRenderInstance {
     pub id: GeometryInstanceId,
+    pub element_id: SemanticElementId,
     pub definition_id: GeometryDefinitionId,
     pub model_from_object: DMat4,
     pub world_bounds: Bounds3,
     pub material: PreparedMaterial,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PickRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl PickRegion {
+    pub fn pixel(x: u32, y: u32) -> Self {
+        Self {
+            x,
+            y,
+            width: 1,
+            height: 1,
+        }
+    }
+
+    pub fn rect(x: u32, y: u32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width: width.max(1),
+            height: height.max(1),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PickHit {
+    pub instance_id: GeometryInstanceId,
+    pub element_id: SemanticElementId,
+    pub definition_id: GeometryDefinitionId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PickResult {
+    pub region: PickRegion,
+    pub hits: Vec<PickHit>,
+}
+
+impl PickResult {
+    pub fn empty(region: PickRegion) -> Self {
+        Self {
+            region,
+            hits: Vec::new(),
+        }
+    }
+
+    pub fn first_hit(&self) -> Option<&PickHit> {
+        self.hits.first()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1112,6 +1210,280 @@ impl PreparedGeometryPackage {
     pub fn is_empty(&self) -> bool {
         self.definitions.is_empty() && self.elements.is_empty() && self.instances.is_empty()
     }
+
+    pub fn catalog(&self) -> GeometryCatalog {
+        GeometryCatalog::from_prepared_package(self)
+    }
+
+    pub fn definition_batch(
+        &self,
+        request: &GeometryDefinitionBatchRequest,
+    ) -> GeometryDefinitionBatch {
+        GeometryDefinitionBatch {
+            definitions: request
+                .definition_ids
+                .iter()
+                .filter_map(|id| {
+                    self.definitions
+                        .iter()
+                        .find(|definition| definition.id == *id)
+                        .cloned()
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeometryDefinitionCatalogEntry {
+    pub id: GeometryDefinitionId,
+    pub bounds: Bounds3,
+    pub vertex_count: usize,
+    pub triangle_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeometryElementCatalogEntry {
+    pub id: SemanticElementId,
+    pub label: String,
+    pub declared_entity: String,
+    pub default_render_class: DefaultRenderClass,
+    pub bounds: Bounds3,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeometryInstanceCatalogEntry {
+    pub id: GeometryInstanceId,
+    pub element_id: SemanticElementId,
+    pub definition_id: GeometryDefinitionId,
+    pub transform: DMat4,
+    pub bounds: Bounds3,
+    pub external_id: ExternalId,
+    pub label: String,
+    pub display_color: Option<DisplayColor>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeometryCatalog {
+    pub definitions: Vec<GeometryDefinitionCatalogEntry>,
+    pub elements: Vec<GeometryElementCatalogEntry>,
+    pub instances: Vec<GeometryInstanceCatalogEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeometryCatalogLayer {
+    pub layer_id: GeometryLayerId,
+    pub resource_id: GeometryResourceId,
+    pub catalog: GeometryCatalog,
+}
+
+impl GeometryCatalog {
+    pub fn from_prepared_package(package: &PreparedGeometryPackage) -> Self {
+        Self {
+            definitions: package
+                .definitions
+                .iter()
+                .map(|definition| GeometryDefinitionCatalogEntry {
+                    id: definition.id,
+                    bounds: definition.mesh.bounds,
+                    vertex_count: definition.mesh.vertex_count(),
+                    triangle_count: definition.mesh.triangle_count(),
+                })
+                .collect(),
+            elements: package
+                .elements
+                .iter()
+                .map(|element| GeometryElementCatalogEntry {
+                    id: element.id.clone(),
+                    label: element.label.clone(),
+                    declared_entity: element.declared_entity.clone(),
+                    default_render_class: element.default_render_class,
+                    bounds: element.bounds,
+                })
+                .collect(),
+            instances: package
+                .instances
+                .iter()
+                .map(|instance| GeometryInstanceCatalogEntry {
+                    id: instance.id,
+                    element_id: instance.element_id.clone(),
+                    definition_id: instance.definition_id,
+                    transform: instance.transform,
+                    bounds: instance.bounds,
+                    external_id: instance.external_id.clone(),
+                    label: instance.label.clone(),
+                    display_color: instance.display_color,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn instance_batch(&self, request: &GeometryInstanceBatchRequest) -> GeometryInstanceBatch {
+        GeometryInstanceBatch {
+            instances: request
+                .instance_ids
+                .iter()
+                .filter_map(|id| {
+                    self.instances
+                        .iter()
+                        .find(|instance| instance.id == *id)
+                        .cloned()
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GeometryInstanceBatchRequest {
+    pub instance_ids: Vec<GeometryInstanceId>,
+}
+
+impl GeometryInstanceBatchRequest {
+    pub fn new(instance_ids: Vec<GeometryInstanceId>) -> Self {
+        Self { instance_ids }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GeometryInstanceBatch {
+    pub instances: Vec<GeometryInstanceCatalogEntry>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GeometryDefinitionBatchRequest {
+    pub definition_ids: Vec<GeometryDefinitionId>,
+}
+
+impl GeometryDefinitionBatchRequest {
+    pub fn new(definition_ids: Vec<GeometryDefinitionId>) -> Self {
+        Self { definition_ids }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GeometryDefinitionBatch {
+    pub definitions: Vec<PreparedGeometryDefinition>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GeometryResidencyState {
+    Missing,
+    Requested,
+    Ready,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GeometryStreamingBudget {
+    pub max_instances: usize,
+    pub max_definitions: usize,
+}
+
+impl GeometryStreamingBudget {
+    pub const fn unlimited() -> Self {
+        Self {
+            max_instances: usize::MAX,
+            max_definitions: usize::MAX,
+        }
+    }
+
+    pub const fn new(max_instances: usize, max_definitions: usize) -> Self {
+        Self {
+            max_instances,
+            max_definitions,
+        }
+    }
+}
+
+impl Default for GeometryStreamingBudget {
+    fn default() -> Self {
+        Self::unlimited()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GeometryStreamPlan {
+    pub instance_ids: Vec<GeometryInstanceId>,
+    pub definition_ids: Vec<GeometryDefinitionId>,
+}
+
+impl GeometryStreamPlan {
+    pub fn from_visible_element_ids(
+        catalog: &GeometryCatalog,
+        visible_element_ids: &[SemanticElementId],
+    ) -> Self {
+        let mut instance_ids = Vec::new();
+        let mut definition_ids = Vec::new();
+        let mut seen_instances = HashSet::new();
+        let mut seen_definitions = HashSet::new();
+
+        for element_id in visible_element_ids {
+            for instance in catalog
+                .instances
+                .iter()
+                .filter(|instance| instance.element_id == *element_id)
+            {
+                if seen_instances.insert(instance.id) {
+                    instance_ids.push(instance.id);
+                }
+
+                if seen_definitions.insert(instance.definition_id) {
+                    definition_ids.push(instance.definition_id);
+                }
+            }
+        }
+
+        Self {
+            instance_ids,
+            definition_ids,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeometryStreamPlanReason {
+    Selected,
+    InView,
+    VisibleElement,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeometryPrioritizedStreamEntry {
+    pub instance_id: GeometryInstanceId,
+    pub element_id: SemanticElementId,
+    pub definition_id: GeometryDefinitionId,
+    pub reason: GeometryStreamPlanReason,
+    pub priority_score: f64,
+    pub projected_screen_area: f64,
+    pub distance_to_camera: f64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GeometryPrioritizedStreamPlan {
+    pub entries: Vec<GeometryPrioritizedStreamEntry>,
+    pub instance_ids: Vec<GeometryInstanceId>,
+    pub definition_ids: Vec<GeometryDefinitionId>,
+}
+
+impl GeometryPrioritizedStreamPlan {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.instance_ids.is_empty() && self.definition_ids.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum GeometryStartViewRequest {
+    #[default]
+    Default,
+    Minimal(usize),
+    All,
+    Elements(Vec<SemanticElementId>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedGeometryStartView {
+    pub visible_element_ids: Vec<SemanticElementId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1207,6 +1579,112 @@ mod tests {
         .expect("loop");
 
         Profile2::new(outer, vec![])
+    }
+
+    fn sample_prepared_mesh() -> PreparedMesh {
+        PreparedMesh {
+            local_origin: DVec3::ZERO,
+            bounds: Bounds3::from_points(&[DVec3::ZERO, DVec3::new(1.0, 1.0, 1.0)])
+                .expect("bounds"),
+            vertices: vec![],
+            indices: vec![],
+        }
+    }
+
+    fn sample_stream_package() -> PreparedGeometryPackage {
+        PreparedGeometryPackage {
+            definitions: vec![
+                PreparedGeometryDefinition {
+                    id: GeometryDefinitionId(10),
+                    mesh: sample_prepared_mesh(),
+                },
+                PreparedGeometryDefinition {
+                    id: GeometryDefinitionId(20),
+                    mesh: sample_prepared_mesh(),
+                },
+            ],
+            elements: vec![
+                PreparedGeometryElement {
+                    id: SemanticElementId::new("element-a"),
+                    label: "Element A".to_string(),
+                    declared_entity: "IfcWall".to_string(),
+                    default_render_class: DefaultRenderClass::Physical,
+                    bounds: Bounds3::zero(),
+                },
+                PreparedGeometryElement {
+                    id: SemanticElementId::new("element-b"),
+                    label: "Element B".to_string(),
+                    declared_entity: "IfcSlab".to_string(),
+                    default_render_class: DefaultRenderClass::Physical,
+                    bounds: Bounds3::zero(),
+                },
+            ],
+            instances: vec![
+                PreparedGeometryInstance {
+                    id: GeometryInstanceId(1),
+                    element_id: SemanticElementId::new("element-a"),
+                    definition_id: GeometryDefinitionId(10),
+                    transform: DMat4::IDENTITY,
+                    bounds: Bounds3::zero(),
+                    external_id: ExternalId::new("instance-1"),
+                    label: "Instance 1".to_string(),
+                    display_color: None,
+                },
+                PreparedGeometryInstance {
+                    id: GeometryInstanceId(2),
+                    element_id: SemanticElementId::new("element-b"),
+                    definition_id: GeometryDefinitionId(20),
+                    transform: DMat4::IDENTITY,
+                    bounds: Bounds3::zero(),
+                    external_id: ExternalId::new("instance-2"),
+                    label: "Instance 2".to_string(),
+                    display_color: None,
+                },
+                PreparedGeometryInstance {
+                    id: GeometryInstanceId(3),
+                    element_id: SemanticElementId::new("element-b"),
+                    definition_id: GeometryDefinitionId(10),
+                    transform: DMat4::IDENTITY,
+                    bounds: Bounds3::zero(),
+                    external_id: ExternalId::new("instance-3"),
+                    label: "Instance 3".to_string(),
+                    display_color: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn geometry_layer_id_preserves_string_value() {
+        let id = GeometryLayerId::new("primary-layer");
+        let from_str = GeometryLayerId::from("overlay-layer");
+
+        assert_eq!(id.as_str(), "primary-layer");
+        assert_eq!(from_str.as_str(), "overlay-layer");
+    }
+
+    #[test]
+    fn geometry_resource_id_preserves_string_value() {
+        let id = GeometryResourceId::new("ifc-resource");
+        let from_str = GeometryResourceId::from("native-resource");
+
+        assert_eq!(id.as_str(), "ifc-resource");
+        assert_eq!(from_str.as_str(), "native-resource");
+    }
+
+    #[test]
+    fn geometry_catalog_layer_keeps_resource_and_layer_identity() {
+        let layer = GeometryCatalogLayer {
+            layer_id: GeometryLayerId::from("structural"),
+            resource_id: GeometryResourceId::from("sample.ifc"),
+            catalog: sample_stream_package().catalog(),
+        };
+
+        assert_eq!(layer.layer_id.as_str(), "structural");
+        assert_eq!(layer.resource_id.as_str(), "sample.ifc");
+        assert_eq!(layer.catalog.definitions.len(), 2);
+        assert_eq!(layer.catalog.elements[0].id.as_str(), "element-a");
+        assert_eq!(layer.catalog.instances[2].id, GeometryInstanceId(3));
     }
 
     #[test]
@@ -1505,5 +1983,90 @@ mod tests {
         assert_eq!(package.element_count(), 1);
         assert_eq!(package.instance_count(), 1);
         assert!(!package.is_empty());
+
+        let catalog = package.catalog();
+        assert_eq!(catalog.definitions.len(), 1);
+        assert_eq!(catalog.definitions[0].vertex_count, 0);
+        assert_eq!(catalog.definitions[0].triangle_count, 0);
+        assert_eq!(
+            catalog.elements[0].id,
+            SemanticElementId::new("demo/element")
+        );
+        assert_eq!(catalog.instances[0].definition_id, GeometryDefinitionId(1));
+    }
+
+    #[test]
+    fn instance_batch_requests_preserve_order_and_skip_unknown_ids() {
+        let catalog = sample_stream_package().catalog();
+        let request = GeometryInstanceBatchRequest::new(vec![
+            GeometryInstanceId(3),
+            GeometryInstanceId(99),
+            GeometryInstanceId(1),
+            GeometryInstanceId(2),
+        ]);
+
+        let batch = catalog.instance_batch(&request);
+        let ids = batch
+            .instances
+            .iter()
+            .map(|instance| instance.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            vec![
+                GeometryInstanceId(3),
+                GeometryInstanceId(1),
+                GeometryInstanceId(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn definition_batch_requests_preserve_order_and_skip_unknown_ids() {
+        let package = sample_stream_package();
+        let request = GeometryDefinitionBatchRequest::new(vec![
+            GeometryDefinitionId(20),
+            GeometryDefinitionId(99),
+            GeometryDefinitionId(10),
+        ]);
+
+        let batch = package.definition_batch(&request);
+        let ids = batch
+            .definitions
+            .iter()
+            .map(|definition| definition.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            vec![GeometryDefinitionId(20), GeometryDefinitionId(10)]
+        );
+    }
+
+    #[test]
+    fn stream_plan_selects_visible_instances_and_unique_definitions() {
+        let catalog = sample_stream_package().catalog();
+        let plan = GeometryStreamPlan::from_visible_element_ids(
+            &catalog,
+            &[
+                SemanticElementId::new("element-b"),
+                SemanticElementId::new("missing-element"),
+                SemanticElementId::new("element-a"),
+            ],
+        );
+
+        assert_eq!(
+            plan.instance_ids,
+            vec![
+                GeometryInstanceId(2),
+                GeometryInstanceId(3),
+                GeometryInstanceId(1),
+            ]
+        );
+        assert_eq!(
+            plan.definition_ids,
+            vec![GeometryDefinitionId(20), GeometryDefinitionId(10)]
+        );
     }
 }

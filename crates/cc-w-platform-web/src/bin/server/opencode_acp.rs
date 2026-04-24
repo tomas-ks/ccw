@@ -78,7 +78,10 @@ impl OpencodeAcpConfig {
         if let Some(config_path) = &self.config_path {
             command.env("OPENCODE_CONFIG", config_path);
         }
-        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         command
     }
 

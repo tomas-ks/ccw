@@ -77,9 +77,8 @@ fn backticked_tokens(text: &str) -> BTreeSet<String> {
 
 #[test]
 fn opencode_config_is_deny_by_default_and_seeded_with_gpt_5_4() {
-    let config: Value =
-        serde_json::from_str(&read_repo_file("tools/opencode/opencode.json"))
-            .expect("opencode config should be valid json");
+    let config: Value = serde_json::from_str(&read_repo_file("tools/opencode/opencode.json"))
+        .expect("opencode config should be valid json");
 
     assert_eq!(
         config.get("model").and_then(Value::as_str),
@@ -155,9 +154,11 @@ fn ifc_agent_config_is_deny_by_default_and_allows_compatibility_aliases() {
     );
 
     assert!(
-        permissions
-            .iter()
-            .all(|(key, value)| key == "*" || key == "ifc_*" || key == "entity_search" || key == "properties" || value == "deny"),
+        permissions.iter().all(|(key, value)| key == "*"
+            || key == "ifc_*"
+            || key == "entity_search"
+            || key == "properties"
+            || value == "deny"),
         "the IFC agent should not grant any extra permissions beyond the canonical IFC tools and the two compatibility aliases"
     );
 
@@ -204,7 +205,9 @@ fn strict_ifc_agent_config_is_deny_by_default_and_mentions_only_canonical_ifc_to
         "the strict IFC agent should not expose the compatibility alias"
     );
     assert!(
-        permissions.iter().all(|(key, value)| key == "*" || key == "ifc_*" || value == "deny"),
+        permissions
+            .iter()
+            .all(|(key, value)| key == "*" || key == "ifc_*" || value == "deny"),
         "the strict IFC agent should not grant any extra permissions"
     );
 
@@ -258,7 +261,9 @@ fn answer_42_debug_agent_is_deny_by_default_and_forces_literal_42() {
         "the 42 debug agent should stay deny-by-default"
     );
     assert!(
-        permissions.iter().all(|(key, value)| key == "*" || value == "deny"),
+        permissions
+            .iter()
+            .all(|(key, value)| key == "*" || value == "deny"),
         "the 42 debug agent should not grant any extra permissions"
     );
 
@@ -296,7 +301,9 @@ fn readonly_cypher_only_debug_agent_is_deny_by_default_and_uses_one_tool() {
         "the one-tool debug agent should allow read-only Cypher"
     );
     assert!(
-        permissions.iter().all(|(key, value)| key == "*" || key == "ifc_readonly_cypher" || value == "deny"),
+        permissions
+            .iter()
+            .all(|(key, value)| key == "*" || key == "ifc_readonly_cypher" || value == "deny"),
         "the one-tool debug agent should not grant any extra permissions"
     );
 
@@ -345,9 +352,10 @@ fn playbook_and_cypher_debug_agent_is_deny_by_default_and_uses_two_tools() {
         "the two-tool debug agent should allow read-only Cypher"
     );
     assert!(
-        permissions
-            .iter()
-            .all(|(key, value)| key == "*" || key == "ifc_query_playbook" || key == "ifc_readonly_cypher" || value == "deny"),
+        permissions.iter().all(|(key, value)| key == "*"
+            || key == "ifc_query_playbook"
+            || key == "ifc_readonly_cypher"
+            || value == "deny"),
         "the two-tool debug agent should not grant any extra permissions"
     );
 

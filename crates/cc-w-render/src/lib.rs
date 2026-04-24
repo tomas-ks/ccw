@@ -1,10 +1,11 @@
 use bytemuck::{Pod, Zeroable, bytes_of, cast_slice};
 use cc_w_types::{
-    Bounds3, GeometryDefinitionId, GeometryInstanceId, PreparedMaterial, PreparedMesh,
-    PreparedRenderDefinition, PreparedRenderInstance, PreparedRenderScene, WORLD_FORWARD,
-    WORLD_RIGHT, WORLD_UP,
+    Bounds3, GeometryDefinitionId, GeometryInstanceId, PickHit, PickRegion, PickResult,
+    PreparedMaterial, PreparedMesh, PreparedRenderDefinition, PreparedRenderInstance,
+    PreparedRenderScene, SemanticElementId, WORLD_FORWARD, WORLD_RIGHT, WORLD_UP,
 };
 use glam::{DMat4, DVec3, Mat4, Vec3};
+use std::collections::HashSet;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
 use wgpu::util::DeviceExt;
@@ -65,6 +66,58 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
     let diffuse = max(dot(normalize(input.normal), normalize(lighting.light_direction.xyz)), 0.0);
     let lit = lighting.factors.x + (diffuse * lighting.factors.y);
     return vec4<f32>(input.material_color.xyz * lit, input.material_color.w);
+}
+"#;
+
+pub const PICK_MESH_SHADER_WGSL: &str = r#"
+struct Camera {
+    clip_from_world : mat4x4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera : Camera;
+
+struct VertexInput {
+    @location(0) position : vec3<f32>,
+    @location(2) model_col0 : vec4<f32>,
+    @location(3) model_col1 : vec4<f32>,
+    @location(4) model_col2 : vec4<f32>,
+    @location(5) model_col3 : vec4<f32>,
+    @location(7) pick_index : u32,
+};
+
+struct VertexOutput {
+    @builtin(position) position : vec4<f32>,
+    @location(0) @interpolate(flat) pick_color : vec4<u32>,
+};
+
+fn encode_pick_index(index : u32) -> vec4<u32> {
+    return vec4<u32>(
+        index & 0xffu,
+        (index >> 8u) & 0xffu,
+        (index >> 16u) & 0xffu,
+        (index >> 24u) & 0xffu,
+    );
+}
+
+@vertex
+fn vs_main(input : VertexInput) -> VertexOutput {
+    var out : VertexOutput;
+    let model_from_object = mat4x4<f32>(
+        input.model_col0,
+        input.model_col1,
+        input.model_col2,
+        input.model_col3,
+    );
+    let world_position = model_from_object * vec4<f32>(input.position, 1.0);
+    out.position = camera.clip_from_world * world_position;
+    out.pick_color = encode_pick_index(input.pick_index);
+    return out;
+}
+
+@fragment
+fn fs_main(input : VertexOutput) -> @location(0) vec4<u32> {
+    return input.pick_color;
 }
 "#;
 
@@ -364,10 +417,16 @@ struct GpuInstanceBatch {
 struct GpuInstance {
     model_from_object: [[f32; 4]; 4],
     material_color: [f32; 4],
+    pick_index: u32,
+    _padding: [u32; 3],
 }
 
 impl GpuInstance {
-    fn from_instance(model_from_object: DMat4, material: PreparedMaterial) -> Self {
+    fn from_instance(
+        model_from_object: DMat4,
+        material: PreparedMaterial,
+        pick_index: u32,
+    ) -> Self {
         // Current instance transforms are assumed rigid-body or uniform-scale, so normals can
         // follow the model matrix with w=0 and be normalized once in the fragment shader.
         let draw = DrawUniform::from_instance(model_from_object, material);
@@ -375,16 +434,19 @@ impl GpuInstance {
         Self {
             model_from_object: draw.model_from_object,
             material_color: draw.material_color,
+            pick_index,
+            _padding: [0; 3],
         }
     }
 
     fn layout() -> wgpu::VertexBufferLayout<'static> {
-        const ATTRIBUTES: [wgpu::VertexAttribute; 5] = vertex_attr_array![
+        const ATTRIBUTES: [wgpu::VertexAttribute; 6] = vertex_attr_array![
             2 => Float32x4,
             3 => Float32x4,
             4 => Float32x4,
             5 => Float32x4,
-            6 => Float32x4
+            6 => Float32x4,
+            7 => Uint32
         ];
 
         wgpu::VertexBufferLayout {
@@ -450,6 +512,7 @@ impl DepthTarget {
 #[derive(Debug)]
 pub struct MeshRenderer {
     pipeline: wgpu::RenderPipeline,
+    pick_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     _lighting_buffer: wgpu::Buffer,
     scene_bind_group: wgpu::BindGroup,
@@ -458,6 +521,7 @@ pub struct MeshRenderer {
     defaults: RenderDefaults,
     meshes: Vec<GpuMesh>,
     instance_batches: Vec<GpuInstanceBatch>,
+    pick_targets: Vec<PickHit>,
     next_mesh_id: u64,
 }
 
@@ -585,9 +649,53 @@ impl MeshRenderer {
             multiview_mask: None,
             cache: None,
         });
+        let pick_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("w pick mesh shader"),
+            source: wgpu::ShaderSource::Wgsl(PICK_MESH_SHADER_WGSL.into()),
+        });
+        let pick_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("w pick mesh pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &pick_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[GpuVertex::layout(), GpuInstance::layout()],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: defaults.front_face,
+                cull_mode: defaults.cull_mode,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: defaults.depth_format,
+                depth_write_enabled: Some(defaults.depth_write_enabled),
+                depth_compare: Some(defaults.depth_compare),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &pick_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Uint,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
 
         Self {
             pipeline,
+            pick_pipeline,
             camera_buffer,
             _lighting_buffer: lighting_buffer,
             scene_bind_group,
@@ -596,6 +704,7 @@ impl MeshRenderer {
             defaults,
             meshes: Vec::new(),
             instance_batches: Vec::new(),
+            pick_targets: Vec::new(),
             next_mesh_id: 1,
         }
     }
@@ -617,6 +726,7 @@ impl MeshRenderer {
                 }],
                 instances: vec![PreparedRenderInstance {
                     id: GeometryInstanceId(1),
+                    element_id: SemanticElementId::new("mesh/instance"),
                     definition_id: GeometryDefinitionId(1),
                     model_from_object: DMat4::IDENTITY,
                     world_bounds: mesh.bounds,
@@ -637,6 +747,7 @@ impl MeshRenderer {
     ) -> Vec<UploadedMesh> {
         self.meshes.clear();
         self.instance_batches.clear();
+        self.pick_targets.clear();
 
         let uploads = scene
             .definitions
@@ -654,9 +765,16 @@ impl MeshRenderer {
             let local_origin = scene.definitions[mesh_index].mesh.local_origin;
             let model_from_object =
                 instance.model_from_object * DMat4::from_translation(local_origin);
+            let pick_index = self.pick_targets.len() as u32 + 1;
+            self.pick_targets.push(PickHit {
+                instance_id: instance.id,
+                element_id: instance.element_id.clone(),
+                definition_id: instance.definition_id,
+            });
             instances_by_mesh[mesh_index].push(GpuInstance::from_instance(
                 model_from_object,
                 instance.material,
+                pick_index,
             ));
         }
 
@@ -805,10 +923,221 @@ impl MeshRenderer {
         }
     }
 
+    pub fn render_pick_region(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        depth_target: &wgpu::TextureView,
+        region: PickRegion,
+    ) -> Option<PickRegion> {
+        let region = clamp_pick_region(region, self.viewport)?;
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("w pick mesh pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_target,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(self.defaults.depth_clear_value),
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_scissor_rect(region.x, region.y, region.width, region.height);
+        pass.set_pipeline(&self.pick_pipeline);
+        pass.set_bind_group(0, &self.scene_bind_group, &[]);
+
+        for batch in &self.instance_batches {
+            let mesh = &self.meshes[batch.mesh_index];
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
+            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
+        }
+
+        Some(region)
+    }
+
+    pub fn decode_pick_pixels(&self, region: PickRegion, rgba8: &[u8]) -> PickResult {
+        Self::decode_pick_pixels_with_targets(region, rgba8, &self.pick_targets)
+    }
+
+    pub fn decode_pick_pixels_with_targets(
+        region: PickRegion,
+        rgba8: &[u8],
+        pick_targets: &[PickHit],
+    ) -> PickResult {
+        let mut seen = HashSet::new();
+        let mut hits = Vec::new();
+
+        for pixel in rgba8.chunks_exact(4) {
+            let pick_index = decode_pick_index(pixel);
+            if pick_index == 0 || !seen.insert(pick_index) {
+                continue;
+            }
+            let Some(hit) = pick_targets.get((pick_index - 1) as usize) else {
+                continue;
+            };
+            hits.push(hit.clone());
+        }
+
+        PickResult { region, hits }
+    }
+
+    pub fn pick_targets(&self) -> &[PickHit] {
+        &self.pick_targets
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn pick_region(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        region: PickRegion,
+    ) -> Result<PickResult, PickError> {
+        let Some(region) = clamp_pick_region(region, self.viewport) else {
+            return Ok(PickResult::empty(region));
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("w pick texture"),
+            size: wgpu::Extent3d {
+                width: self.viewport.width,
+                height: self.viewport.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Uint,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("w pick texture view"),
+            ..Default::default()
+        });
+        let depth_target =
+            DepthTarget::with_defaults(device, self.viewport, self.defaults, "w pick depth target");
+
+        let unpadded_bytes_per_row = region
+            .width
+            .checked_mul(4)
+            .ok_or(PickError::OutputTooLarge)?;
+        let padded_bytes_per_row =
+            align_to(unpadded_bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let readback_size = u64::from(padded_bytes_per_row)
+            .checked_mul(u64::from(region.height))
+            .ok_or(PickError::OutputTooLarge)?;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("w pick readback buffer"),
+            size: readback_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("w pick encoder"),
+        });
+        self.render_pick_region(&mut encoder, &view, depth_target.view(), region);
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: region.x,
+                    y: region.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(region.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: region.width,
+                height: region.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let submission = queue.submit([encoder.finish()]);
+        let slice = readback.slice(..);
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: None,
+        })?;
+        let mapping_result = rx.recv().map_err(|_| PickError::ReadbackChannelClosed)?;
+        mapping_result?;
+
+        let mapped = slice.get_mapped_range();
+        let rgba8 = strip_padded_rows(
+            &mapped,
+            unpadded_bytes_per_row as usize,
+            padded_bytes_per_row as usize,
+            region.height as usize,
+        );
+        drop(mapped);
+        readback.unmap();
+
+        Ok(self.decode_pick_pixels(region, &rgba8))
+    }
+
     fn update_camera(&self, queue: &wgpu::Queue) {
         let uniform = CameraUniform::from_camera(self.camera, self.viewport);
         queue.write_buffer(&self.camera_buffer, 0, bytes_of(&uniform));
     }
+}
+
+fn clamp_pick_region(region: PickRegion, viewport: ViewportSize) -> Option<PickRegion> {
+    let viewport = viewport.clamped();
+    if region.is_empty() || region.x >= viewport.width || region.y >= viewport.height {
+        return None;
+    }
+
+    Some(PickRegion {
+        x: region.x,
+        y: region.y,
+        width: region.width.min(viewport.width - region.x),
+        height: region.height.min(viewport.height - region.y),
+    })
+}
+
+fn decode_pick_index(pixel: &[u8]) -> u32 {
+    u32::from(pixel[0])
+        | (u32::from(pixel[1]) << 8)
+        | (u32::from(pixel[2]) << 16)
+        | (u32::from(pixel[3]) << 24)
+}
+
+#[cfg(test)]
+fn encode_pick_index(index: u32) -> [u8; 4] {
+    [
+        (index & 0xff) as u8,
+        ((index >> 8) & 0xff) as u8,
+        ((index >> 16) & 0xff) as u8,
+        ((index >> 24) & 0xff) as u8,
+    ]
 }
 
 pub fn default_clear_color() -> wgpu::Color {
@@ -853,6 +1182,19 @@ pub enum HeadlessRenderError {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, thiserror::Error)]
+pub enum PickError {
+    #[error(transparent)]
+    BufferAsync(#[from] wgpu::BufferAsyncError),
+    #[error(transparent)]
+    Poll(#[from] wgpu::PollError),
+    #[error("failed to receive the GPU pick readback callback")]
+    ReadbackChannelClosed,
+    #[error("the requested pick region is too large for a readback buffer")]
+    OutputTooLarge,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn render_prepared_mesh_offscreen(
     mesh: &PreparedMesh,
     viewport: ViewportSize,
@@ -867,6 +1209,7 @@ pub async fn render_prepared_mesh_offscreen(
             }],
             instances: vec![PreparedRenderInstance {
                 id: GeometryInstanceId(1),
+                element_id: SemanticElementId::new("mesh/instance"),
                 definition_id: GeometryDefinitionId(1),
                 model_from_object: DMat4::IDENTITY,
                 world_bounds: mesh.bounds,
@@ -1186,6 +1529,27 @@ mod tests {
         assert_eq!(rgba8, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
+    #[test]
+    fn pick_indices_round_trip_through_rgba_bytes() {
+        for index in [0, 1, 255, 256, 65_535, 65_536, 0x12_34_56_78] {
+            assert_eq!(decode_pick_index(&encode_pick_index(index)), index);
+        }
+    }
+
+    #[test]
+    fn pick_regions_are_clamped_to_viewport() {
+        let viewport = ViewportSize::new(100, 80);
+
+        assert_eq!(
+            clamp_pick_region(PickRegion::rect(95, 70, 20, 20), viewport),
+            Some(PickRegion::rect(95, 70, 5, 10))
+        );
+        assert_eq!(
+            clamp_pick_region(PickRegion::pixel(100, 10), viewport),
+            None
+        );
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn scene_upload_batches_instances_per_definition() {
@@ -1244,6 +1608,7 @@ mod tests {
                 instances: vec![
                     PreparedRenderInstance {
                         id: GeometryInstanceId(1),
+                        element_id: SemanticElementId::new("synthetic/left"),
                         definition_id: GeometryDefinitionId(7),
                         model_from_object: DMat4::IDENTITY,
                         world_bounds: mesh.bounds,
@@ -1251,6 +1616,7 @@ mod tests {
                     },
                     PreparedRenderInstance {
                         id: GeometryInstanceId(2),
+                        element_id: SemanticElementId::new("synthetic/right"),
                         definition_id: GeometryDefinitionId(7),
                         model_from_object: DMat4::from_translation(DVec3::new(5.0, 0.0, 0.0)),
                         world_bounds: mesh
@@ -1273,6 +1639,109 @@ mod tests {
             assert_eq!(renderer.meshes.len(), 1);
             assert_eq!(renderer.instance_batches.len(), 1);
             assert_eq!(renderer.instance_batches[0].instance_count, 2);
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn pick_region_returns_visible_unique_instances() {
+        pollster::block_on(async {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                })
+                .await
+                .expect("adapter");
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("w render picking test device"),
+                    ..Default::default()
+                })
+                .await
+                .expect("device");
+
+            let mesh = PreparedMesh {
+                local_origin: DVec3::ZERO,
+                bounds: Bounds3::from_points(&[
+                    DVec3::new(-0.75, -0.75, 0.0),
+                    DVec3::new(0.75, 0.75, 0.0),
+                ])
+                .expect("bounds"),
+                vertices: vec![
+                    PreparedVertex {
+                        position: [-0.75, -0.75, 0.0],
+                        normal: [0.0, 0.0, 1.0],
+                    },
+                    PreparedVertex {
+                        position: [0.75, -0.75, 0.0],
+                        normal: [0.0, 0.0, 1.0],
+                    },
+                    PreparedVertex {
+                        position: [0.0, 0.75, 0.0],
+                        normal: [0.0, 0.0, 1.0],
+                    },
+                ],
+                indices: vec![0, 1, 2],
+            };
+            let left_transform = DMat4::from_translation(DVec3::new(-1.0, 0.0, 0.0));
+            let right_transform = DMat4::from_translation(DVec3::new(1.0, 0.0, 0.0));
+            let scene = PreparedRenderScene {
+                bounds: Bounds3::from_points(&[
+                    DVec3::new(-1.75, -0.75, 0.0),
+                    DVec3::new(1.75, 0.75, 0.0),
+                ])
+                .expect("scene bounds"),
+                definitions: vec![PreparedRenderDefinition {
+                    id: GeometryDefinitionId(7),
+                    mesh: mesh.clone(),
+                }],
+                instances: vec![
+                    PreparedRenderInstance {
+                        id: GeometryInstanceId(1),
+                        element_id: SemanticElementId::new("synthetic/left"),
+                        definition_id: GeometryDefinitionId(7),
+                        model_from_object: left_transform,
+                        world_bounds: mesh.bounds.transformed(left_transform),
+                        material: PreparedMaterial::default(),
+                    },
+                    PreparedRenderInstance {
+                        id: GeometryInstanceId(2),
+                        element_id: SemanticElementId::new("synthetic/right"),
+                        definition_id: GeometryDefinitionId(7),
+                        model_from_object: right_transform,
+                        world_bounds: mesh.bounds.transformed(right_transform),
+                        material: PreparedMaterial::new(DisplayColor::new(0.9, 0.3, 0.2)),
+                    },
+                ],
+            };
+
+            let mut renderer = MeshRenderer::new(
+                &device,
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                ViewportSize::new(160, 120),
+                fit_camera_to_render_scene(&scene),
+            );
+            renderer.upload_prepared_scene(&device, &queue, &scene);
+
+            let result = renderer
+                .pick_region(&device, &queue, PickRegion::rect(0, 0, 160, 120))
+                .expect("pick result");
+            let hit_ids = result
+                .hits
+                .iter()
+                .map(|hit| hit.instance_id)
+                .collect::<std::collections::HashSet<_>>();
+
+            assert_eq!(
+                hit_ids,
+                [GeometryInstanceId(1), GeometryInstanceId(2)]
+                    .into_iter()
+                    .collect()
+            );
         });
     }
 }

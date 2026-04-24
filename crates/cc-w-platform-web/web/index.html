@@ -47,46 +47,47 @@
         font-size: 0.94em;
       }
 
-      .toolbar {
-        height: 56px;
+      .viewer-footer {
+        flex: 0 0 auto;
+        min-height: 34px;
         display: flex;
         align-items: center;
-        gap: 16px;
-        padding: 0 16px;
+        gap: 12px;
+        padding: 5px 12px;
         background: #151b2a;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
       }
 
-      .toolbar label {
+      .viewer-footer label {
         display: flex;
         align-items: center;
-        gap: 8px;
-        font-size: 14px;
+        gap: 6px;
+        font-size: 12px;
+        color: rgba(243, 246, 255, 0.72);
         white-space: nowrap;
       }
 
-      .toolbar select {
-        height: 32px;
-        min-width: 220px;
+      .viewer-footer select {
+        height: 24px;
+        min-width: 148px;
+        max-width: 280px;
         border: 1px solid rgba(255, 255, 255, 0.12);
         border-radius: 6px;
         background: #0f1320;
         color: inherit;
-        padding: 0 10px;
+        padding: 0 8px;
         font: inherit;
       }
 
-      .hint {
-        font-size: 13px;
-        color: rgba(243, 246, 255, 0.76);
-        white-space: nowrap;
+      .viewer-footer #tool-picker {
+        min-width: 96px;
       }
 
       .status {
         min-width: 0;
         flex: 1;
-        font-size: 13px;
-        color: rgba(243, 246, 255, 0.76);
+        font-size: 12px;
+        color: rgba(243, 246, 255, 0.68);
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -590,15 +591,15 @@
       }
 
       @media (max-width: 900px) {
-        .toolbar {
+        .viewer-footer {
           height: auto;
-          min-height: 56px;
-          padding: 8px 12px;
+          min-height: 34px;
+          padding: 5px 8px;
           flex-wrap: wrap;
         }
 
-        .toolbar select {
-          min-width: 170px;
+        .viewer-footer select {
+          min-width: 132px;
         }
 
         .terminal {
@@ -612,14 +613,6 @@
     </style>
   </head>
   <body>
-    <div class="toolbar">
-      <label>
-        Resource
-        <select id="resource-picker"></select>
-      </label>
-      <div class="hint">Drag to orbit. Wheel to zoom.</div>
-      <div class="status" id="status-line">Starting w web viewer…</div>
-    </div>
     <main class="workspace">
       <section class="viewer-pane">
         <div class="viewport">
@@ -775,6 +768,20 @@
         </div>
       </div>
     </section>
+    <footer class="viewer-footer" aria-label="Viewer controls and status">
+      <label>
+        Model
+        <select id="resource-picker"></select>
+      </label>
+      <label>
+        Tool
+        <select id="tool-picker">
+          <option value="orbit" selected>Orbit</option>
+          <option value="pick">Pick</option>
+        </select>
+      </label>
+      <div class="status" id="status-line">Starting w web viewer…</div>
+    </footer>
     <script src="./vendor/graphology.js"></script>
     <script src="./vendor/sigma.js"></script>
     <script type="importmap">
@@ -801,12 +808,17 @@
         viewer_frame_visible,
         viewer_hide_elements,
         viewer_list_element_ids,
+        viewer_pick_at_json,
+        viewer_pick_rect_json,
         viewer_resize_viewport,
         viewer_reset_all_visibility,
         viewer_reset_element_visibility,
         viewer_select_elements,
         viewer_selected_element_ids,
+        viewer_set_view_mode,
         viewer_show_elements,
+        viewer_stream_visible as viewer_stream_newly_visible_geometry,
+        viewer_view_state_json,
         viewer_visible_element_ids,
       } from "./pkg/cc_w_platform_web.js";
 
@@ -854,17 +866,72 @@
       });
 
       function createViewerApi() {
+        const parseViewState = (json) => JSON.parse(json);
+        const parsePickResult = (json) => JSON.parse(json);
+        const setViewModeAsync = async (mode) => parseViewState(await viewer_set_view_mode(mode));
+        const pickAtAsync = async (x, y) => parsePickResult(await viewer_pick_at_json(x, y));
+        const pickRectAsync = async (x0, y0, x1, y1) =>
+          parsePickResult(await viewer_pick_rect_json(x0, y0, x1, y1));
+        const streamNewlyVisibleGeometrySoon = () => {
+          viewer_stream_newly_visible_geometry().catch((error) => {
+            console.error("viewer automatic geometry streaming failed", error);
+          });
+        };
+        const setViewModeSoon = (mode) => {
+          setViewModeAsync(mode).catch((error) => {
+            console.error(`viewer setViewMode(${JSON.stringify(mode)}) failed`, error);
+          });
+          return api.viewState();
+        };
+        const pickAtSoon = (x, y) => {
+          pickAtAsync(x, y).catch((error) => {
+            console.error(`viewer pickAt(${x}, ${y}) failed`, error);
+          });
+          return api.viewState();
+        };
+        const pickRectSoon = (x0, y0, x1, y1) => {
+          pickRectAsync(x0, y0, x1, y1).catch((error) => {
+            console.error(`viewer pickRect(${x0}, ${y0}, ${x1}, ${y1}) failed`, error);
+          });
+          return api.viewState();
+        };
         const api = {
           currentResource: () => viewer_current_resource(),
+          viewState: () => parseViewState(viewer_view_state_json()),
+          setViewMode: (mode) => setViewModeSoon(mode),
+          defaultView: () => setViewModeSoon("default"),
+          allView: () => setViewModeSoon("all"),
+          async: {
+            setViewMode: setViewModeAsync,
+            defaultView: () => setViewModeAsync("default"),
+            allView: () => setViewModeAsync("all"),
+            pickAt: pickAtAsync,
+            pickRect: pickRectAsync,
+          },
           listElementIds: () => Array.from(viewer_list_element_ids()),
           visibleElementIds: () => Array.from(viewer_visible_element_ids()),
           selectedElementIds: () => Array.from(viewer_selected_element_ids()),
+          selectedInstanceIds: () => api.viewState().selectedInstanceIds || [],
           hide: (ids) => viewer_hide_elements(ids),
-          show: (ids) => viewer_show_elements(ids),
-          resetVisibility: (ids) => viewer_reset_element_visibility(ids),
-          resetAllVisibility: () => viewer_reset_all_visibility(),
+          show: (ids) => {
+            const changed = viewer_show_elements(ids);
+            streamNewlyVisibleGeometrySoon();
+            return changed;
+          },
+          resetVisibility: (ids) => {
+            const changed = viewer_reset_element_visibility(ids);
+            streamNewlyVisibleGeometrySoon();
+            return changed;
+          },
+          resetAllVisibility: () => {
+            const changed = viewer_reset_all_visibility();
+            streamNewlyVisibleGeometrySoon();
+            return changed;
+          },
           select: (ids) => viewer_select_elements(ids),
           clearSelection: () => viewer_clear_selection(),
+          pickAt: pickAtSoon,
+          pickRect: pickRectSoon,
           frameVisible: () => viewer_frame_visible(),
           resizeViewport: () => viewer_resize_viewport(),
           queryCypher: async (cypher, resource = viewer_current_resource()) => {
@@ -1042,7 +1109,7 @@
       function installLayoutResizers(callbacks = {}) {
         const root = document.documentElement;
         const body = document.body;
-        const toolbar = document.querySelector(".toolbar");
+        const footer = document.querySelector(".viewer-footer");
         const workspace = document.querySelector(".workspace");
         const sidePanel = document.querySelector(".side-panel");
         const terminal = document.querySelector(".terminal");
@@ -1097,10 +1164,10 @@
         };
 
         const constrainTerminalHeight = (height) => {
-          const toolbarHeight = toolbar ? toolbar.getBoundingClientRect().height : 56;
+          const footerHeight = footer ? footer.getBoundingClientRect().height : 34;
           const minHeight = 132;
           const minWorkspaceHeight = 260;
-          const maxHeight = Math.max(minHeight, window.innerHeight - toolbarHeight - minWorkspaceHeight);
+          const maxHeight = Math.max(minHeight, window.innerHeight - footerHeight - minWorkspaceHeight);
           return clamp(height, minHeight, maxHeight);
         };
 
@@ -3381,9 +3448,21 @@
           viewer,
           graph,
           resource: () => viewer.currentResource(),
+          viewState: () => viewer.viewState(),
+          setViewMode: (mode) => viewer.setViewMode(mode),
+          defaultView: () => viewer.defaultView(),
+          allView: () => viewer.allView(),
+          setViewModeAsync: (mode) => viewer.async.setViewMode(mode),
+          defaultViewAsync: () => viewer.async.defaultView(),
+          allViewAsync: () => viewer.async.allView(),
+          pickAt: (x, y) => viewer.pickAt(x, y),
+          pickRect: (x0, y0, x1, y1) => viewer.pickRect(x0, y0, x1, y1),
+          pickAtAsync: (x, y) => viewer.async.pickAt(x, y),
+          pickRectAsync: (x0, y0, x1, y1) => viewer.async.pickRect(x0, y0, x1, y1),
           listIds: () => viewer.listElementIds(),
           visibleIds: () => viewer.visibleElementIds(),
           selectedIds: () => viewer.selectedElementIds(),
+          selectedInstanceIds: () => viewer.selectedInstanceIds(),
           query: async (cypher, resource = currentIfcResource()) =>
             viewer.queryCypher(cypher, resource),
           queryIds: async (cypher, resource = currentIfcResource()) =>
@@ -4911,7 +4990,7 @@
           screenId: "repl-screen",
           hostId: "repl-terminal",
           introLines: [
-            'resource(), query(...), ids(...), hide([...]), show([...]), select([...]), graph.reset(...), graph.clear(), graph.mode("semantic"), frame()',
+            'resource(), allView(), defaultView(), viewState(), pickAt(x,y), pickRect(x0,y0,x1,y1), query(...), ids(...), hide([...]), show([...]), select([...]), graph.reset(...), frame()',
             'Example: graph.reset("MATCH (p:IfcProject) RETURN id(p) AS node_id LIMIT 1");',
             'Example: var walls = ids("MATCH (w:IfcWall) RETURN w.GlobalId AS global_id LIMIT 8"); hide(walls);',
             "Enter runs. Up/Down walks history. Ctrl+C clears the line.",
@@ -4922,7 +5001,7 @@
               "api",
               "window",
               "document",
-              `"use strict"; const { viewer, graph, resource, listIds, visibleIds, selectedIds, query, queryIds, ids, hide, show, select, resetVisibility, clearSelection, frame, frameVisible, hideQuery, showQuery, selectQuery } = api; return (async () => { ${rewritten} })();`
+              `"use strict"; const { viewer, graph, resource, viewState, setViewMode, defaultView, allView, setViewModeAsync, defaultViewAsync, allViewAsync, pickAt, pickRect, pickAtAsync, pickRectAsync, listIds, visibleIds, selectedIds, selectedInstanceIds, query, queryIds, ids, hide, show, select, resetVisibility, clearSelection, frame, frameVisible, hideQuery, showQuery, selectQuery } = api; return (async () => { ${rewritten} })();`
             );
             return fn(replApi, window, document);
           },
@@ -4990,6 +5069,17 @@
           window.query = repl.query;
           window.queryIds = repl.queryIds;
           window.ids = repl.ids;
+          window.viewState = repl.viewState;
+          window.setViewMode = repl.setViewMode;
+          window.defaultView = repl.defaultView;
+          window.allView = repl.allView;
+          window.setViewModeAsync = repl.setViewModeAsync;
+          window.defaultViewAsync = repl.defaultViewAsync;
+          window.allViewAsync = repl.allViewAsync;
+          window.pickAt = repl.pickAt;
+          window.pickRect = repl.pickRect;
+          window.pickAtAsync = repl.pickAtAsync;
+          window.pickRectAsync = repl.pickRectAsync;
           window.hideQuery = repl.hideQuery;
           window.showQuery = repl.showQuery;
           window.selectQuery = repl.selectQuery;
@@ -4997,6 +5087,7 @@
           window.listIds = repl.listIds;
           window.visibleIds = repl.visibleIds;
           window.selectedIds = repl.selectedIds;
+          window.selectedInstanceIds = repl.selectedInstanceIds;
           window.hide = repl.hide;
           window.show = repl.show;
           window.select = repl.select;

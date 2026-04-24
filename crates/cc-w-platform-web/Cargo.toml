@@ -39,6 +39,7 @@ wasm-bindgen-futures.workspace = true
 web-sys = { workspace = true, features = [
     "CanvasRenderingContext2d",
     "Document",
+    "DomRect",
     "Element",
     "Event",
     "EventTarget",

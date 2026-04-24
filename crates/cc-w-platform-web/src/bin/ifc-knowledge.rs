@@ -3,13 +3,9 @@ mod agent_executor;
 #[path = "server/schema_reference.rs"]
 mod schema_reference;
 
-use std::{
-    env,
-    path::PathBuf,
-    process::ExitCode,
-};
+use std::{env, path::PathBuf, process::ExitCode};
 
-use cc_w_velr::{default_ifc_artifacts_root, IfcSchemaId};
+use cc_w_velr::{IfcSchemaId, default_ifc_artifacts_root};
 use schema_reference::{
     load_entity_references, load_query_playbooks, load_relation_references, load_schema_context,
 };
@@ -31,27 +27,25 @@ fn run() -> Result<(), String> {
         .artifacts_root
         .unwrap_or_else(default_ifc_artifacts_root);
 
-    let output = match cli.command {
-        Command::SchemaContext => serde_json::to_value(load_schema_context(&artifacts_root, &schema)?)
-            .map_err(|error| format!("could not serialize schema context: {error}"))?,
-        Command::EntityReference { entity_names } => serde_json::to_value(load_entity_references(
-            &artifacts_root,
-            &schema,
-            &entity_names,
-        )?)
-        .map_err(|error| format!("could not serialize entity references: {error}"))?,
-        Command::QueryPlaybook { goal, entity_names } => serde_json::to_value(load_query_playbooks(
-            &artifacts_root,
-            &schema,
-            &goal,
-            &entity_names,
-        )?)
-        .map_err(|error| format!("could not serialize query playbooks: {error}"))?,
-        Command::RelationReference { relation_names } => serde_json::to_value(
-            load_relation_references(&artifacts_root, &schema, &relation_names)?,
-        )
-        .map_err(|error| format!("could not serialize relation references: {error}"))?,
-    };
+    let output =
+        match cli.command {
+            Command::SchemaContext => {
+                serde_json::to_value(load_schema_context(&artifacts_root, &schema)?)
+                    .map_err(|error| format!("could not serialize schema context: {error}"))?
+            }
+            Command::EntityReference { entity_names } => serde_json::to_value(
+                load_entity_references(&artifacts_root, &schema, &entity_names)?,
+            )
+            .map_err(|error| format!("could not serialize entity references: {error}"))?,
+            Command::QueryPlaybook { goal, entity_names } => serde_json::to_value(
+                load_query_playbooks(&artifacts_root, &schema, &goal, &entity_names)?,
+            )
+            .map_err(|error| format!("could not serialize query playbooks: {error}"))?,
+            Command::RelationReference { relation_names } => serde_json::to_value(
+                load_relation_references(&artifacts_root, &schema, &relation_names)?,
+            )
+            .map_err(|error| format!("could not serialize relation references: {error}"))?,
+        };
 
     let json = serde_json::to_string_pretty(&output)
         .map_err(|error| format!("could not format JSON output: {error}"))?;
@@ -69,9 +63,16 @@ struct Cli {
 #[derive(Debug, Clone)]
 enum Command {
     SchemaContext,
-    EntityReference { entity_names: Vec<String> },
-    QueryPlaybook { goal: String, entity_names: Vec<String> },
-    RelationReference { relation_names: Vec<String> },
+    EntityReference {
+        entity_names: Vec<String>,
+    },
+    QueryPlaybook {
+        goal: String,
+        entity_names: Vec<String>,
+    },
+    RelationReference {
+        relation_names: Vec<String>,
+    },
 }
 
 impl Cli {
@@ -82,15 +83,15 @@ impl Cli {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--artifacts-root" => {
-                    let value = args.next().ok_or_else(|| {
-                        "--artifacts-root expects a path".to_owned()
-                    })?;
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--artifacts-root expects a path".to_owned())?;
                     artifacts_root = Some(PathBuf::from(value));
                 }
                 "--schema" => {
-                    let value = args.next().ok_or_else(|| {
-                        "--schema expects an IFC schema id".to_owned()
-                    })?;
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--schema expects an IFC schema id".to_owned())?;
                     schema = Some(value);
                 }
                 "--help" | "-h" => return Err(usage()),
@@ -129,7 +130,7 @@ impl Cli {
                                 return Err(format!(
                                     "unexpected argument `{other}` for query-playbook\n{}",
                                     usage()
-                                ))
+                                ));
                             }
                         }
                     }
@@ -151,10 +152,7 @@ impl Cli {
                     });
                 }
                 other => {
-                    return Err(format!(
-                        "unexpected argument `{other}`\n{}",
-                        usage()
-                    ));
+                    return Err(format!("unexpected argument `{other}`\n{}", usage()));
                 }
             }
         }

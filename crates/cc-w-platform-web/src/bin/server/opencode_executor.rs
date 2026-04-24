@@ -1,12 +1,12 @@
 use super::agent_executor::{
     AgentActionCandidate, AgentBackendTurnRequest, AgentBackendTurnResponse, AgentEntityReference,
-    AgentExecutor, AgentGraphMode, AgentProgressSink, AgentQueryPlaybook, NullAgentProgressSink,
+    AgentExecutor, AgentGraphMode, AgentProgressSink, AgentQueryPlaybook,
     AgentReadonlyCypherResult, AgentReadonlyCypherRuntime, AgentRelationReference,
-    AgentSchemaContext, AgentTranscriptEvent,
+    AgentSchemaContext, AgentTranscriptEvent, NullAgentProgressSink,
 };
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use reqwest::blocking::Client;
 use std::{
     collections::{BTreeMap, HashMap},
     env,
@@ -284,8 +284,8 @@ impl OpencodeNativeServer {
         config: &OpencodeExecutorConfig,
         viewer_api_base: Option<&str>,
     ) -> Result<Arc<Self>, String> {
-        let executable = resolve_executable(&config.executable)
-            .map_err(|error| error.to_string())?;
+        let executable =
+            resolve_executable(&config.executable).map_err(|error| error.to_string())?;
         let mut command = Command::new(&executable);
         command.arg("serve");
         command.arg("--pure");
@@ -324,7 +324,9 @@ impl OpencodeNativeServer {
             loop {
                 line.clear();
                 let Ok(bytes_read) = reader.read_line(&mut line) else {
-                    let _ = ready_tx.send(Err("failed to read opencode serve startup output".to_owned()));
+                    let _ = ready_tx.send(Err(
+                        "failed to read opencode serve startup output".to_owned()
+                    ));
                     return;
                 };
                 if bytes_read == 0 {
@@ -341,10 +343,9 @@ impl OpencodeNativeServer {
                 output.extend_from_slice(line.as_bytes());
                 let trimmed = line.trim();
                 if trimmed.starts_with("opencode server listening") {
-                    if let Some(url) = trimmed
-                        .split_whitespace()
-                        .find(|segment| segment.starts_with("http://") || segment.starts_with("https://"))
-                    {
+                    if let Some(url) = trimmed.split_whitespace().find(|segment| {
+                        segment.starts_with("http://") || segment.starts_with("https://")
+                    }) {
                         let _ = ready_tx.send(Ok(url.to_owned()));
                         return;
                     }
@@ -518,7 +519,10 @@ impl OpencodeNativeServer {
             }
         }
         if let Some(variant) = variant.filter(|value| !value.trim().is_empty()) {
-            body.insert("variant".to_owned(), Value::String(variant.trim().to_owned()));
+            body.insert(
+                "variant".to_owned(),
+                Value::String(variant.trim().to_owned()),
+            );
         }
         body.insert(
             "parts".to_owned(),
@@ -628,9 +632,12 @@ impl NativeEventBus {
         let Some(session_id) = native_event_session_id(&event).map(ToOwned::to_owned) else {
             return;
         };
-        let Some(sender) = self.subscribers.lock().ok().and_then(|subscribers| {
-            subscribers.get(&session_id).cloned()
-        }) else {
+        let Some(sender) = self
+            .subscribers
+            .lock()
+            .ok()
+            .and_then(|subscribers| subscribers.get(&session_id).cloned())
+        else {
             return;
         };
         if sender.send(event).is_err() {
@@ -734,13 +741,7 @@ impl OpencodeExecutor {
         let prompt = build_native_turn_prompt(request, agent);
 
         native_server
-            .prompt_async(
-                &native_session_id,
-                agent,
-                model,
-                variant,
-                &prompt,
-            )
+            .prompt_async(&native_session_id, agent, model, variant, &prompt)
             .map_err(|error| format!("opencode prompt submission failed: {error}"))?;
 
         let mut collector = NativeTurnCollector::new();
@@ -762,7 +763,10 @@ impl OpencodeExecutor {
                         last_activity = Instant::now();
                     }
                     for event in events {
-                        println!("w web opencode progress {}", summarize_agent_transcript_event(&event));
+                        println!(
+                            "w web opencode progress {}",
+                            summarize_agent_transcript_event(&event)
+                        );
                         progress.emit(event.clone());
                         collector.transcript.push(event);
                     }
@@ -1173,9 +1177,8 @@ impl AgentExecutor for OpencodeExecutor {
             let mut executed_tool = false;
             for (call_index, tool_call) in step.tool_calls.into_iter().enumerate() {
                 let tool_call_signature = opencode_tool_call_signature(&tool_call);
-                if let Some(previous_result) = tool_results_by_signature
-                    .get(&tool_call_signature)
-                    .cloned()
+                if let Some(previous_result) =
+                    tool_results_by_signature.get(&tool_call_signature).cloned()
                 {
                     let reused_started_event = AgentTranscriptEvent::tool(format!(
                         "(reused) {}",
@@ -1233,14 +1236,15 @@ impl AgentExecutor for OpencodeExecutor {
                                     ),
                                     content: serialize_readonly_cypher_tool_result(&result)
                                         .map_err(|error| {
-                                            format!(
-                                                "could not encode Cypher tool result: {error}"
-                                            )
+                                            format!("could not encode Cypher tool result: {error}")
                                         })?,
                                 });
                                 tool_results_by_signature.insert(
                                     tool_call_signature,
-                                    tool_results.last().cloned().expect("tool result just pushed"),
+                                    tool_results
+                                        .last()
+                                        .cloned()
+                                        .expect("tool result just pushed"),
                                 );
                             }
                             Err(error) => {
@@ -1260,7 +1264,10 @@ impl AgentExecutor for OpencodeExecutor {
                                 });
                                 tool_results_by_signature.insert(
                                     tool_call_signature,
-                                    tool_results.last().cloned().expect("tool result just pushed"),
+                                    tool_results
+                                        .last()
+                                        .cloned()
+                                        .expect("tool result just pushed"),
                                 );
                             }
                         }
@@ -1290,7 +1297,10 @@ impl AgentExecutor for OpencodeExecutor {
                         });
                         tool_results_by_signature.insert(
                             tool_call_signature,
-                            tool_results.last().cloned().expect("tool result just pushed"),
+                            tool_results
+                                .last()
+                                .cloned()
+                                .expect("tool result just pushed"),
                         );
                     }
                     OpencodeToolCall::GetModelDetails => {
@@ -1320,7 +1330,10 @@ impl AgentExecutor for OpencodeExecutor {
                         });
                         tool_results_by_signature.insert(
                             tool_call_signature,
-                            tool_results.last().cloned().expect("tool result just pushed"),
+                            tool_results
+                                .last()
+                                .cloned()
+                                .expect("tool result just pushed"),
                         );
                     }
                     OpencodeToolCall::GetEntityReference { entity_names } => {
@@ -1351,7 +1364,10 @@ impl AgentExecutor for OpencodeExecutor {
                         });
                         tool_results_by_signature.insert(
                             tool_call_signature,
-                            tool_results.last().cloned().expect("tool result just pushed"),
+                            tool_results
+                                .last()
+                                .cloned()
+                                .expect("tool result just pushed"),
                         );
                     }
                     OpencodeToolCall::RequestTools { tools } => {
@@ -1380,12 +1396,14 @@ impl AgentExecutor for OpencodeExecutor {
                         for requested_tool in requested_tools {
                             match normalize_tool_function_kind(&requested_tool).as_str() {
                                 "get_schema_context" => {
-                                    let schema_started_event = AgentTranscriptEvent::tool(
-                                        format!("Loading schema context for {}.", request.schema_id),
-                                    );
+                                    let schema_started_event = AgentTranscriptEvent::tool(format!(
+                                        "Loading schema context for {}.",
+                                        request.schema_id
+                                    ));
                                     progress.emit(schema_started_event.clone());
                                     transcript.push(schema_started_event);
-                                    let result: AgentSchemaContext = runtime.get_schema_context()?;
+                                    let result: AgentSchemaContext =
+                                        runtime.get_schema_context()?;
                                     queries_executed = queries_executed.saturating_add(1);
                                     let schema_finished_event = AgentTranscriptEvent::system(
                                         format!("Schema context loaded for {}.", result.schema_id),
@@ -1418,9 +1436,7 @@ impl AgentExecutor for OpencodeExecutor {
                             requested_results.insert(
                                 "unsupportedTools".to_owned(),
                                 serde_json::to_value(&unsupported_tools).map_err(|error| {
-                                    format!(
-                                        "could not encode unsupported requested tools: {error}"
-                                    )
+                                    format!("could not encode unsupported requested tools: {error}")
                                 })?,
                             );
                         }
@@ -1428,7 +1444,11 @@ impl AgentExecutor for OpencodeExecutor {
                         let finished_event = AgentTranscriptEvent::system(format!(
                             "Requested tool bundle returned {} supported tool{}.",
                             requested_results.len() - usize::from(!unsupported_tools.is_empty()),
-                            if requested_results.len() == 1 { "" } else { "s" }
+                            if requested_results.len() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
                         ));
                         progress.emit(finished_event.clone());
                         transcript.push(finished_event);
@@ -1444,7 +1464,10 @@ impl AgentExecutor for OpencodeExecutor {
                         });
                         tool_results_by_signature.insert(
                             tool_call_signature,
-                            tool_results.last().cloned().expect("tool result just pushed"),
+                            tool_results
+                                .last()
+                                .cloned()
+                                .expect("tool result just pushed"),
                         );
                     }
                     OpencodeToolCall::GetQueryPlaybook { goal, entity_names } => {
@@ -1474,7 +1497,10 @@ impl AgentExecutor for OpencodeExecutor {
                         });
                         tool_results_by_signature.insert(
                             tool_call_signature,
-                            tool_results.last().cloned().expect("tool result just pushed"),
+                            tool_results
+                                .last()
+                                .cloned()
+                                .expect("tool result just pushed"),
                         );
                     }
                     OpencodeToolCall::GetRelationReference { relation_names } => {
@@ -1505,7 +1531,10 @@ impl AgentExecutor for OpencodeExecutor {
                         });
                         tool_results_by_signature.insert(
                             tool_call_signature,
-                            tool_results.last().cloned().expect("tool result just pushed"),
+                            tool_results
+                                .last()
+                                .cloned()
+                                .expect("tool result just pushed"),
                         );
                     }
                     OpencodeToolCall::DescribeNodes { db_node_ids } => {
@@ -1539,7 +1568,10 @@ impl AgentExecutor for OpencodeExecutor {
                         });
                         tool_results_by_signature.insert(
                             tool_call_signature,
-                            tool_results.last().cloned().expect("tool result just pushed"),
+                            tool_results
+                                .last()
+                                .cloned()
+                                .expect("tool result just pushed"),
                         );
                     }
                     OpencodeToolCall::GetNodeProperties { db_node_id } => {
@@ -1574,7 +1606,10 @@ impl AgentExecutor for OpencodeExecutor {
                         });
                         tool_results_by_signature.insert(
                             tool_call_signature,
-                            tool_results.last().cloned().expect("tool result just pushed"),
+                            tool_results
+                                .last()
+                                .cloned()
+                                .expect("tool result just pushed"),
                         );
                     }
                     OpencodeToolCall::GetNeighbors {
@@ -1613,7 +1648,10 @@ impl AgentExecutor for OpencodeExecutor {
                         });
                         tool_results_by_signature.insert(
                             tool_call_signature,
-                            tool_results.last().cloned().expect("tool result just pushed"),
+                            tool_results
+                                .last()
+                                .cloned()
+                                .expect("tool result just pushed"),
                         );
                     }
                     OpencodeToolCall::EmitUiActions { actions } => {
@@ -1634,9 +1672,7 @@ impl AgentExecutor for OpencodeExecutor {
                                     "ok": true,
                                 }))
                                 .map_err(|error| {
-                                    format!(
-                                        "could not encode viewer action reuse marker: {error}"
-                                    )
+                                    format!("could not encode viewer action reuse marker: {error}")
                                 })?,
                             },
                         );
@@ -1900,10 +1936,8 @@ impl NativeTurnCollector {
             }
         }
         if self.transcript.is_empty() {
-            let event = AgentTranscriptEvent::system(format!(
-                "OpenCode session {} completed.",
-                session_id
-            ));
+            let event =
+                AgentTranscriptEvent::system(format!("OpenCode session {} completed.", session_id));
             progress.emit(event.clone());
             self.transcript.push(event);
         }
@@ -2007,11 +2041,8 @@ impl NativeTurnCollector {
             .trim()
             .to_owned();
         let snapshot = native_tool_state_snapshot(part);
-        if !native_record_tool_snapshot(
-            &mut self.last_tool_snapshot_by_call_id,
-            &call_id,
-            snapshot,
-        ) {
+        if !native_record_tool_snapshot(&mut self.last_tool_snapshot_by_call_id, &call_id, snapshot)
+        {
             return Vec::new();
         }
         self.last_tool_status_by_call_id
@@ -2051,15 +2082,19 @@ impl NativeTurnCollector {
                             .insert(call_id.clone(), true);
                         events.extend(call_events);
                     }
-                    events.push(AgentTranscriptEvent::tool(opencode_tool_progress_output_summary(
-                        &tool_name,
-                        state.and_then(|state| state.get("output")),
-                    )));
+                    events.push(AgentTranscriptEvent::tool(
+                        opencode_tool_progress_output_summary(
+                            &tool_name,
+                            state.and_then(|state| state.get("output")),
+                        ),
+                    ));
                 } else {
-                    events.push(AgentTranscriptEvent::tool(opencode_tool_progress_output_summary(
-                        &tool_name,
-                        state.and_then(|state| state.get("output")),
-                    )));
+                    events.push(AgentTranscriptEvent::tool(
+                        opencode_tool_progress_output_summary(
+                            &tool_name,
+                            state.and_then(|state| state.get("output")),
+                        ),
+                    ));
                 }
             }
             "error" => {
@@ -2069,19 +2104,23 @@ impl NativeTurnCollector {
                             .insert(call_id.clone(), true);
                         events.extend(call_events);
                     }
-                    events.push(AgentTranscriptEvent::tool(opencode_tool_progress_error_summary(
-                        &tool_name,
-                        state
-                            .and_then(|state| state.get("error"))
-                            .unwrap_or(&state_value),
-                    )));
+                    events.push(AgentTranscriptEvent::tool(
+                        opencode_tool_progress_error_summary(
+                            &tool_name,
+                            state
+                                .and_then(|state| state.get("error"))
+                                .unwrap_or(&state_value),
+                        ),
+                    ));
                 } else {
-                    events.push(AgentTranscriptEvent::tool(opencode_tool_progress_error_summary(
-                        &tool_name,
-                        state
-                            .and_then(|state| state.get("error"))
-                            .unwrap_or(&state_value),
-                    )));
+                    events.push(AgentTranscriptEvent::tool(
+                        opencode_tool_progress_error_summary(
+                            &tool_name,
+                            state
+                                .and_then(|state| state.get("error"))
+                                .unwrap_or(&state_value),
+                        ),
+                    ));
                 }
             }
             _ => {
@@ -2217,7 +2256,12 @@ fn native_event_type(value: &Value) -> Option<String> {
         .get("type")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
-        .or_else(|| value.get("name").and_then(Value::as_str).map(ToOwned::to_owned))
+        .or_else(|| {
+            value
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
 }
 
 fn native_event_payload(value: &Value) -> &Value {
@@ -2232,7 +2276,11 @@ fn native_event_part(value: &Value) -> Option<&Value> {
         .get("part")
         .or_else(|| value.get("info"))
         .or_else(|| value.get("message"))
-        .or_else(|| value.get("properties").and_then(|properties| properties.get("part")))
+        .or_else(|| {
+            value
+                .get("properties")
+                .and_then(|properties| properties.get("part"))
+        })
 }
 
 fn native_event_session_id(value: &Value) -> Option<&str> {
@@ -2240,8 +2288,18 @@ fn native_event_session_id(value: &Value) -> Option<&str> {
         .get("sessionID")
         .and_then(Value::as_str)
         .or_else(|| value.get("sessionId").and_then(Value::as_str))
-        .or_else(|| value.get("properties").and_then(|value| value.get("sessionID")).and_then(Value::as_str))
-        .or_else(|| value.get("data").and_then(|value| value.get("sessionID")).and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .get("properties")
+                .and_then(|value| value.get("sessionID"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            value
+                .get("data")
+                .and_then(|value| value.get("sessionID"))
+                .and_then(Value::as_str)
+        })
 }
 
 fn native_session_is_idle(value: &Value) -> bool {
@@ -2252,14 +2310,13 @@ fn native_session_is_idle(value: &Value) -> bool {
             .and_then(|status| status.get("type"))
             .and_then(Value::as_str),
         Some("idle")
-    ) || matches!(
-        value.get("status").and_then(Value::as_str),
-        Some("idle")
-    )
+    ) || matches!(value.get("status").and_then(Value::as_str), Some("idle"))
 }
 
 fn native_session_error_summary(value: &Value) -> Option<String> {
-    let error = value.get("error").or_else(|| value.get("properties")?.get("error"))?;
+    let error = value
+        .get("error")
+        .or_else(|| value.get("properties")?.get("error"))?;
     let message = error
         .get("data")
         .and_then(|data| data.get("message"))
@@ -2325,15 +2382,21 @@ fn native_action_candidate_from_tool_call(
     let state = state?;
     let input = state.get("input")?.as_object()?;
     match canonical_native_tool_name(tool_name) {
-        "graph_set_seeds" => native_db_node_ids_from_input(input).map(AgentActionCandidate::graph_set_seeds),
-        "properties_show_node" => native_db_node_id_from_input(input)
-            .map(AgentActionCandidate::properties_show_node),
-        "elements_hide" => native_semantic_ids_from_input(input)
-            .map(AgentActionCandidate::elements_hide),
-        "elements_show" => native_semantic_ids_from_input(input)
-            .map(AgentActionCandidate::elements_show),
-        "elements_select" => native_semantic_ids_from_input(input)
-            .map(AgentActionCandidate::elements_select),
+        "graph_set_seeds" => {
+            native_db_node_ids_from_input(input).map(AgentActionCandidate::graph_set_seeds)
+        }
+        "properties_show_node" => {
+            native_db_node_id_from_input(input).map(AgentActionCandidate::properties_show_node)
+        }
+        "elements_hide" => {
+            native_semantic_ids_from_input(input).map(AgentActionCandidate::elements_hide)
+        }
+        "elements_show" => {
+            native_semantic_ids_from_input(input).map(AgentActionCandidate::elements_show)
+        }
+        "elements_select" => {
+            native_semantic_ids_from_input(input).map(AgentActionCandidate::elements_select)
+        }
         "viewer_frame_visible" | "frame" => Some(AgentActionCandidate::viewer_frame_visible()),
         _ => None,
     }
@@ -2653,7 +2716,10 @@ fn turn_context_block(resource: &str, schema_id: &str, schema_slug: Option<&str>
 
     let mut lines = vec![format!("Bound IFC resource for this turn: {}.", resource)];
     if let Some(slug) = schema_slug {
-        lines.push(format!("Bound IFC schema for this turn: {} ({}).", schema_id, slug));
+        lines.push(format!(
+            "Bound IFC schema for this turn: {} ({}).",
+            schema_id, slug
+        ));
     } else {
         lines.push(format!("Bound IFC schema for this turn: {}.", schema_id));
     }
@@ -2671,7 +2737,10 @@ fn build_native_turn_prompt(request: &AgentBackendTurnRequest, agent: Option<&st
         request.schema_slug.as_deref(),
     );
     if let Some(agent) = agent.filter(|value| !value.trim().is_empty()) {
-        prompt.push(format!("Selected native OpenCode agent: `{}`.", agent.trim()));
+        prompt.push(format!(
+            "Selected native OpenCode agent: `{}`.",
+            agent.trim()
+        ));
     }
     prompt.push(String::new());
     prompt.push("User request:".to_owned());
@@ -2817,7 +2886,9 @@ enum OpencodeResponseParseError {
     ProviderError { message: String },
 }
 
-fn parse_opencode_response(stdout: &[u8]) -> Result<OpencodeTurnResponse, OpencodeResponseParseError> {
+fn parse_opencode_response(
+    stdout: &[u8],
+) -> Result<OpencodeTurnResponse, OpencodeResponseParseError> {
     let stdout_text = String::from_utf8_lossy(stdout);
     if let Ok(value) = serde_json::from_str::<Value>(&stdout_text) {
         if let Some(message) = opencode_error_event_message(&value) {
@@ -2840,19 +2911,20 @@ fn parse_opencode_response(stdout: &[u8]) -> Result<OpencodeTurnResponse, Openco
         match serde_json::from_str::<Value>(&normalized_json) {
             Ok(value) => {
                 return serde_json::from_value(normalize_response_shape(value))
-                    .map_err(OpencodeResponseParseError::InvalidJson)
+                    .map_err(OpencodeResponseParseError::InvalidJson);
             }
             Err(error) => last_error = Some(error),
         }
     }
 
-    Err(OpencodeResponseParseError::InvalidJson(last_error.unwrap_or_else(
-        || {
-        serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "opencode did not return any parseable assistant JSON payload",
-        ))
-    })))
+    Err(OpencodeResponseParseError::InvalidJson(
+        last_error.unwrap_or_else(|| {
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "opencode did not return any parseable assistant JSON payload",
+            ))
+        }),
+    ))
 }
 
 struct ExtractedAssistantPayload {
@@ -3061,7 +3133,13 @@ fn normalize_tool_call(tool_call: Value) -> Value {
         Some("request_tools") => {
             if let Some(Value::Array(tools)) = get_first_value(
                 &normalized,
-                &["tools", "toolNames", "tool_names", "requestedTools", "requested_tools"],
+                &[
+                    "tools",
+                    "toolNames",
+                    "tool_names",
+                    "requestedTools",
+                    "requested_tools",
+                ],
             ) {
                 let canonical_tools = tools
                     .iter()
@@ -3078,12 +3156,10 @@ fn normalize_tool_call(tool_call: Value) -> Value {
             }
         }
         Some("get_query_playbook") => {
-            if let Some(value) =
-                get_first_value(
-                    &normalized,
-                    &["goal", "task", "query", "query_goal", "queryGoal", "topic"],
-                )
-            {
+            if let Some(value) = get_first_value(
+                &normalized,
+                &["goal", "task", "query", "query_goal", "queryGoal", "topic"],
+            ) {
                 normalized.insert("goal".to_owned(), value.clone());
                 normalized.remove("task");
                 normalized.remove("query");
@@ -3630,14 +3706,15 @@ fn drain_progress_events(
     executable: &Path,
 ) -> Result<(), OpencodeExecutorError> {
     let events = {
-        let mut guard = progress_events.lock().map_err(|source| {
-            OpencodeExecutorError::WaitFailed {
-                executable: executable.to_path_buf(),
-                source: std::io::Error::other(format!(
-                    "opencode progress queue lock poisoned: {source}"
-                )),
-            }
-        })?;
+        let mut guard =
+            progress_events
+                .lock()
+                .map_err(|source| OpencodeExecutorError::WaitFailed {
+                    executable: executable.to_path_buf(),
+                    source: std::io::Error::other(format!(
+                        "opencode progress queue lock poisoned: {source}"
+                    )),
+                })?;
         if guard.is_empty() {
             return Ok(());
         }
@@ -3651,10 +3728,7 @@ fn drain_progress_events(
     Ok(())
 }
 
-fn opencode_stream_progress_events(
-    stream_name: &str,
-    line: &[u8],
-) -> Vec<AgentTranscriptEvent> {
+fn opencode_stream_progress_events(stream_name: &str, line: &[u8]) -> Vec<AgentTranscriptEvent> {
     let text = String::from_utf8_lossy(line);
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -3837,7 +3911,10 @@ fn opencode_tool_progress_events(event: &Value) -> Vec<AgentTranscriptEvent> {
 
     let mut events = Vec::new();
     events.extend(opencode_tool_progress_call_events(
-        &tool_name, title.as_deref(), &status, input.as_ref(),
+        &tool_name,
+        title.as_deref(),
+        &status,
+        input.as_ref(),
     ));
 
     if let Some(output) = output {
@@ -3892,7 +3969,9 @@ fn opencode_tool_progress_call_events(
         return Vec::new();
     }
 
-    vec![AgentTranscriptEvent::tool(format!("{tool_name} : {reason}"))]
+    vec![AgentTranscriptEvent::tool(format!(
+        "{tool_name} : {reason}"
+    ))]
 }
 
 fn opencode_cypher_progress_call_events(
@@ -3941,9 +4020,10 @@ fn summarize_tool_input(tool_name: &str, input: &Value) -> String {
     }
     match input {
         Value::Object(object) => {
-            if let Some(reason) =
-                get_first_string(object, &["why", "reason", "goal", "task", "prompt", "message", "text"])
-            {
+            if let Some(reason) = get_first_string(
+                object,
+                &["why", "reason", "goal", "task", "prompt", "message", "text"],
+            ) {
                 let trimmed = reason.trim();
                 if !trimmed.is_empty() {
                     return trimmed.to_owned();
@@ -3968,10 +4048,7 @@ fn summarize_tool_input(tool_name: &str, input: &Value) -> String {
                 );
             }
             if let Some(db_node_ids) = get_first_value(object, &["db_node_id", "db_node_ids"]) {
-                return format!(
-                    "db_node_ids: {}",
-                    format_progress_value(&db_node_ids, 120)
-                );
+                return format!("db_node_ids: {}", format_progress_value(&db_node_ids, 120));
             }
             if let Some(semantic_ids) = get_first_value(object, &["semantic_ids"]) {
                 return format!(
@@ -4076,7 +4153,10 @@ fn summarize_cypher_tool_output(output: Option<&Value>) -> String {
             if trimmed.is_empty() {
                 "Read-only Cypher returned no visible output.".to_owned()
             } else {
-                format!("Read-only Cypher returned {}.", shorten_for_progress(trimmed, 280))
+                format!(
+                    "Read-only Cypher returned {}.",
+                    shorten_for_progress(trimmed, 280)
+                )
             }
         }
         other => format!(
@@ -4132,7 +4212,10 @@ fn summarize_schema_context_output(value: &Value) -> String {
         details.push(format!("{cautions} caution{}", plural_suffix(cautions)));
     }
     if query_habits > 0 {
-        details.push(format!("{query_habits} query habit{}", plural_suffix(query_habits)));
+        details.push(format!(
+            "{query_habits} query habit{}",
+            plural_suffix(query_habits)
+        ));
     }
     if playbooks > 0 {
         details.push(format!("{playbooks} playbook{}", plural_suffix(playbooks)));
@@ -4171,10 +4254,7 @@ fn summarize_model_details_output(value: &Value) -> String {
 
 fn summarize_collection_output(label: &str, value: &Value) -> String {
     if let Some(count) = count_collection_items(value) {
-        return format!(
-            "{label} returned {count} item{}.",
-            plural_suffix(count)
-        );
+        return format!("{label} returned {count} item{}.", plural_suffix(count));
     }
     summarize_generic_tool_output(value)
 }
@@ -4187,7 +4267,12 @@ fn count_collection_items(value: &Value) -> Option<usize> {
             .and_then(Value::as_array)
             .map(Vec::len)
             .or_else(|| object.get("rows").and_then(Value::as_array).map(Vec::len))
-            .or_else(|| object.get("results").and_then(Value::as_array).map(Vec::len)),
+            .or_else(|| {
+                object
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+            }),
         _ => None,
     }
 }
@@ -4233,11 +4318,7 @@ fn summarize_generic_tool_output(value: &Value) -> String {
 }
 
 fn plural_suffix(count: usize) -> &'static str {
-    if count == 1 {
-        ""
-    } else {
-        "s"
-    }
+    if count == 1 { "" } else { "s" }
 }
 
 fn is_cypher_tool_name(tool_name: &str) -> bool {
@@ -4290,48 +4371,41 @@ fn parse_opencode_turn_response_text(text: &str) -> Option<OpencodeTurnResponse>
 
 fn opencode_progress_event_for_tool_call(tool_call: &OpencodeToolCall) -> AgentTranscriptEvent {
     match tool_call {
-        OpencodeToolCall::RunReadonlyCypher { cypher, why } => AgentTranscriptEvent::tool(
-            match why.as_deref().map(str::trim) {
-                Some(why) if !why.is_empty() => format!(
-                    "ifc_readonly_cypher : {why}\nCypher:\n{}",
-                    cypher.trim()
-                ),
+        OpencodeToolCall::RunReadonlyCypher { cypher, why } => {
+            AgentTranscriptEvent::tool(match why.as_deref().map(str::trim) {
+                Some(why) if !why.is_empty() => {
+                    format!("ifc_readonly_cypher : {why}\nCypher:\n{}", cypher.trim())
+                }
                 _ => format!(
                     "ifc_readonly_cypher : read-only Cypher\nCypher:\n{}",
                     cypher.trim()
                 ),
-            },
-        ),
-        OpencodeToolCall::GetSchemaContext => {
-            AgentTranscriptEvent::tool(
-                "ifc_schema_context : loading schema context for the current IFC model."
-                    .to_owned(),
-            )
+            })
         }
-        OpencodeToolCall::GetModelDetails => AgentTranscriptEvent::tool(
-            "ifc_model_details : loading model overview for the current IFC model."
-                .to_owned(),
+        OpencodeToolCall::GetSchemaContext => AgentTranscriptEvent::tool(
+            "ifc_schema_context : loading schema context for the current IFC model.".to_owned(),
         ),
-        OpencodeToolCall::GetEntityReference { entity_names } => AgentTranscriptEvent::tool(
-            format!(
+        OpencodeToolCall::GetModelDetails => AgentTranscriptEvent::tool(
+            "ifc_model_details : loading model overview for the current IFC model.".to_owned(),
+        ),
+        OpencodeToolCall::GetEntityReference { entity_names } => {
+            AgentTranscriptEvent::tool(format!(
                 "ifc_entity_reference : loading schema reference for {} entit{}.",
                 entity_names.len(),
                 if entity_names.len() == 1 { "y" } else { "ies" }
-            ),
-        ),
-        OpencodeToolCall::GetQueryPlaybook { goal, .. } => AgentTranscriptEvent::tool(
-            format!(
-                "ifc_query_playbook : loading query playbook for `{}`.",
-                goal.trim()
-            ),
-        ),
-        OpencodeToolCall::GetRelationReference { relation_names } => AgentTranscriptEvent::tool(
-            format!(
+            ))
+        }
+        OpencodeToolCall::GetQueryPlaybook { goal, .. } => AgentTranscriptEvent::tool(format!(
+            "ifc_query_playbook : loading query playbook for `{}`.",
+            goal.trim()
+        )),
+        OpencodeToolCall::GetRelationReference { relation_names } => {
+            AgentTranscriptEvent::tool(format!(
                 "ifc_relation_reference : loading relation reference for {} item{}.",
                 relation_names.len(),
                 if relation_names.len() == 1 { "" } else { "s" }
-            ),
-        ),
+            ))
+        }
         OpencodeToolCall::RequestTools { tools } => AgentTranscriptEvent::tool(format!(
             "request_tools : requesting {} tool{}: {}.",
             tools.len(),
@@ -4347,26 +4421,20 @@ fn opencode_progress_event_for_tool_call(tool_call: &OpencodeToolCall) -> AgentT
             db_node_ids.len(),
             if db_node_ids.len() == 1 { "" } else { "s" }
         )),
-        OpencodeToolCall::GetNodeProperties { db_node_id } => AgentTranscriptEvent::tool(
-            format!(
-                "get_node_properties : loading properties for graph node {}.",
-                db_node_id
-            ),
-        ),
-        OpencodeToolCall::GetNeighbors { db_node_ids, .. } => AgentTranscriptEvent::tool(
-            format!(
-                "get_neighbors : loading neighbor graph from {} seed node{}.",
-                db_node_ids.len(),
-                if db_node_ids.len() == 1 { "" } else { "s" }
-            ),
-        ),
-        OpencodeToolCall::EmitUiActions { actions } => AgentTranscriptEvent::assistant(
-            format!(
-                "preparing {} viewer action{}.",
-                actions.len(),
-                if actions.len() == 1 { "" } else { "s" }
-            ),
-        ),
+        OpencodeToolCall::GetNodeProperties { db_node_id } => AgentTranscriptEvent::tool(format!(
+            "get_node_properties : loading properties for graph node {}.",
+            db_node_id
+        )),
+        OpencodeToolCall::GetNeighbors { db_node_ids, .. } => AgentTranscriptEvent::tool(format!(
+            "get_neighbors : loading neighbor graph from {} seed node{}.",
+            db_node_ids.len(),
+            if db_node_ids.len() == 1 { "" } else { "s" }
+        )),
+        OpencodeToolCall::EmitUiActions { actions } => AgentTranscriptEvent::assistant(format!(
+            "preparing {} viewer action{}.",
+            actions.len(),
+            if actions.len() == 1 { "" } else { "s" }
+        )),
     }
 }
 
@@ -4456,13 +4524,11 @@ fn opencode_tool_call_signature(tool_call: &OpencodeToolCall) -> String {
                 normalize_graph_mode(mode.unwrap_or(AgentGraphMode::Semantic))
             )
         }
-        OpencodeToolCall::EmitUiActions { actions } => {
-            serde_json::to_string(&serde_json::json!({
-                "kind": "emit_ui_actions",
-                "actions": actions,
-            }))
-            .unwrap_or_else(|_| format!("{tool_call:?}"))
-        }
+        OpencodeToolCall::EmitUiActions { actions } => serde_json::to_string(&serde_json::json!({
+            "kind": "emit_ui_actions",
+            "actions": actions,
+        }))
+        .unwrap_or_else(|_| format!("{tool_call:?}")),
     }
 }
 
@@ -4515,10 +4581,9 @@ mod tests {
     use super::*;
     use crate::agent_executor::{
         AgentEntityReference, AgentExecutor, AgentGraphMode, AgentNeighborGraph,
-        AgentNodePropertiesResult, AgentNodeSummary, AgentProgressSink,
-        AgentQueryPlaybook, AgentReadonlyCypherResult, AgentReadonlyCypherRuntime,
-        AgentRelationReference, AgentSchemaContext, AgentTranscriptEventKind,
-        NullAgentProgressSink,
+        AgentNodePropertiesResult, AgentNodeSummary, AgentProgressSink, AgentQueryPlaybook,
+        AgentReadonlyCypherResult, AgentReadonlyCypherRuntime, AgentRelationReference,
+        AgentSchemaContext, AgentTranscriptEventKind, NullAgentProgressSink,
     };
     use std::collections::{BTreeMap, HashMap};
 
@@ -4649,10 +4714,7 @@ mod tests {
 
     #[test]
     fn config_ignores_none_variant_override() {
-        let values = HashMap::from([(
-            "CC_W_OPENCODE_VARIANT".to_owned(),
-            OsString::from("none"),
-        )]);
+        let values = HashMap::from([("CC_W_OPENCODE_VARIANT".to_owned(), OsString::from("none"))]);
 
         let config = OpencodeExecutorConfig::from_env_with(|key| values.get(key).cloned())
             .expect("config should parse");
@@ -4708,7 +4770,10 @@ mod tests {
                 "CC_W_OPENCODE_WORKDIR".to_owned(),
                 OsString::from("/tmp/opencode-workdir"),
             ),
-            ("CC_W_OPENCODE_AGENT".to_owned(), OsString::from("ifc-explorer")),
+            (
+                "CC_W_OPENCODE_AGENT".to_owned(),
+                OsString::from("ifc-explorer"),
+            ),
             ("CC_W_OPENCODE_VARIANT".to_owned(), OsString::from("medium")),
             (
                 "CC_W_OPENCODE_TIMEOUT_MS".to_owned(),
@@ -4862,9 +4927,7 @@ mod tests {
         assert!(
             progress.events.iter().any(|event| {
                 matches!(event.kind, AgentTranscriptEventKind::Tool)
-                    && event
-                        .text
-                        .contains("Read-only Cypher returned 1 row.")
+                    && event.text.contains("Read-only Cypher returned 1 row.")
             }),
             "expected the tool result to be forwarded to the progress sink"
         );
@@ -4915,11 +4978,7 @@ mod tests {
             serde_json::json!({"type":"step_finish","part":{"type":"step-finish"}}).to_string();
         let script = format!(
             "printf '%s\\n' '{}' ; printf '%s\\n' '{}' ; printf '%s\\n' '{}' ; printf '%s\\n' '{}' ; printf '%s\\n' '{}'",
-            step_start_line,
-            schema_line,
-            cypher_line,
-            assistant_line,
-            step_finish_line
+            step_start_line, schema_line, cypher_line, assistant_line, step_finish_line
         );
         let executor = OpencodeExecutor::new(OpencodeExecutorConfig {
             executable: PathBuf::from("/bin/sh"),
@@ -5388,13 +5447,20 @@ mod tests {
         .expect("tool result should serialize");
 
         let value: Value = serde_json::from_str(&payload).expect("payload should be json");
-        assert_eq!(value.get("firstDbNodeId").and_then(Value::as_i64), Some(215));
         assert_eq!(
-            value.get("dbNodeIds").and_then(Value::as_array).map(|items| items.len()),
+            value.get("firstDbNodeId").and_then(Value::as_i64),
+            Some(215)
+        );
+        assert_eq!(
+            value
+                .get("dbNodeIds")
+                .and_then(Value::as_array)
+                .map(|items| items.len()),
             Some(1)
         );
         assert_eq!(
-            value.get("rowObjects")
+            value
+                .get("rowObjects")
                 .and_then(Value::as_array)
                 .and_then(|rows| rows.first())
                 .and_then(|row| row.get("node_id"))

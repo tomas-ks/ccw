@@ -392,8 +392,8 @@ fn normalize_goal_key(value: &str) -> String {
 
 fn goal_tokens(value: &str) -> BTreeSet<String> {
     const STOPWORDS: &[&str] = &[
-        "a", "an", "and", "as", "at", "by", "for", "from", "in", "into", "is", "it", "of",
-        "on", "or", "the", "to", "with",
+        "a", "an", "and", "as", "at", "by", "for", "from", "in", "into", "is", "it", "of", "on",
+        "or", "the", "to", "with",
     ];
 
     value
