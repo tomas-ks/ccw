@@ -344,11 +344,28 @@
       }
 
       .graph-status {
-        min-height: 32px;
-        padding: 7px 12px;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-        font-size: 11px;
         color: rgba(243, 246, 255, 0.72);
+      }
+
+      .graph-floating-button {
+        position: absolute;
+        right: 10px;
+        bottom: 10px;
+        z-index: 5;
+        width: 26px;
+        height: 24px;
+        background: rgba(16, 22, 34, 0.86);
+        backdrop-filter: blur(6px);
+      }
+
+      .graph-floating-button:disabled {
+        opacity: 0.45;
+        cursor: default;
+        border-color: rgba(255, 255, 255, 0.08);
+      }
+
+      .graph-floating-button:focus:not(:focus-visible) {
+        outline: none;
       }
 
       .graph-status[data-tone="warn"] {
@@ -986,12 +1003,29 @@
             role="tabpanel"
             aria-label="Graph panel"
           >
-            <div class="graph-status" id="graph-status-line">
-              Graph explorer ready. Use <code>graph.reset(...)</code> to seed the panel from the terminal.
+            <div class="graph-status visually-hidden" id="graph-status-line" aria-live="polite">
+              Graph explorer ready. Use graph.reset(...) to seed the panel from the terminal.
             </div>
             <div class="graph-shell">
               <div class="graph-view" id="graph-view" aria-label="Graph view"></div>
               <div class="graph-fallback-list" id="graph-fallback-list" hidden></div>
+              <button
+                class="icon-button graph-floating-button"
+                id="graph-relayout-button"
+                type="button"
+                aria-label="Recalculate graph layout"
+                title="Relayout"
+                disabled
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M7 7h4v4" />
+                  <path d="M17 17h-4v-4" />
+                  <path d="M11 7a6 6 0 0 1 5.2 3" />
+                  <path d="M13 17a6 6 0 0 1-5.2-3" />
+                  <circle cx="6" cy="18" r="1.8" />
+                  <circle cx="18" cy="6" r="1.8" />
+                </svg>
+              </button>
             </div>
           </section>
         </div>
@@ -1100,6 +1134,7 @@
         "reset",
         "expandSelected",
         "expand",
+        "relayout",
         "clear",
         "focusSelected",
         "mode",
@@ -1532,14 +1567,20 @@
         const toolPicker = document.getElementById("tool-picker");
         const toolButtons = Array.from(document.querySelectorAll("[data-tool-button]"));
         const graphToggleButton = document.getElementById("graph-toggle-button");
+        const activeTool = () => (toolPicker?.value === "pick" ? "pick" : "orbit");
 
         const syncToolButtons = () => {
-          const activeTool = toolPicker?.value || "orbit";
+          const nextTool = activeTool();
           for (const button of toolButtons) {
-            const active = button.dataset.toolButton === activeTool;
+            const active = button.dataset.toolButton === nextTool;
             button.classList.toggle("active", active);
             button.setAttribute("aria-pressed", String(active));
           }
+          window.dispatchEvent(
+            new CustomEvent("w-viewer-tool-change", {
+              detail: { tool: nextTool },
+            })
+          );
         };
 
         for (const button of toolButtons) {
@@ -1571,6 +1612,7 @@
         });
 
         return {
+          activeTool,
           setGraphVisible,
           showGraph: () => setGraphVisible(true),
           hideGraph: () => setGraphVisible(false),
@@ -2342,6 +2384,7 @@
           graphStatusLine: document.getElementById("graph-status-line"),
           graphClearButton: document.getElementById("graph-clear-button"),
           graphFocusButton: document.getElementById("graph-focus-button"),
+          graphRelayoutButton: document.getElementById("graph-relayout-button"),
           graphModeButtons: Array.from(document.querySelectorAll("[data-graph-mode]")),
           viewport: document.querySelector(".viewport"),
           viewerCanvas: document.getElementById("viewer-canvas"),
@@ -2359,10 +2402,13 @@
           propertiesRelationsSection: document.getElementById("properties-relations-section"),
           propertiesRelationsList: document.getElementById("properties-relations-list"),
           resourcePicker: document.getElementById("resource-picker"),
+          toolPicker: document.getElementById("tool-picker"),
         };
 
         const state = {
           activeTab: "graph",
+          interactionTool: dom.toolPicker?.value === "pick" ? "pick" : "orbit",
+          selectionOrigin: "none",
           mode: "semantic",
           nodes: [],
           edges: [],
@@ -2597,6 +2643,21 @@
         const currentSelectedNode = () =>
           state.selectedNodeId ? state.nodesById.get(state.selectedNodeId) || null : null;
 
+        const activeInteractionTool = () =>
+          state.interactionTool === "pick" ? "pick" : "orbit";
+
+        const graphSelectionShouldShowBalloon = () => activeInteractionTool() === "pick";
+
+        const syncInteractionTool = (tool) => {
+          state.interactionTool = tool === "pick" ? "pick" : "orbit";
+          if (state.interactionTool !== "pick") {
+            state.activePickHasHit = false;
+            hidePickAnchorMarker();
+            hidePropertiesBalloon();
+          }
+          return state.interactionTool;
+        };
+
         const selectedRenderableId = () => {
           const node = currentSelectedNode();
           return node ? graphNodeSemanticId(node) : state.pickedSemanticId;
@@ -2829,6 +2890,9 @@
           if (dom.graphFocusButton) {
             dom.graphFocusButton.disabled = !hasSelectedNode;
           }
+          if (dom.graphRelayoutButton) {
+            dom.graphRelayoutButton.disabled = state.nodes.length < 2;
+          }
         };
 
         const renderProperties = () => {
@@ -2907,6 +2971,7 @@
           const hit = hits[0] || null;
           const requestId = state.pickDetailsRequestId + 1;
           state.pickDetailsRequestId = requestId;
+          state.selectionOrigin = "pick";
           state.activePickHasHit = Boolean(hit);
           state.selectedNodeId = null;
           state.pickedSemanticId = hit?.elementId ? String(hit.elementId) : null;
@@ -2958,7 +3023,11 @@
             row.append(title, detail);
             row.addEventListener("click", () => {
               const nodeId = graphNodeKey(node);
-              api.setSelectedNode(nodeId, { syncViewer: true });
+              api.setSelectedNode(nodeId, {
+                syncViewer: true,
+                origin: "graph",
+                revealProperties: graphSelectionShouldShowBalloon(),
+              });
               void api.expand(nodeId, { merge: true, silentIfExpanded: true });
             });
             dom.graphFallbackList.append(row);
@@ -3519,6 +3588,113 @@
           }
         };
 
+        const refreshGraphRenderer = () => {
+          if (!state.sigma) {
+            return;
+          }
+          if (typeof state.sigma.refresh === "function") {
+            state.sigma.refresh();
+          } else if (typeof state.sigma.scheduleRefresh === "function") {
+            state.sigma.scheduleRefresh();
+          } else if (typeof state.sigma.scheduleRender === "function") {
+            state.sigma.scheduleRender();
+          }
+        };
+
+        const focusGraphLayoutCenter = (layout, options = {}) => {
+          if (!state.sigma || typeof state.sigma.getCamera !== "function" || !layout.size) {
+            return;
+          }
+          const camera = state.sigma.getCamera();
+          if (!camera || typeof camera.setState !== "function") {
+            return;
+          }
+          let minX = Number.POSITIVE_INFINITY;
+          let minY = Number.POSITIVE_INFINITY;
+          let maxX = Number.NEGATIVE_INFINITY;
+          let maxY = Number.NEGATIVE_INFINITY;
+          for (const position of layout.values()) {
+            minX = Math.min(minX, position.x);
+            minY = Math.min(minY, position.y);
+            maxX = Math.max(maxX, position.x);
+            maxY = Math.max(maxY, position.y);
+          }
+          let center = {
+            x: (minX + maxX) / 2,
+            y: (minY + maxY) / 2,
+          };
+          const layoutSpan = Math.max(maxX - minX, maxY - minY);
+          if (typeof state.sigma.normalizationFunction === "function") {
+            center = state.sigma.normalizationFunction(center);
+          }
+          const currentState =
+            typeof camera.getState === "function" ? camera.getState() : {};
+          camera.setState({
+            ...currentState,
+            x: center.x,
+            y: center.y,
+            ratio: options.ratio ?? clamp(layoutSpan / 5.5, 1.7, 4),
+          });
+        };
+
+        const relayoutGraph = (options = {}) => {
+          if (!state.nodes.length) {
+            setStatus("Seed the graph before recalculating its layout.", "warn");
+            return api.snapshot();
+          }
+          if (
+            !state.graphModel ||
+            typeof state.graphModel.hasNode !== "function" ||
+            typeof state.graphModel.setNodeAttribute !== "function"
+          ) {
+            setStatus("Graph renderer is not ready for relayout yet.", "warn");
+            return api.snapshot();
+          }
+
+          const layout = computeGraphLayout(state.nodes, state.edges);
+          placeRelationshipDots(state.nodes, layout);
+          for (const [index, node] of state.nodes.entries()) {
+            const key = graphNodeKey(node, index);
+            const position = layout.get(key);
+            if (!position || !state.graphModel.hasNode(key)) {
+              continue;
+            }
+            state.graphModel.setNodeAttribute(key, "x", position.x);
+            state.graphModel.setNodeAttribute(key, "y", position.y);
+          }
+
+          if (typeof state.graphModel.setEdgeAttribute === "function") {
+            for (const [index, edge] of state.edges.entries()) {
+              const key = graphEdgeKey(edge, index);
+              if (
+                state.graphModel.hasEdge &&
+                !state.graphModel.hasEdge(key)
+              ) {
+                continue;
+              }
+              state.graphModel.setEdgeAttribute(
+                key,
+                "curvature",
+                graphEdgeCurvatureForPositions(edge, index, layout)
+              );
+            }
+          }
+
+          state.layoutPositions = new Map(layout);
+          refreshGraphRenderer();
+
+          const shouldFocusSelected = options.focusSelected !== false && state.selectedNodeId;
+          if (shouldFocusSelected) {
+            focusSelectedNode({ instant: true, ratio: options.ratio ?? 0.72 });
+          } else if (options.recenter !== false) {
+            focusGraphLayoutCenter(layout, { ratio: options.ratio });
+          }
+          setStatus(
+            `Graph layout recalculated for ${state.nodes.length} node${state.nodes.length === 1 ? "" : "s"} and ${state.edges.length} edge${state.edges.length === 1 ? "" : "s"}.`
+          );
+          return api.snapshot();
+        };
+
         const patchSigmaGraph = () => {
           if (
             !state.graphModel ||
@@ -3765,11 +3941,15 @@
             if (typeof state.sigma.on === "function") {
               state.sigma.on("clickNode", ({ node }) => {
                 const nodeId = String(node);
-                api.setSelectedNode(nodeId, { syncViewer: true });
+                api.setSelectedNode(nodeId, {
+                  syncViewer: true,
+                  origin: "graph",
+                  revealProperties: graphSelectionShouldShowBalloon(),
+                });
                 void api.expand(nodeId, { merge: true, silentIfExpanded: true });
               });
               state.sigma.on("clickStage", () => {
-                api.setSelectedNode(null);
+                api.setSelectedNode(null, { syncViewer: true });
               });
             }
           } catch (error) {
@@ -3901,9 +4081,13 @@
         const performSelectedViewerAction = (action) => {
           const semanticId = selectedRenderableId();
           if (!semanticId) {
+            if (action === "select") {
+              viewer.clearSelection();
+            }
             return null;
           }
           if (action === "select") {
+            viewer.clearSelection();
             viewer.select([semanticId]);
           } else if (action === "hide") {
             viewer.hide([semanticId]);
@@ -3936,12 +4120,22 @@
             const nextId =
               nodeId === null || nodeId === undefined ? null : String(nodeId);
             state.selectedNodeId = nextId && state.nodesById.has(nextId) ? nextId : null;
+            state.selectionOrigin = state.selectedNodeId ? options.origin || "graph" : "none";
+            state.activePickHasHit = false;
             state.pickedSemanticId = null;
+            state.pickedDbNodeId = null;
+            setPickedGraphButtonVisible(false);
+            hidePickAnchorMarker();
             renderFallbackList();
             applySelectionToSigma(state.selectedNodeId);
             renderProperties();
             syncActionButtons();
-            if (options.revealProperties) {
+            const shouldRevealProperties =
+              options.revealProperties === true ||
+              (options.revealProperties !== false &&
+                state.selectionOrigin === "graph" &&
+                graphSelectionShouldShowBalloon());
+            if (shouldRevealProperties) {
               if (state.selectedNodeId) {
                 if (Number.isFinite(options.clientX) && Number.isFinite(options.clientY)) {
                   showPropertiesBalloonAtClientPoint(options.clientX, options.clientY);
@@ -3951,6 +4145,8 @@
               } else {
                 hidePropertiesBalloon();
               }
+            } else if (state.selectionOrigin === "graph" || !state.selectedNodeId) {
+              hidePropertiesBalloon();
             }
             if (options.syncViewer) {
               performSelectedViewerAction("select");
@@ -4197,6 +4393,10 @@
             setActiveTab("graph");
             return focusSelectedNode();
           },
+          relayout(options = {}) {
+            setActiveTab("graph");
+            return relayoutGraph(options);
+          },
           async snapshot() {
             return {
               resource: safeViewerCurrentResource(viewer),
@@ -4231,6 +4431,11 @@
           void api.focusSelected();
         });
 
+        dom.graphRelayoutButton?.addEventListener("click", () => {
+          api.relayout();
+          dom.graphRelayoutButton.blur();
+        });
+
         dom.propertiesGraphButton?.addEventListener("click", () => {
           const nodeId = state.pickedDbNodeId || state.selectedNodeId;
           if (!nodeId) {
@@ -4244,7 +4449,18 @@
 
         dom.propertiesCloseButton?.addEventListener("click", hidePropertiesBalloon);
 
+        window.addEventListener("w-viewer-tool-change", (event) => {
+          syncInteractionTool(event.detail?.tool);
+        });
+        dom.toolPicker?.addEventListener("change", () => {
+          syncInteractionTool(dom.toolPicker.value);
+        });
+        syncInteractionTool(dom.toolPicker?.value);
+
         window.addEventListener("w-viewer-pick", (event) => {
+          if (activeInteractionTool() !== "pick") {
+            return;
+          }
           renderPickProperties(event.detail || {});
           const anchor = pickRegionClientCenter(event.detail || {});
           if (anchor) {
@@ -4256,6 +4472,10 @@
 
         window.addEventListener("w-viewer-anchor", (event) => {
           const detail = event.detail || {};
+          if (activeInteractionTool() !== "pick") {
+            hidePickAnchorMarker();
+            return;
+          }
           if (!detail.visible) {
             hidePickAnchorMarker();
             if (state.activePickHasHit) {
