@@ -27,7 +27,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use cc_w_backend::{GeometryBackend, available_demo_resources};
+use cc_w_backend::GeometryBackend;
 use cc_w_platform_web::{
     WebGeometryCatalogRequest, WebGeometryCatalogResponse, WebGeometryDefinitionBatch,
     WebGeometryDefinitionBatchRequest, WebGeometryInstanceBatch, WebGeometryInstanceBatchRequest,
@@ -1183,6 +1183,11 @@ struct GraphSubgraphEdge {
     source_db_node_id: i64,
     target_db_node_id: i64,
     relationship_type: String,
+    relation_node_db_node_id: Option<i64>,
+    source_role: Option<String>,
+    source_role_direction: Option<String>,
+    target_role: Option<String>,
+    target_role_direction: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1283,6 +1288,11 @@ struct GraphEdgeQueryRecord {
     source_db_node_id: i64,
     target_db_node_id: i64,
     relationship_type: String,
+    relation_node_db_node_id: Option<i64>,
+    source_role: Option<String>,
+    source_role_direction: Option<String>,
+    target_role: Option<String>,
+    target_role_direction: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2497,13 +2507,7 @@ fn load_prepared_package_with_metrics(
 }
 
 fn available_server_resources(ifc_artifacts_root: &Path) -> Vec<String> {
-    let mut resources = available_demo_resources()
-        .into_iter()
-        .map(|resource| resource.to_string())
-        .collect::<Vec<_>>();
-    if let Ok(mut ifc_resources) = available_ifc_body_resources(ifc_artifacts_root) {
-        resources.append(&mut ifc_resources);
-    }
+    let mut resources = available_ifc_body_resources(ifc_artifacts_root).unwrap_or_default();
     resources.sort();
     resources
 }
@@ -4726,8 +4730,12 @@ fn build_graph_subgraph_response(
             .collect::<Vec<_>>();
         let frontier_set = frontier_ids.iter().copied().collect::<HashSet<_>>();
         let remaining_edge_capacity = limits.max_edges.saturating_sub(edges_by_id.len());
-        let (candidate_edges, edge_query_truncated) =
-            fetch_incident_graph_edges(model, &frontier_ids, remaining_edge_capacity)?;
+        let (candidate_edges, edge_query_truncated) = if limits.mode == GraphSubgraphMode::Semantic
+        {
+            fetch_semantic_graph_edges(model, &frontier_ids, remaining_edge_capacity)?
+        } else {
+            fetch_incident_graph_edges(model, &frontier_ids, remaining_edge_capacity)?
+        };
         truncated |= edge_query_truncated;
         let mut neighbor_ids = HashSet::new();
 
@@ -4783,11 +4791,20 @@ fn build_graph_subgraph_response(
             {
                 continue;
             }
-            let edge_id = graph_edge_id(
-                edge.source_db_node_id,
-                &edge.relationship_type,
-                edge.target_db_node_id,
-            );
+            let edge_id = if let Some(relation_node_db_node_id) = edge.relation_node_db_node_id {
+                graph_semantic_edge_id(
+                    edge.source_db_node_id,
+                    &edge.relationship_type,
+                    relation_node_db_node_id,
+                    edge.target_db_node_id,
+                )
+            } else {
+                graph_edge_id(
+                    edge.source_db_node_id,
+                    &edge.relationship_type,
+                    edge.target_db_node_id,
+                )
+            };
             edges_by_id
                 .entry(edge_id.clone())
                 .or_insert(GraphSubgraphEdge {
@@ -4795,6 +4812,11 @@ fn build_graph_subgraph_response(
                     source_db_node_id: edge.source_db_node_id,
                     target_db_node_id: edge.target_db_node_id,
                     relationship_type: edge.relationship_type,
+                    relation_node_db_node_id: edge.relation_node_db_node_id,
+                    source_role: edge.source_role,
+                    source_role_direction: edge.source_role_direction,
+                    target_role: edge.target_role,
+                    target_role_direction: edge.target_role_direction,
                 });
         }
 
@@ -4950,6 +4972,46 @@ fn fetch_incident_graph_edges(
     Ok((edges, truncated))
 }
 
+fn fetch_semantic_graph_edges(
+    model: &VelrIfcModel,
+    db_node_ids: &[i64],
+    max_edges: usize,
+) -> Result<(Vec<GraphEdgeQueryRecord>, bool), String> {
+    if db_node_ids.is_empty() || max_edges == 0 {
+        return Ok((Vec::new(), false));
+    }
+    let ids = cypher_id_list(db_node_ids);
+    let query = format!(
+        "MATCH (rel_node)-->(seed) MATCH (rel_node)-->(neighbor) WHERE id(seed) IN [{ids}] AND rel_node.declared_entity STARTS WITH 'IfcRel' AND id(neighbor) <> id(seed) RETURN id(seed) AS source_db_node_id, id(neighbor) AS target_db_node_id, id(rel_node) AS relation_node_db_node_id, rel_node.declared_entity AS relationship_type, '' AS source_role, 'from_relation' AS source_role_direction, '' AS target_role, 'from_relation' AS target_role_direction ORDER BY id(seed), id(neighbor), rel_node.declared_entity LIMIT {}",
+        max_edges + 1
+    );
+    let result = model
+        .execute_cypher_rows(&query)
+        .map_err(|error| format!("failed to load semantic graph edges: {error}"))?;
+    let mut edges = parse_graph_edge_query_result(&result)?;
+    if edges.is_empty() {
+        return fetch_incident_graph_edges(model, db_node_ids, max_edges);
+    }
+    let mut target_ids = edges
+        .iter()
+        .map(|edge| edge.target_db_node_id)
+        .collect::<Vec<_>>();
+    target_ids.sort_unstable();
+    target_ids.dedup();
+    let has_semantic_target = fetch_graph_nodes_by_ids(model, &target_ids)?
+        .into_iter()
+        .map(|record| graph_node_from_record(record, 1, false))
+        .any(|node| graph_node_is_semantic_neighbor(&node));
+    if !has_semantic_target {
+        return fetch_incident_graph_edges(model, db_node_ids, max_edges);
+    }
+    let truncated = edges.len() > max_edges;
+    if truncated {
+        edges.truncate(max_edges);
+    }
+    Ok((edges, truncated))
+}
+
 fn parse_graph_edge_query_result(
     result: &cc_w_velr::CypherQueryResult,
 ) -> Result<Vec<GraphEdgeQueryRecord>, String> {
@@ -4959,6 +5021,16 @@ fn parse_graph_edge_query_result(
         required_column_index(&result.columns, &["targetdbnodeid"], "target_db_node_id")?;
     let relationship_type_index =
         required_column_index(&result.columns, &["relationshiptype"], "relationship_type")?;
+    let relation_node_index = find_column_index(
+        &result.columns,
+        &["relationnodedbnodeid", "relationnodeid"],
+    );
+    let source_role_index = find_column_index(&result.columns, &["sourcerole"]);
+    let source_role_direction_index =
+        find_column_index(&result.columns, &["sourceroledirection"]);
+    let target_role_index = find_column_index(&result.columns, &["targetrole"]);
+    let target_role_direction_index =
+        find_column_index(&result.columns, &["targetroledirection"]);
 
     let mut edges = Vec::with_capacity(result.rows.len());
     for row in &result.rows {
@@ -4970,6 +5042,14 @@ fn parse_graph_edge_query_result(
                 "relationship_type",
             )?
             .to_owned(),
+            relation_node_db_node_id: relation_node_index
+                .and_then(|index| parse_optional_i64_cell(row.get(index))),
+            source_role: source_role_index.and_then(|index| parse_optional_string_cell(row.get(index))),
+            source_role_direction: source_role_direction_index
+                .and_then(|index| parse_optional_string_cell(row.get(index))),
+            target_role: target_role_index.and_then(|index| parse_optional_string_cell(row.get(index))),
+            target_role_direction: target_role_direction_index
+                .and_then(|index| parse_optional_string_cell(row.get(index))),
         });
     }
 
@@ -5239,10 +5319,40 @@ fn cypher_node_property_value_to_string(value: &serde_json::Value) -> String {
 fn graph_mode_keeps_node(node: &GraphSubgraphNode, mode: GraphSubgraphMode) -> bool {
     match mode {
         GraphSubgraphMode::Raw => true,
-        GraphSubgraphMode::Semantic => {
-            node.is_seed || node.global_id.is_some() || node.declared_entity.starts_with("IfcRel")
-        }
+        GraphSubgraphMode::Semantic => node.is_seed || graph_node_is_semantic_neighbor(node),
     }
+}
+
+fn graph_node_is_semantic_neighbor(node: &GraphSubgraphNode) -> bool {
+    if node.global_id.is_some() {
+        return true;
+    }
+    matches!(
+        node.declared_entity.as_str(),
+        "IfcProject"
+            | "IfcSite"
+            | "IfcBuilding"
+            | "IfcBuildingStorey"
+            | "IfcFacility"
+            | "IfcFacilityPart"
+            | "IfcBridge"
+            | "IfcBridgePart"
+            | "IfcRoad"
+            | "IfcRailway"
+            | "IfcMarineFacility"
+            | "IfcRoof"
+            | "IfcZone"
+            | "IfcSpatialZone"
+            | "IfcMaterial"
+            | "IfcMaterialLayer"
+            | "IfcMaterialLayerSet"
+            | "IfcMaterialConstituent"
+            | "IfcMaterialConstituentSet"
+            | "IfcPropertySet"
+            | "IfcElementQuantity"
+            | "IfcTypeObject"
+            | "IfcTypeProduct"
+    )
 }
 
 fn dedup_sorted_ids(ids: &[i64]) -> Vec<i64> {
@@ -5260,6 +5370,17 @@ fn graph_edge_id(
     format!("{source_db_node_id}:{relationship_type}:{target_db_node_id}")
 }
 
+fn graph_semantic_edge_id(
+    source_db_node_id: i64,
+    relationship_type: &str,
+    relation_node_db_node_id: i64,
+    target_db_node_id: i64,
+) -> String {
+    format!(
+        "{source_db_node_id}:{relationship_type}:{relation_node_db_node_id}:{target_db_node_id}"
+    )
+}
+
 fn required_column_index(
     columns: &[String],
     candidates: &[&str],
@@ -5275,6 +5396,10 @@ fn parse_required_i64_cell(cell: Option<&String>, label: &str) -> Result<i64, St
         .trim()
         .parse::<i64>()
         .map_err(|error| format!("invalid integer in `{label}`: {error}"))
+}
+
+fn parse_optional_i64_cell(cell: Option<&String>) -> Option<i64> {
+    cell.and_then(|value| value.trim().parse::<i64>().ok())
 }
 
 fn parse_required_string_cell<'a>(
@@ -6126,7 +6251,7 @@ mod tests {
             &internal,
             GraphSubgraphMode::Semantic
         ));
-        assert!(graph_mode_keeps_node(&rel, GraphSubgraphMode::Semantic));
+        assert!(!graph_mode_keeps_node(&rel, GraphSubgraphMode::Semantic));
         assert!(graph_mode_keeps_node(&product, GraphSubgraphMode::Semantic));
     }
 

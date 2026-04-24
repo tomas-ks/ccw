@@ -4,8 +4,8 @@ use cc_w_types::{
     PreparedMaterial, PreparedMesh, PreparedRenderDefinition, PreparedRenderInstance,
     PreparedRenderScene, SemanticElementId, WORLD_FORWARD, WORLD_RIGHT, WORLD_UP,
 };
-use glam::{DMat4, DVec3, Mat4, Vec3};
-use std::collections::HashSet;
+use glam::{DMat4, DVec3, DVec4, Mat4, Vec3};
+use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
 use wgpu::util::DeviceExt;
@@ -274,6 +274,295 @@ pub fn fit_camera_to_bounds(bounds: Bounds3) -> Camera {
 
 pub fn fit_camera_to_render_scene(scene: &PreparedRenderScene) -> Camera {
     fit_camera_to_bounds(scene.bounds)
+}
+
+pub fn pick_prepared_scene_cpu(
+    scene: &PreparedRenderScene,
+    camera: Camera,
+    viewport: ViewportSize,
+    region: PickRegion,
+) -> PickResult {
+    let Some(region) = clamp_pick_region(region, viewport) else {
+        return PickResult::empty(region);
+    };
+    let viewport = viewport.clamped();
+    let definitions = scene
+        .definitions
+        .iter()
+        .map(|definition| (definition.id, definition))
+        .collect::<HashMap<_, _>>();
+    let clip_from_world = camera.clip_from_world(viewport);
+
+    if region.width == 1 && region.height == 1 {
+        return pick_prepared_scene_point_cpu(
+            scene,
+            &definitions,
+            camera,
+            viewport,
+            region,
+            clip_from_world,
+        );
+    }
+
+    pick_prepared_scene_rect_cpu(
+        scene,
+        &definitions,
+        camera,
+        viewport,
+        region,
+        clip_from_world,
+    )
+}
+
+fn pick_prepared_scene_point_cpu(
+    scene: &PreparedRenderScene,
+    definitions: &HashMap<GeometryDefinitionId, &PreparedRenderDefinition>,
+    camera: Camera,
+    viewport: ViewportSize,
+    region: PickRegion,
+    clip_from_world: DMat4,
+) -> PickResult {
+    let Some(ray) = pick_ray_for_pixel(camera, viewport, region.x, region.y) else {
+        return PickResult::empty(region);
+    };
+    let mut best_hit = None::<(f64, PickHit)>;
+
+    for instance in &scene.instances {
+        let Some(definition) = definitions.get(&instance.definition_id) else {
+            continue;
+        };
+        let model_from_object =
+            instance.model_from_object * DMat4::from_translation(definition.mesh.local_origin);
+        let centroid = instance.world_bounds.center();
+
+        for triangle in definition.mesh.indices.chunks_exact(3) {
+            let Some([a, b, c]) =
+                triangle_world_points(&definition.mesh, model_from_object, triangle)
+            else {
+                continue;
+            };
+            if !triangle_may_project_to_region(clip_from_world, viewport, region, [a, b, c]) {
+                continue;
+            }
+            let Some(distance) = intersect_ray_triangle(ray.origin, ray.direction, a, b, c) else {
+                continue;
+            };
+            if best_hit
+                .as_ref()
+                .is_some_and(|(best_distance, _)| distance >= *best_distance)
+            {
+                continue;
+            }
+            best_hit = Some((
+                distance,
+                PickHit {
+                    instance_id: instance.id,
+                    element_id: instance.element_id.clone(),
+                    definition_id: instance.definition_id,
+                    world_centroid: centroid,
+                    world_anchor: ray.origin + ray.direction * distance,
+                },
+            ));
+        }
+    }
+
+    PickResult {
+        region,
+        hits: best_hit.map(|(_, hit)| vec![hit]).unwrap_or_default(),
+    }
+}
+
+fn pick_prepared_scene_rect_cpu(
+    scene: &PreparedRenderScene,
+    definitions: &HashMap<GeometryDefinitionId, &PreparedRenderDefinition>,
+    camera: Camera,
+    viewport: ViewportSize,
+    region: PickRegion,
+    clip_from_world: DMat4,
+) -> PickResult {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+
+    for instance in &scene.instances {
+        let Some(definition) = definitions.get(&instance.definition_id) else {
+            continue;
+        };
+        let model_from_object =
+            instance.model_from_object * DMat4::from_translation(definition.mesh.local_origin);
+
+        let mut intersects_region = false;
+        for triangle in definition.mesh.indices.chunks_exact(3) {
+            let Some(points) = triangle_world_points(&definition.mesh, model_from_object, triangle)
+            else {
+                continue;
+            };
+            if triangle_may_project_to_region(clip_from_world, viewport, region, points) {
+                intersects_region = true;
+                break;
+            }
+        }
+
+        if !intersects_region || !seen.insert(instance.id) {
+            continue;
+        }
+
+        let centroid = instance.world_bounds.center();
+        candidates.push((
+            centroid.distance(camera.eye),
+            PickHit {
+                instance_id: instance.id,
+                element_id: instance.element_id.clone(),
+                definition_id: instance.definition_id,
+                world_centroid: centroid,
+                world_anchor: centroid,
+            },
+        ));
+    }
+
+    candidates.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.1.instance_id.0.cmp(&right.1.instance_id.0))
+    });
+
+    PickResult {
+        region,
+        hits: candidates.into_iter().map(|(_, hit)| hit).collect(),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PickRay {
+    origin: DVec3,
+    direction: DVec3,
+}
+
+fn pick_ray_for_pixel(
+    camera: Camera,
+    viewport: ViewportSize,
+    pixel_x: u32,
+    pixel_y: u32,
+) -> Option<PickRay> {
+    let viewport = viewport.clamped();
+    let ndc_x = ((f64::from(pixel_x) + 0.5) / f64::from(viewport.width)) * 2.0 - 1.0;
+    let ndc_y = 1.0 - (((f64::from(pixel_y) + 0.5) / f64::from(viewport.height)) * 2.0);
+    let world_from_clip = camera.clip_from_world(viewport).inverse();
+    let near = unproject_clip_point(world_from_clip, DVec4::new(ndc_x, ndc_y, 0.0, 1.0))?;
+    let far = unproject_clip_point(world_from_clip, DVec4::new(ndc_x, ndc_y, 1.0, 1.0))?;
+    let direction = (far - near).try_normalize()?;
+    Some(PickRay {
+        origin: near,
+        direction,
+    })
+}
+
+fn unproject_clip_point(world_from_clip: DMat4, clip: DVec4) -> Option<DVec3> {
+    let world = world_from_clip * clip;
+    if world.w.abs() <= f64::EPSILON {
+        return None;
+    }
+    Some(world.truncate() / world.w)
+}
+
+fn triangle_world_points(
+    mesh: &PreparedMesh,
+    model_from_object: DMat4,
+    triangle: &[u32],
+) -> Option<[DVec3; 3]> {
+    let a = mesh.vertices.get(*triangle.first()? as usize)?;
+    let b = mesh.vertices.get(*triangle.get(1)? as usize)?;
+    let c = mesh.vertices.get(*triangle.get(2)? as usize)?;
+    Some([
+        model_from_object.transform_point3(DVec3::from_array(a.position.map(f64::from))),
+        model_from_object.transform_point3(DVec3::from_array(b.position.map(f64::from))),
+        model_from_object.transform_point3(DVec3::from_array(c.position.map(f64::from))),
+    ])
+}
+
+fn triangle_may_project_to_region(
+    clip_from_world: DMat4,
+    viewport: ViewportSize,
+    region: PickRegion,
+    points: [DVec3; 3],
+) -> bool {
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut has_projected_point = false;
+
+    for point in points {
+        let Some((x, y, _depth)) = project_world_point(clip_from_world, viewport, point) else {
+            continue;
+        };
+        has_projected_point = true;
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+
+    if !has_projected_point {
+        return false;
+    }
+
+    let region_min_x = f64::from(region.x);
+    let region_min_y = f64::from(region.y);
+    let region_max_x = f64::from(region.x + region.width);
+    let region_max_y = f64::from(region.y + region.height);
+
+    max_x >= region_min_x && min_x <= region_max_x && max_y >= region_min_y && min_y <= region_max_y
+}
+
+fn project_world_point(
+    clip_from_world: DMat4,
+    viewport: ViewportSize,
+    point: DVec3,
+) -> Option<(f64, f64, f64)> {
+    let viewport = viewport.clamped();
+    let clip = clip_from_world * DVec4::new(point.x, point.y, point.z, 1.0);
+    if clip.w <= f64::EPSILON {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    if ndc.z < 0.0 || ndc.z > 1.0 {
+        return None;
+    }
+    Some((
+        ((ndc.x + 1.0) * 0.5) * f64::from(viewport.width),
+        (1.0 - ((ndc.y + 1.0) * 0.5)) * f64::from(viewport.height),
+        ndc.z,
+    ))
+}
+
+fn intersect_ray_triangle(
+    origin: DVec3,
+    direction: DVec3,
+    a: DVec3,
+    b: DVec3,
+    c: DVec3,
+) -> Option<f64> {
+    const EPSILON: f64 = 1.0e-9;
+    let edge_ab = b - a;
+    let edge_ac = c - a;
+    let h = direction.cross(edge_ac);
+    let determinant = edge_ab.dot(h);
+    if determinant.abs() < EPSILON {
+        return None;
+    }
+    let inverse_determinant = 1.0 / determinant;
+    let s = origin - a;
+    let u = inverse_determinant * s.dot(h);
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = s.cross(edge_ab);
+    let v = inverse_determinant * direction.dot(q);
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let distance = inverse_determinant * edge_ac.dot(q);
+    (distance > EPSILON).then_some(distance)
 }
 
 fn fit_camera_to_min_max(min: DVec3, max: DVec3) -> Camera {
@@ -766,10 +1055,13 @@ impl MeshRenderer {
             let model_from_object =
                 instance.model_from_object * DMat4::from_translation(local_origin);
             let pick_index = self.pick_targets.len() as u32 + 1;
+            let world_centroid = instance.world_bounds.center();
             self.pick_targets.push(PickHit {
                 instance_id: instance.id,
                 element_id: instance.element_id.clone(),
                 definition_id: instance.definition_id,
+                world_centroid,
+                world_anchor: world_centroid,
             });
             instances_by_mesh[mesh_index].push(GpuInstance::from_instance(
                 model_from_object,
@@ -947,7 +1239,7 @@ impl MeshRenderer {
                 view: depth_target,
                 depth_ops: Some(wgpu::Operations {
                     load: wgpu::LoadOp::Clear(self.defaults.depth_clear_value),
-                    store: wgpu::StoreOp::Discard,
+                    store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
             }),
@@ -1548,6 +1840,93 @@ mod tests {
             clamp_pick_region(PickRegion::pixel(100, 10), viewport),
             None
         );
+    }
+
+    #[test]
+    fn cpu_pick_prepared_scene_returns_visible_instances_and_surface_anchor() {
+        let mesh = PreparedMesh {
+            local_origin: DVec3::ZERO,
+            bounds: Bounds3::from_points(&[
+                DVec3::new(-0.75, -0.75, 0.0),
+                DVec3::new(0.75, 0.75, 0.0),
+            ])
+            .expect("bounds"),
+            vertices: vec![
+                PreparedVertex {
+                    position: [-0.75, -0.75, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                },
+                PreparedVertex {
+                    position: [0.75, -0.75, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                },
+                PreparedVertex {
+                    position: [0.0, 0.75, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                },
+            ],
+            indices: vec![0, 1, 2],
+        };
+        let left_transform = DMat4::from_translation(DVec3::new(-1.0, 0.0, 0.0));
+        let right_transform = DMat4::from_translation(DVec3::new(1.0, 0.0, 0.0));
+        let scene = PreparedRenderScene {
+            bounds: Bounds3::from_points(&[
+                DVec3::new(-1.75, -0.75, 0.0),
+                DVec3::new(1.75, 0.75, 0.0),
+            ])
+            .expect("scene bounds"),
+            definitions: vec![PreparedRenderDefinition {
+                id: GeometryDefinitionId(7),
+                mesh: mesh.clone(),
+            }],
+            instances: vec![
+                PreparedRenderInstance {
+                    id: GeometryInstanceId(1),
+                    element_id: SemanticElementId::new("synthetic/left"),
+                    definition_id: GeometryDefinitionId(7),
+                    model_from_object: left_transform,
+                    world_bounds: mesh.bounds.transformed(left_transform),
+                    material: PreparedMaterial::default(),
+                },
+                PreparedRenderInstance {
+                    id: GeometryInstanceId(2),
+                    element_id: SemanticElementId::new("synthetic/right"),
+                    definition_id: GeometryDefinitionId(7),
+                    model_from_object: right_transform,
+                    world_bounds: mesh.bounds.transformed(right_transform),
+                    material: PreparedMaterial::default(),
+                },
+            ],
+        };
+        let viewport = ViewportSize::new(160, 120);
+        let camera = fit_camera_to_render_scene(&scene);
+
+        let rect_result =
+            pick_prepared_scene_cpu(&scene, camera, viewport, PickRegion::rect(0, 0, 160, 120));
+        let rect_hit_ids = rect_result
+            .hits
+            .iter()
+            .map(|hit| hit.instance_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            rect_hit_ids,
+            [GeometryInstanceId(1), GeometryInstanceId(2)]
+                .into_iter()
+                .collect()
+        );
+
+        let left_center = scene.instances[0].world_bounds.center();
+        let clip = camera.clip_from_world(viewport)
+            * DVec4::new(left_center.x, left_center.y, left_center.z, 1.0);
+        let ndc = clip.truncate() / clip.w;
+        let x = (((ndc.x + 1.0) * 0.5) * f64::from(viewport.width)).floor() as u32;
+        let y = ((1.0 - ((ndc.y + 1.0) * 0.5)) * f64::from(viewport.height)).floor() as u32;
+        let point_result =
+            pick_prepared_scene_cpu(&scene, camera, viewport, PickRegion::pixel(x, y));
+
+        assert_eq!(point_result.hits.len(), 1);
+        assert_eq!(point_result.hits[0].instance_id, GeometryInstanceId(1));
+        assert!((point_result.hits[0].world_anchor.z - 0.0).abs() < 1.0e-6);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

@@ -20,6 +20,10 @@
         box-sizing: border-box;
       }
 
+      [hidden] {
+        display: none !important;
+      }
+
       body {
         margin: 0;
         height: 100vh;
@@ -42,9 +46,77 @@
         cursor: col-resize;
       }
 
+      .visually-hidden {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+
       code {
         font-family: ui-monospace, SFMono-Regular, SF Mono, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
         font-size: 0.94em;
+      }
+
+      .viewer-header {
+        flex: 0 0 auto;
+        min-height: 34px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 5px 12px;
+        background: #151b2a;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      }
+
+      .header-tools,
+      .header-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .icon-button {
+        width: 28px;
+        height: 24px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 6px;
+        background: #101622;
+        color: rgba(243, 246, 255, 0.72);
+        cursor: pointer;
+      }
+
+      .icon-button:hover {
+        color: #f3f6ff;
+        border-color: rgba(141, 182, 255, 0.32);
+      }
+
+      .icon-button.active,
+      .icon-button[aria-pressed="true"] {
+        color: #f3f6ff;
+        background: #203052;
+        border-color: rgba(141, 182, 255, 0.54);
+      }
+
+      .icon-button svg {
+        width: 16px;
+        height: 16px;
+        display: block;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.8;
+        stroke-linecap: round;
+        stroke-linejoin: round;
       }
 
       .viewer-footer {
@@ -79,13 +151,9 @@
         font: inherit;
       }
 
-      .viewer-footer #tool-picker {
-        min-width: 96px;
-      }
-
       .status {
         min-width: 0;
-        flex: 1;
+        flex: 1 1 auto;
         font-size: 12px;
         color: rgba(243, 246, 255, 0.68);
         overflow: hidden;
@@ -112,6 +180,7 @@
         position: relative;
         flex: 1;
         min-height: 320px;
+        overflow: hidden;
         background: #0f1320;
       }
 
@@ -138,10 +207,15 @@
         min-width: 420px;
         min-height: 0;
         display: grid;
-        grid-template-rows: auto 1fr;
+        grid-template-rows: 1fr;
         overflow: hidden;
         background: #121827;
         border-left: 1px solid rgba(255, 255, 255, 0.08);
+      }
+
+      body.graph-hidden .side-panel,
+      body.graph-hidden #side-panel-resizer {
+        display: none;
       }
 
       .splitter {
@@ -342,6 +416,163 @@
         border-bottom: 1px solid rgba(255, 255, 255, 0.08);
       }
 
+      .properties-balloon {
+        position: absolute;
+        z-index: 20;
+        --arrow-y: 50%;
+        width: min(342px, calc(100% - 24px));
+        max-height: min(420px, calc(100% - 24px));
+        display: flex;
+        flex-direction: column;
+        overflow: visible;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
+        background: rgba(18, 24, 39, 0.96);
+        box-shadow: 0 18px 38px rgba(0, 0, 0, 0.32);
+        backdrop-filter: blur(10px);
+      }
+
+      .properties-balloon[hidden] {
+        display: none;
+      }
+
+      .properties-balloon::before,
+      .properties-balloon::after {
+        content: "";
+        position: absolute;
+        top: var(--arrow-y);
+        width: 0;
+        height: 0;
+        transform: translateY(-50%);
+      }
+
+      .properties-balloon::before {
+        filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.28));
+      }
+
+      .properties-balloon[data-side="right"]::before {
+        left: -14px;
+        border-top: 10px solid transparent;
+        border-bottom: 10px solid transparent;
+        border-right: 14px solid rgba(255, 255, 255, 0.13);
+      }
+
+      .properties-balloon[data-side="right"]::after {
+        left: -11px;
+        border-top: 8px solid transparent;
+        border-bottom: 8px solid transparent;
+        border-right: 11px solid rgba(18, 24, 39, 0.96);
+      }
+
+      .properties-balloon[data-side="left"]::before {
+        right: -14px;
+        border-top: 10px solid transparent;
+        border-bottom: 10px solid transparent;
+        border-left: 14px solid rgba(255, 255, 255, 0.13);
+      }
+
+      .properties-balloon[data-side="left"]::after {
+        right: -11px;
+        border-top: 8px solid transparent;
+        border-bottom: 8px solid transparent;
+        border-left: 11px solid rgba(18, 24, 39, 0.96);
+      }
+
+      .properties-balloon[data-side="center"]::before,
+      .properties-balloon[data-side="center"]::after {
+        display: none;
+      }
+
+      .properties-balloon .properties-header {
+        padding: 12px 14px;
+        overflow: hidden;
+        border-top-left-radius: 8px;
+        border-top-right-radius: 8px;
+      }
+
+      .properties-balloon .properties-title {
+        font-size: 15px;
+      }
+
+      .properties-title {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+      }
+
+      .properties-title-text {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .properties-graph-button {
+        width: 22px;
+        height: 22px;
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        border: 1px solid rgba(141, 182, 255, 0.24);
+        border-radius: 6px;
+        background: rgba(141, 182, 255, 0.08);
+        color: rgba(243, 246, 255, 0.76);
+        cursor: pointer;
+      }
+
+      .properties-graph-button:hover {
+        color: #f3f6ff;
+        border-color: rgba(141, 182, 255, 0.48);
+        background: rgba(141, 182, 255, 0.14);
+      }
+
+      .properties-graph-button svg {
+        width: 14px;
+        height: 14px;
+        display: block;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.8;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      .properties-balloon .properties-subtitle {
+        font-size: 12px;
+      }
+
+      .properties-close {
+        position: absolute;
+        top: 9px;
+        right: 9px;
+        width: 24px;
+        height: 24px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 6px;
+        background: rgba(255, 255, 255, 0.04);
+        color: rgba(243, 246, 255, 0.72);
+        cursor: pointer;
+      }
+
+      .properties-close:hover {
+        color: #f3f6ff;
+        border-color: rgba(141, 182, 255, 0.34);
+      }
+
+      .pick-anchor-marker {
+        position: absolute;
+        z-index: 19;
+        width: 12px;
+        height: 12px;
+        border: 2px solid #f3f6ff;
+        border-radius: 999px;
+        background: #8db6ff;
+        box-shadow: 0 0 0 5px rgba(141, 182, 255, 0.18), 0 8px 18px rgba(0, 0, 0, 0.28);
+        transform: translate(-50%, -50%);
+        pointer-events: none;
+      }
+
       .properties-kicker {
         margin: 0 0 6px;
         font-size: 12px;
@@ -484,7 +715,6 @@
         min-width: 0;
         display: grid;
         grid-template-columns: 40px 1fr;
-        grid-template-rows: minmax(0, 1fr) auto;
         gap: 8px;
         flex: 1;
         overflow: hidden;
@@ -494,7 +724,7 @@
 
       .terminal-side {
         min-height: 0;
-        grid-row: 1 / span 2;
+        grid-row: 1;
         display: flex;
         flex-direction: column;
         align-items: stretch;
@@ -521,19 +751,15 @@
       }
 
       .agent-capability-controls {
-        grid-column: 2;
-        grid-row: 2;
-        min-height: 24px;
-        display: none;
+        flex: 0 1 auto;
+        margin-left: auto;
+        min-width: 0;
+        display: flex;
         align-items: center;
         justify-content: flex-end;
         gap: 8px;
         color: rgba(243, 246, 255, 0.52);
-        font: 11px/1.2 ui-monospace, SFMono-Regular, SF Mono, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      }
-
-      #agent-terminal.active ~ .agent-capability-controls {
-        display: flex;
+        font-size: 12px;
       }
 
       .agent-capability-controls label {
@@ -544,7 +770,8 @@
       }
 
       .agent-capability-controls select {
-        height: 22px;
+        height: 24px;
+        min-width: 112px;
         max-width: 190px;
         border: 1px solid rgba(141, 182, 255, 0.2);
         border-radius: 6px;
@@ -591,6 +818,11 @@
       }
 
       @media (max-width: 900px) {
+        .viewer-header {
+          min-height: 34px;
+          padding: 5px 8px;
+        }
+
         .viewer-footer {
           height: auto;
           min-height: 34px;
@@ -600,6 +832,15 @@
 
         .viewer-footer select {
           min-width: 132px;
+        }
+
+        .agent-capability-controls {
+          order: 3;
+        }
+
+        .status {
+          order: 4;
+          flex-basis: 100%;
         }
 
         .terminal {
@@ -612,96 +853,109 @@
       }
     </style>
   </head>
-  <body>
+  <body class="graph-hidden">
+    <header class="viewer-header" aria-label="Viewer tools">
+      <div class="header-tools" role="toolbar" aria-label="3D tools">
+        <select id="tool-picker" class="visually-hidden" aria-label="Active 3D tool">
+          <option value="orbit" selected>Orbit</option>
+          <option value="pick">Pick</option>
+        </select>
+        <button
+          class="icon-button tool-button active"
+          data-tool-button="orbit"
+          type="button"
+          aria-label="Rotate model"
+          aria-pressed="true"
+          title="Rotate"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M20 11a8 8 0 1 0-2.3 5.7" />
+            <path d="M20 5v6h-6" />
+          </svg>
+        </button>
+        <button
+          class="icon-button tool-button"
+          data-tool-button="pick"
+          type="button"
+          aria-label="Pick model elements"
+          aria-pressed="false"
+          title="Pick"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 4v5" />
+            <path d="M12 15v5" />
+            <path d="M4 12h5" />
+            <path d="M15 12h5" />
+            <circle cx="12" cy="12" r="2.8" />
+          </svg>
+        </button>
+      </div>
+      <div class="header-actions" aria-label="Viewer panels">
+        <button
+          class="icon-button graph-toggle-button"
+          id="graph-toggle-button"
+          type="button"
+          aria-label="Toggle graph viewport"
+          aria-pressed="false"
+          title="Graph"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="6" cy="7" r="2.4" />
+            <circle cx="17" cy="6" r="2.4" />
+            <circle cx="18" cy="17" r="2.4" />
+            <circle cx="7" cy="18" r="2.4" />
+            <path d="M8.2 7h6.4" />
+            <path d="M16.8 8.2l.8 6.2" />
+            <path d="M15.8 17.2h-6.4" />
+            <path d="M6.4 9.2l.4 6.4" />
+          </svg>
+        </button>
+      </div>
+    </header>
     <main class="workspace">
       <section class="viewer-pane">
         <div class="viewport">
           <canvas id="viewer-canvas"></canvas>
           <canvas id="axes-overlay"></canvas>
-        </div>
-      </section>
-      <div
-        class="splitter vertical"
-        id="side-panel-resizer"
-        role="separator"
-        aria-label="Resize graph panel"
-        aria-orientation="vertical"
-      ></div>
-      <aside class="side-panel" aria-label="Graph exploration panel">
-        <div class="panel-tabs" role="tablist" aria-label="Viewer side panel">
-          <button
-            class="panel-tab active"
-            id="graph-tab"
-            data-panel-tab="graph"
-            type="button"
-            role="tab"
-            aria-selected="true"
-            aria-controls="graph-panel"
-          >
-            Graph
-          </button>
-          <button
-            class="panel-tab"
-            id="properties-tab"
-            data-panel-tab="properties"
-            type="button"
-            role="tab"
-            aria-selected="false"
-            aria-controls="properties-panel"
-          >
-            Properties
-          </button>
-        </div>
-        <div class="side-panel-body">
-          <section
-            class="side-panel-view active"
-            id="graph-panel"
-            data-panel-view="graph"
-            role="tabpanel"
-            aria-labelledby="graph-tab"
-          >
-            <div class="graph-status" id="graph-status-line">
-              Graph explorer ready. Use <code>graph.reset(...)</code> to seed the panel from the terminal.
-            </div>
-            <div class="graph-shell">
-              <div class="graph-view" id="graph-view" aria-label="Graph view"></div>
-              <div class="graph-fallback-list" id="graph-fallback-list" hidden></div>
-            </div>
-          </section>
-          <section
-            class="side-panel-view"
-            id="properties-panel"
-            data-panel-view="properties"
-            role="tabpanel"
-            aria-labelledby="properties-tab"
-          >
+          <div class="pick-anchor-marker" id="pick-anchor-marker" aria-hidden="true" hidden></div>
+          <div class="properties-balloon" id="properties-balloon" role="dialog" aria-live="polite" hidden>
+            <button class="properties-close" id="properties-close-button" type="button" aria-label="Close properties">
+              x
+            </button>
             <div class="properties-header">
-              <p class="properties-kicker">Graph Node</p>
-              <h2 class="properties-title" id="properties-title">No graph node selected</h2>
+              <p class="properties-kicker">Selection</p>
+              <h2 class="properties-title">
+                <span class="properties-title-text" id="properties-title">No element selected</span>
+                <button
+                  class="properties-graph-button"
+                  id="properties-graph-button"
+                  type="button"
+                  aria-label="Open graph around picked element"
+                  title="Open graph"
+                  hidden
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <circle cx="6" cy="7" r="2.4" />
+                    <circle cx="17" cy="6" r="2.4" />
+                    <circle cx="18" cy="17" r="2.4" />
+                    <circle cx="7" cy="18" r="2.4" />
+                    <path d="M8.2 7h6.4" />
+                    <path d="M16.8 8.2l.8 6.2" />
+                    <path d="M15.8 17.2h-6.4" />
+                    <path d="M6.4 9.2l.4 6.4" />
+                  </svg>
+                </button>
+              </h2>
               <p class="properties-subtitle" id="properties-subtitle">
-                Select a graph node to inspect its layout, ids, and attached metadata.
+                Pick an object in the model to inspect its IFC properties.
               </p>
-            </div>
-            <div class="properties-actions">
-              <div class="toolbar-actions">
-                <button class="ui-button" id="properties-select-button" type="button" disabled>
-                  Select in 3D
-                </button>
-                <button class="ui-button" id="properties-hide-button" type="button" disabled>
-                  Hide
-                </button>
-                <button class="ui-button" id="properties-show-button" type="button" disabled>
-                  Show
-                </button>
-              </div>
             </div>
             <div class="properties-content" id="properties-content">
               <div class="properties-empty" id="properties-empty-state">
-                The properties panel is ready. Once a graph node is selected, this panel will show entity identity,
-                mapped semantic ids, and any extra properties that the integration layer feeds into the shell.
+                Pick an object in the model to inspect its IFC properties.
               </div>
               <section class="properties-section" id="properties-core-section" hidden>
-                <h3>Core</h3>
+                <h3>Properties</h3>
                 <div class="property-grid" id="properties-core-grid"></div>
               </section>
               <section class="properties-section" id="properties-extra-section" hidden>
@@ -712,6 +966,32 @@
                 <h3>Relations</h3>
                 <div class="relation-list" id="properties-relations-list"></div>
               </section>
+            </div>
+          </div>
+        </div>
+      </section>
+      <div
+        class="splitter vertical"
+        id="side-panel-resizer"
+        role="separator"
+        aria-label="Resize graph panel"
+        aria-orientation="vertical"
+      ></div>
+      <aside class="side-panel" aria-label="Graph exploration panel">
+        <div class="side-panel-body">
+          <section
+            class="side-panel-view active"
+            id="graph-panel"
+            data-panel-view="graph"
+            role="tabpanel"
+            aria-label="Graph panel"
+          >
+            <div class="graph-status" id="graph-status-line">
+              Graph explorer ready. Use <code>graph.reset(...)</code> to seed the panel from the terminal.
+            </div>
+            <div class="graph-shell">
+              <div class="graph-view" id="graph-view" aria-label="Graph view"></div>
+              <div class="graph-fallback-list" id="graph-fallback-list" hidden></div>
             </div>
           </section>
         </div>
@@ -752,20 +1032,6 @@
         </div>
         <div class="terminal-host active" id="repl-terminal" aria-label="JavaScript terminal"></div>
         <div class="terminal-host" id="agent-terminal" aria-label="AI agent terminal"></div>
-        <div class="agent-capability-controls" id="agent-capability-controls" aria-label="AI model controls">
-          <label>
-            Model
-            <select id="agent-model-select" disabled>
-              <option value="">loading</option>
-            </select>
-          </label>
-          <label>
-            Level
-            <select id="agent-level-select" disabled>
-              <option value="">loading</option>
-            </select>
-          </label>
-        </div>
       </div>
     </section>
     <footer class="viewer-footer" aria-label="Viewer controls and status">
@@ -773,14 +1039,19 @@
         Model
         <select id="resource-picker"></select>
       </label>
-      <label>
-        Tool
-        <select id="tool-picker">
-          <option value="orbit" selected>Orbit</option>
-          <option value="pick">Pick</option>
-        </select>
-      </label>
       <div class="status" id="status-line">Starting w web viewer…</div>
+      <div class="agent-capability-controls" id="agent-capability-controls" aria-label="AI model controls">
+        <label>
+          <select id="agent-model-select" aria-label="AI model" disabled>
+            <option value="">loading</option>
+          </select>
+        </label>
+        <label>
+          <select id="agent-level-select" aria-label="AI level" disabled>
+            <option value="">loading</option>
+          </select>
+        </label>
+      </div>
     </footer>
     <script src="./vendor/graphology.js"></script>
     <script src="./vendor/sigma.js"></script>
@@ -851,18 +1122,26 @@
       const GRAPH_EDGE_LABEL_MAX_RATIO = 0.95;
       const GRAPH_NODE_NAME_MAX_RATIO = 0.58;
       const GRAPH_NODE_FORCE_LABEL_MAX_RATIO = 1.05;
-      const GRAPH_RELATIONSHIP_FORCE_LABEL_MAX_RATIO = 2.4;
+      const GRAPH_RELATIONSHIP_LABEL_MAX_RATIO = 0.34;
+      const GRAPH_RELATIONSHIP_FORCE_LABEL_MAX_RATIO = GRAPH_RELATIONSHIP_LABEL_MAX_RATIO;
       const GRAPH_REFERENCE_VIEWPORT = {
         width: 648,
         height: 640,
       };
       const GRAPH_CAMERA_BASE_PADDING = 1.18;
+      const DrawCurvedGraphEdgeLabel = createDrawCurvedEdgeLabel({
+        curvatureAttribute: "curvature",
+        defaultCurvature: DEFAULT_EDGE_CURVATURE * 0.68,
+        keepLabelUpright: true,
+      });
       const EmphasizedCurvedArrowProgram = createEdgeCurveProgram({
         arrowHead: {
           extremity: "target",
           lengthToThicknessRatio: 6.2,
           widenessToThicknessRatio: 4.6,
         },
+        curvatureAttribute: "curvature",
+        drawLabel: DrawCurvedGraphEdgeLabel,
       });
 
       function createViewerApi() {
@@ -1109,6 +1388,7 @@
       function installLayoutResizers(callbacks = {}) {
         const root = document.documentElement;
         const body = document.body;
+        const header = document.querySelector(".viewer-header");
         const footer = document.querySelector(".viewer-footer");
         const workspace = document.querySelector(".workspace");
         const sidePanel = document.querySelector(".side-panel");
@@ -1164,10 +1444,14 @@
         };
 
         const constrainTerminalHeight = (height) => {
+          const headerHeight = header ? header.getBoundingClientRect().height : 34;
           const footerHeight = footer ? footer.getBoundingClientRect().height : 34;
           const minHeight = 132;
           const minWorkspaceHeight = 260;
-          const maxHeight = Math.max(minHeight, window.innerHeight - footerHeight - minWorkspaceHeight);
+          const maxHeight = Math.max(
+            minHeight,
+            window.innerHeight - headerHeight - footerHeight - minWorkspaceHeight
+          );
           return clamp(height, minHeight, maxHeight);
         };
 
@@ -1242,6 +1526,56 @@
         applyTerminalHeight(constrainTerminalHeight(terminal.getBoundingClientRect().height));
         syncResizerAria();
         schedulePaneRefresh({ immediate: true });
+      }
+
+      function installHeaderControls(viewer, graphShell) {
+        const toolPicker = document.getElementById("tool-picker");
+        const toolButtons = Array.from(document.querySelectorAll("[data-tool-button]"));
+        const graphToggleButton = document.getElementById("graph-toggle-button");
+
+        const syncToolButtons = () => {
+          const activeTool = toolPicker?.value || "orbit";
+          for (const button of toolButtons) {
+            const active = button.dataset.toolButton === activeTool;
+            button.classList.toggle("active", active);
+            button.setAttribute("aria-pressed", String(active));
+          }
+        };
+
+        for (const button of toolButtons) {
+          button.addEventListener("click", () => {
+            if (!toolPicker) {
+              return;
+            }
+            toolPicker.value = button.dataset.toolButton || "orbit";
+            toolPicker.dispatchEvent(new Event("change", { bubbles: true }));
+            syncToolButtons();
+          });
+        }
+        toolPicker?.addEventListener("change", syncToolButtons);
+        syncToolButtons();
+
+        const setGraphVisible = (visible) => {
+          document.body.classList.toggle("graph-hidden", !visible);
+          graphToggleButton?.classList.toggle("active", visible);
+          graphToggleButton?.setAttribute("aria-pressed", String(visible));
+          requestAnimationFrame(() => {
+            graphShell?.resize?.();
+            viewer?.resizeViewport?.();
+          });
+          return visible;
+        };
+
+        graphToggleButton?.addEventListener("click", () => {
+          setGraphVisible(document.body.classList.contains("graph-hidden"));
+        });
+
+        return {
+          setGraphVisible,
+          showGraph: () => setGraphVisible(true),
+          hideGraph: () => setGraphVisible(false),
+          toggleGraph: () => setGraphVisible(document.body.classList.contains("graph-hidden")),
+        };
       }
 
       function formatResult(value) {
@@ -1337,7 +1671,16 @@
         return name ? `${label} · ${name}` : label;
       }
 
-      function graphNodeShouldForceLabel(node, ratio) {
+      function graphRelationshipDotTouchesSelected(node, selectedNodeId) {
+        if (!selectedNodeId || !graphIsRelationshipDot(node)) {
+          return false;
+        }
+        const selectedKey = String(selectedNodeId);
+        const endpoints = graphNodeProperties(node).endpoints;
+        return Array.isArray(endpoints) && endpoints.map(String).includes(selectedKey);
+      }
+
+      function graphNodeShouldForceLabel(node, ratio, selectedNodeId = null) {
         if (graphIsRelationshipNode(node)) {
           return ratio <= GRAPH_RELATIONSHIP_FORCE_LABEL_MAX_RATIO;
         }
@@ -1357,7 +1700,7 @@
         }
         const entity = graphNodeEntity(node).toLowerCase();
         if (entity.includes("ifcrel")) {
-          return "#5d6c86";
+          return "#9fb5d9";
         }
         if (entity.includes("project") || entity.includes("site") || entity.includes("building")) {
           return "#8ec2ff";
@@ -1378,28 +1721,293 @@
         return graphNodeEntity(node).toLowerCase().includes("ifcrel");
       }
 
+      function graphNodeProperties(node) {
+        const properties = tryGetFirst(node, ["properties"]);
+        return properties && typeof properties === "object" ? properties : {};
+      }
+
+      function graphIsRelationshipDot(node) {
+        return graphIsRelationshipNode(node) && Boolean(graphNodeProperties(node).isRelationshipDot);
+      }
+
       function graphNodeSize(node, selected = false) {
         const degree = Number(tryGetFirst(node, ["degree"])) || 0;
-        if (selected) {
-          return graphIsRelationshipNode(node) ? 13 : 19;
-        }
         if (graphIsRelationshipNode(node)) {
-          return Math.min(12, 7 + Math.sqrt(Math.max(degree, 1)) * 0.8);
+          return selected ? 6.5 : 4.2;
+        }
+        if (selected) {
+          return 19;
         }
         const base = tryGetFirst(node, ["properties"])?.isSeed ? 20 : 15;
         return Math.min(28, base + Math.sqrt(Math.max(degree, 1)) * 0.7);
       }
 
-      function graphNodeRenderLabel(node, expanded = false) {
+      function graphNodeZIndex(node, selected = false) {
+        if (graphIsRelationshipDot(node)) {
+          return 0;
+        }
+        return selected ? 3 : 2;
+      }
+
+      function graphNodeRenderLabel(
+        node,
+        expanded = false,
+        ratio = Number.POSITIVE_INFINITY,
+        selectedNodeId = null
+      ) {
+        if (graphIsRelationshipNode(node)) {
+          return ratio <= GRAPH_RELATIONSHIP_LABEL_MAX_RATIO ? graphNodeLabel(node) : "";
+        }
         return expanded ? graphNodeText(node) : graphNodeLabel(node);
       }
 
       function graphEdgeCurvature(edge, index = 0) {
         const source = String(tryGetFirst(edge, ["source", "from", "sourceId"]) || "");
         const target = String(tryGetFirst(edge, ["target", "to", "targetId"]) || "");
+        if (tryGetFirst(edge, ["isRelationshipSegment"])) {
+          return relationshipSegmentFallbackCurvature(edge, source, target);
+        }
+        if (tryGetFirst(edge, ["isRelationshipPath"])) {
+          return relationshipPathCurvature({
+            source,
+            target,
+            edgeId: tryGetFirst(edge, ["edgeId", "id", "key"]),
+            relationSiblingIndex: tryGetFirst(edge, ["relationSiblingIndex"]),
+            relationSiblingCount: tryGetFirst(edge, ["relationSiblingCount"]),
+          });
+        }
+        if (source.startsWith("rel:") || target.startsWith("rel:")) {
+          return 0;
+        }
         const directionSign = source < target ? 1 : -1;
         const spread = (index % 4) * 0.04;
         return directionSign * (DEFAULT_EDGE_CURVATURE * 0.68 + spread);
+      }
+
+      function graphEdgeCurvatureForPositions(edge, index = 0, positions = null) {
+        const source = String(tryGetFirst(edge, ["source", "from", "sourceId"]) || "");
+        const target = String(tryGetFirst(edge, ["target", "to", "targetId"]) || "");
+        if (tryGetFirst(edge, ["isRelationshipSegment"])) {
+          const segmentCurvature = relationshipSegmentCurvature(edge, positions);
+          if (Number.isFinite(segmentCurvature)) {
+            return segmentCurvature;
+          }
+          return relationshipSegmentFallbackCurvature(edge, source, target);
+        }
+        return graphEdgeCurvature(edge, index);
+      }
+
+      function graphEdgeRenderLabel(edge) {
+        const label = tryGetFirst(edge, ["label", "relationshipType", "type"]);
+        return label === null || label === undefined ? "" : String(label);
+      }
+
+      function relationshipEndpointDirection(edge, endpoint) {
+        const raw =
+          endpoint === "source"
+            ? tryGetFirst(edge, ["sourceRoleDirection"])
+            : tryGetFirst(edge, ["targetRoleDirection"]);
+        return String(raw || "").trim();
+      }
+
+      function relationshipEndpointRole(edge, endpoint) {
+        const raw =
+          endpoint === "source"
+            ? tryGetFirst(edge, ["sourceRole"])
+            : tryGetFirst(edge, ["targetRole"]);
+        return raw === null || raw === undefined ? "" : String(raw);
+      }
+
+      function relationshipPathCurvature({
+        source,
+        target,
+        edgeId,
+        relationSiblingIndex,
+        relationSiblingCount,
+      }) {
+        const siblingCount = Math.max(1, Number(relationSiblingCount) || 1);
+        const siblingIndex = Math.max(0, Number(relationSiblingIndex) || 0);
+        const centeredIndex = siblingIndex - (siblingCount - 1) / 2;
+        const side =
+          Math.abs(centeredIndex) > 0.001
+            ? Math.sign(centeredIndex)
+            : stableGraphSide(edgeId || `${source}->${target}`);
+        const spread = Math.abs(centeredIndex) * 0.08;
+        return side * (DEFAULT_EDGE_CURVATURE * 0.62 + spread);
+      }
+
+      function relationshipSegmentFallbackCurvature(edge, source, target) {
+        const relationSource = String(tryGetFirst(edge, ["relationshipSource"]) || source);
+        const relationTarget = String(tryGetFirst(edge, ["relationshipTarget"]) || target);
+        const parentCurvature = relationshipPathCurvature({
+          source: relationSource,
+          target: relationTarget,
+          edgeId: tryGetFirst(edge, ["edgeId", "id", "key"]),
+          relationSiblingIndex: tryGetFirst(edge, ["relationSiblingIndex"]),
+          relationSiblingCount: tryGetFirst(edge, ["relationSiblingCount"]),
+        });
+        return parentCurvature * 0.72;
+      }
+
+      function relationshipCurveControlPoint(source, target, curvature) {
+        const dx = target.x - source.x;
+        const dy = target.y - source.y;
+        const distance = Math.max(Math.sqrt(dx * dx + dy * dy), 0.001);
+        return {
+          x: (source.x + target.x) * 0.5 + (-dy / distance) * distance * curvature,
+          y: (source.y + target.y) * 0.5 + (dx / distance) * distance * curvature,
+        };
+      }
+
+      function curvatureForControlPoint(source, target, control) {
+        const dx = target.x - source.x;
+        const dy = target.y - source.y;
+        const distance = Math.max(Math.sqrt(dx * dx + dy * dy), 0.001);
+        const midpoint = {
+          x: (source.x + target.x) * 0.5,
+          y: (source.y + target.y) * 0.5,
+        };
+        const normal = {
+          x: -dy / distance,
+          y: dx / distance,
+        };
+        return ((control.x - midpoint.x) * normal.x + (control.y - midpoint.y) * normal.y) / distance;
+      }
+
+      function relationshipSegmentCurvature(edge, positions) {
+        if (!positions) {
+          return null;
+        }
+        const relationSourceKey = String(tryGetFirst(edge, ["relationshipSource"]) || "");
+        const relationTargetKey = String(tryGetFirst(edge, ["relationshipTarget"]) || "");
+        const relationNodeKey = String(tryGetFirst(edge, ["relationNodeId"]) || "");
+        const sourceKey = String(tryGetFirst(edge, ["source", "from", "sourceId"]) || "");
+        const targetKey = String(tryGetFirst(edge, ["target", "to", "targetId"]) || "");
+        const relationSource = positions.get(relationSourceKey);
+        const relationTarget = positions.get(relationTargetKey);
+        const relationNode = positions.get(relationNodeKey);
+        const edgeSource = positions.get(sourceKey);
+        const edgeTarget = positions.get(targetKey);
+        if (!relationSource || !relationTarget || !relationNode || !edgeSource || !edgeTarget) {
+          return null;
+        }
+        const parentCurvature = relationshipPathCurvature({
+          source: relationSourceKey,
+          target: relationTargetKey,
+          edgeId: tryGetFirst(edge, ["relationshipEdgeId", "edgeId", "id", "key"]),
+          relationSiblingIndex: tryGetFirst(edge, ["relationSiblingIndex"]),
+          relationSiblingCount: tryGetFirst(edge, ["relationSiblingCount"]),
+        });
+        const parentControl = relationshipCurveControlPoint(relationSource, relationTarget, parentCurvature);
+        const segment = String(tryGetFirst(edge, ["relationshipSegment"]) || "");
+        const desiredControl =
+          segment === "source"
+            ? {
+                x: (relationSource.x + parentControl.x) * 0.5,
+                y: (relationSource.y + parentControl.y) * 0.5,
+              }
+            : {
+                x: (parentControl.x + relationTarget.x) * 0.5,
+                y: (parentControl.y + relationTarget.y) * 0.5,
+              };
+        return curvatureForControlPoint(edgeSource, edgeTarget, desiredControl);
+      }
+
+      function stableGraphSide(value) {
+        let hash = 0;
+        const text = String(value || "");
+        for (let index = 0; index < text.length; index += 1) {
+          hash = (hash * 31 + text.charCodeAt(index)) | 0;
+        }
+        return hash % 2 === 0 ? 1 : -1;
+      }
+
+      function relationshipDotPosition(node, positions) {
+        const properties = graphNodeProperties(node);
+        if (!properties.isRelationshipDot) {
+          return null;
+        }
+        const sourceKey = String(properties.source || "");
+        const targetKey = String(properties.target || "");
+        const source = positions.get(sourceKey);
+        const target = positions.get(targetKey);
+        if (!source || !target || sourceKey === targetKey) {
+          const endpointKeys = Array.isArray(properties.endpoints)
+            ? properties.endpoints.map((value) => String(value)).filter(Boolean)
+            : [];
+          const endpointPositions = endpointKeys
+            .map((key) => positions.get(key))
+            .filter((position) => position && Number.isFinite(position.x) && Number.isFinite(position.y));
+          if (endpointPositions.length > 0) {
+            const sum = endpointPositions.reduce(
+              (accumulator, position) => ({
+                x: accumulator.x + position.x,
+                y: accumulator.y + position.y,
+              }),
+              { x: 0, y: 0 }
+            );
+            return {
+              x: sum.x / endpointPositions.length,
+              y: sum.y / endpointPositions.length,
+            };
+          }
+          return null;
+        }
+
+        const dx = target.x - source.x;
+        const dy = target.y - source.y;
+        const distance = Math.max(Math.sqrt(dx * dx + dy * dy), 0.001);
+        const siblingCount = Math.max(1, Number(properties.relationSiblingCount) || 1);
+        const curvature = relationshipPathCurvature({
+          source: sourceKey,
+          target: targetKey,
+          edgeId: properties.edgeId || graphNodeKey(node),
+          relationSiblingIndex: properties.relationSiblingIndex,
+          relationSiblingCount: siblingCount,
+        });
+        const offset = distance * curvature * 0.5;
+        const normalX = -dy / distance;
+        const normalY = dx / distance;
+
+        return {
+          x: (source.x + target.x) * 0.5 + normalX * offset,
+          y: (source.y + target.y) * 0.5 + normalY * offset,
+        };
+      }
+
+      function placeRelationshipDots(nodes, positions) {
+        for (const [index, node] of nodes.entries()) {
+          if (!graphIsRelationshipDot(node)) {
+            continue;
+          }
+          const position = relationshipDotPosition(node, positions);
+          if (position) {
+            positions.set(graphNodeKey(node, index), position);
+          }
+        }
+      }
+
+      function graphNodePositionsFromModel(graphModel, nodes) {
+        const positions = new Map();
+        if (!graphModel || typeof graphModel.getNodeAttributes !== "function") {
+          return positions;
+        }
+        for (const [index, node] of nodes.entries()) {
+          const key = graphNodeKey(node, index);
+          try {
+            const attributes = graphModel.getNodeAttributes(key);
+            if (
+              attributes &&
+              Number.isFinite(attributes.x) &&
+              Number.isFinite(attributes.y)
+            ) {
+              positions.set(key, { x: attributes.x, y: attributes.y });
+            }
+          } catch (_error) {
+            // Ignore nodes that are not in the active graph model.
+          }
+        }
+        return positions;
       }
 
       function graphHoverRenderer(context, data, settings) {
@@ -1543,6 +2151,10 @@
             anchors.set(key, { ...position });
           }
         }
+        placeRelationshipDots(nodes, positions);
+        for (const [key, position] of positions.entries()) {
+          anchors.set(key, { ...position });
+        }
 
         if (nodeKeys.length === 1) {
           return positions;
@@ -1600,7 +2212,7 @@
             const targetNode = nodesByKey.get(targetKey);
             const sourceRelation = graphIsRelationshipNode(sourceNode);
             const targetRelation = graphIsRelationshipNode(targetNode);
-            const desiredLength = sourceRelation || targetRelation ? 1.65 : 2.25;
+            const desiredLength = sourceRelation || targetRelation ? 2.05 : 2.45;
             const force = (distance - desiredLength) * attraction;
             const fx = (dx / distance) * force;
             const fy = (dy / distance) * force;
@@ -1617,7 +2229,13 @@
             const position = positions.get(key);
             const anchor = anchors.get(key);
             const delta = displacement.get(key);
-            const anchorStrength = tryGetFirst(node, ["properties"])?.isSeed ? 0.16 : 0.06;
+            const isSeed = Boolean(tryGetFirst(node, ["properties"])?.isSeed);
+            if (isSeed || graphIsRelationshipDot(node)) {
+              position.x = anchor.x;
+              position.y = anchor.y;
+              continue;
+            }
+            const anchorStrength = 0.06;
 
             delta.x += (anchor.x - position.x) * anchorStrength;
             delta.y += (anchor.y - position.y) * anchorStrength;
@@ -1636,6 +2254,7 @@
               position.y += delta.y * scale;
             }
           }
+          placeRelationshipDots(nodes, positions);
         }
 
         let maxRadius = 0;
@@ -1647,6 +2266,7 @@
           position.x *= scale;
           position.y *= scale;
         }
+        placeRelationshipDots(nodes, positions);
 
         return positions;
       }
@@ -1723,6 +2343,12 @@
           graphClearButton: document.getElementById("graph-clear-button"),
           graphFocusButton: document.getElementById("graph-focus-button"),
           graphModeButtons: Array.from(document.querySelectorAll("[data-graph-mode]")),
+          viewport: document.querySelector(".viewport"),
+          viewerCanvas: document.getElementById("viewer-canvas"),
+          pickAnchorMarker: document.getElementById("pick-anchor-marker"),
+          propertiesBalloon: document.getElementById("properties-balloon"),
+          propertiesCloseButton: document.getElementById("properties-close-button"),
+          propertiesGraphButton: document.getElementById("properties-graph-button"),
           propertiesTitle: document.getElementById("properties-title"),
           propertiesSubtitle: document.getElementById("properties-subtitle"),
           propertiesEmptyState: document.getElementById("properties-empty-state"),
@@ -1732,9 +2358,6 @@
           propertiesExtraGrid: document.getElementById("properties-extra-grid"),
           propertiesRelationsSection: document.getElementById("properties-relations-section"),
           propertiesRelationsList: document.getElementById("properties-relations-list"),
-          propertiesSelectButton: document.getElementById("properties-select-button"),
-          propertiesHideButton: document.getElementById("properties-hide-button"),
-          propertiesShowButton: document.getElementById("properties-show-button"),
           resourcePicker: document.getElementById("resource-picker"),
         };
 
@@ -1745,6 +2368,10 @@
           edges: [],
           nodesById: new Map(),
           selectedNodeId: null,
+          pickedSemanticId: null,
+          pickedDbNodeId: null,
+          pickDetailsRequestId: 0,
+          activePickHasHit: false,
           expandedNodeIds: new Set(),
           expansionPinnedNodeIds: new Set(),
           layoutPositions: new Map(),
@@ -1764,6 +2391,18 @@
         };
 
         let sigmaResizeFrame = 0;
+
+        const waitForAnimationFrames = (count = 2) =>
+          new Promise((resolve) => {
+            const step = (remaining) => {
+              if (remaining <= 0) {
+                resolve();
+                return;
+              }
+              requestAnimationFrame(() => step(remaining - 1));
+            };
+            step(count);
+          });
 
         const graphViewportSize = () => {
           if (!dom.graphView) {
@@ -1847,6 +2486,106 @@
           }
         };
 
+        const hidePropertiesBalloon = () => {
+          if (dom.propertiesBalloon) {
+            dom.propertiesBalloon.hidden = true;
+          }
+          if (dom.pickAnchorMarker) {
+            dom.pickAnchorMarker.hidden = true;
+          }
+        };
+
+        const hidePickAnchorMarker = () => {
+          if (dom.pickAnchorMarker) {
+            dom.pickAnchorMarker.hidden = true;
+          }
+        };
+
+        const showPropertiesBalloonAtClientPoint = (
+          clientX,
+          clientY,
+          { anchored = false, marker = false } = {}
+        ) => {
+          if (!dom.propertiesBalloon || !dom.viewport) {
+            return;
+          }
+          const viewportRect = dom.viewport.getBoundingClientRect();
+          dom.propertiesBalloon.hidden = false;
+          const balloonRect = dom.propertiesBalloon.getBoundingClientRect();
+          const padding = 12;
+          const sideGap = 22;
+          const leftBias = 18;
+          const localX = clientX - viewportRect.left;
+          const localY = clientY - viewportRect.top;
+
+          if (marker && dom.pickAnchorMarker) {
+            dom.pickAnchorMarker.hidden = false;
+            dom.pickAnchorMarker.style.left = `${Math.round(localX)}px`;
+            dom.pickAnchorMarker.style.top = `${Math.round(localY)}px`;
+          } else {
+            hidePickAnchorMarker();
+          }
+
+          const maxLeft = Math.max(padding, viewportRect.width - balloonRect.width - padding);
+          const maxTop = Math.max(padding, viewportRect.height - balloonRect.height - padding);
+          let side = "center";
+          let left = localX - balloonRect.width / 2 - leftBias;
+          if (anchored) {
+            const rightLeft = localX + sideGap - leftBias;
+            const leftLeft = localX - sideGap - balloonRect.width - leftBias;
+            const rightFits = rightLeft + balloonRect.width <= viewportRect.width - padding;
+            const leftFits = leftLeft >= padding;
+            const rightSpace = viewportRect.width - localX - padding;
+            const leftSpace = localX - padding;
+            if (rightFits || (!leftFits && rightSpace >= leftSpace)) {
+              side = "right";
+              left = rightLeft;
+            } else {
+              side = "left";
+              left = leftLeft;
+            }
+          }
+          left = clamp(left, padding, maxLeft);
+          dom.propertiesBalloon.style.left = `${Math.round(left)}px`;
+          const top = clamp(localY - balloonRect.height / 2, padding, maxTop);
+          dom.propertiesBalloon.style.top = `${Math.round(top)}px`;
+          if (anchored) {
+            const rightEdge = left + balloonRect.width;
+            if (localX < left) {
+              side = "right";
+            } else if (localX > rightEdge) {
+              side = "left";
+            } else {
+              side = localX - left <= rightEdge - localX ? "right" : "left";
+            }
+          }
+          dom.propertiesBalloon.dataset.side = side;
+          const arrowY = clamp(localY - top, 18, balloonRect.height - 18);
+          dom.propertiesBalloon.style.setProperty("--arrow-y", `${Math.round(arrowY)}px`);
+        };
+
+        const showPropertiesBalloonAtViewportCenter = () => {
+          if (!dom.viewport) {
+            return;
+          }
+          const rect = dom.viewport.getBoundingClientRect();
+          showPropertiesBalloonAtClientPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+        };
+
+        const pickRegionClientCenter = (detail) => {
+          const region = detail?.region;
+          if (!region || !dom.viewerCanvas) {
+            return null;
+          }
+          const rect = dom.viewerCanvas.getBoundingClientRect();
+          const surfaceWidth = Math.max(1, dom.viewerCanvas.width || rect.width);
+          const surfaceHeight = Math.max(1, dom.viewerCanvas.height || rect.height);
+          return {
+            x: rect.left + ((Number(region.x) + Number(region.width) / 2) / surfaceWidth) * rect.width,
+            y: rect.top + ((Number(region.y) + Number(region.height) / 2) / surfaceHeight) * rect.height,
+          };
+        };
+
         const setStatus = (text, tone = "info") => {
           if (!dom.graphStatusLine) {
             return;
@@ -1860,7 +2599,156 @@
 
         const selectedRenderableId = () => {
           const node = currentSelectedNode();
-          return node ? graphNodeSemanticId(node) : null;
+          return node ? graphNodeSemanticId(node) : state.pickedSemanticId;
+        };
+
+        const cypherStringLiteral = (value) => {
+          return `'${String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
+        };
+
+        const formatPropertyLabel = (label) => {
+          return String(label || "")
+            .replace(/_/g, " ")
+            .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+            .replace(/\s+/g, " ")
+            .trim();
+        };
+
+        const propertyValueText = (value) => {
+          if (value === null || value === undefined || value === "") {
+            return null;
+          }
+          return typeof value === "object" ? JSON.stringify(value) : String(value);
+        };
+
+        const renderPropertyRows = (rows) => {
+          const fragments = rows
+            .map(([label, value]) => [formatPropertyLabel(label), propertyValueText(value)])
+            .filter(([, value]) => value !== null)
+            .map(([label, value]) => createPropertyRow(label, value));
+          dom.propertiesCoreGrid.replaceChildren(...fragments);
+          dom.propertiesCoreSection.hidden = fragments.length === 0;
+          dom.propertiesExtraGrid.replaceChildren();
+          dom.propertiesExtraSection.hidden = true;
+          dom.propertiesRelationsList.replaceChildren();
+          dom.propertiesRelationsSection.hidden = true;
+          return fragments.length;
+        };
+
+        const resetPropertySections = () => {
+          dom.propertiesCoreGrid.replaceChildren();
+          dom.propertiesCoreSection.hidden = true;
+          dom.propertiesExtraGrid.replaceChildren();
+          dom.propertiesExtraSection.hidden = true;
+          dom.propertiesRelationsList.replaceChildren();
+          dom.propertiesRelationsSection.hidden = true;
+        };
+
+        const setPickedGraphButtonVisible = (visible) => {
+          if (dom.propertiesGraphButton) {
+            dom.propertiesGraphButton.hidden = !visible;
+          }
+        };
+
+        const findPickedElementNode = async (semanticId) => {
+          const resource = safeViewerCurrentResource(viewer);
+          if (!semanticId || !isIfcResource(resource)) {
+            return null;
+          }
+          const cypher = [
+            `MATCH (n) WHERE n.GlobalId = ${cypherStringLiteral(semanticId)}`,
+            "RETURN id(n) AS node_id LIMIT 1",
+          ].join(" ");
+          const payload = await viewer.queryCypher(cypher, resource);
+          const dbNodeIds = extractDbNodeIdsFromCypherPayload(payload);
+          return dbNodeIds[0] ?? null;
+        };
+
+        const renderPickedElementDetails = (hit, details, dbNodeId) => {
+          const node = details?.node || {};
+          const entity = node.declaredEntity || "IFC element";
+          const ifcId = node.globalId || hit?.elementId || "";
+          const properties = details?.properties && typeof details.properties === "object"
+            ? details.properties
+            : {};
+          const hiddenKeys = new Set([
+            "declared_entity",
+            "declaredEntity",
+            "GlobalId",
+            "globalId",
+            "semanticId",
+            "semantic_id",
+            "instanceId",
+            "definitionId",
+            "pickAnchor",
+            "worldAnchor",
+            "worldCentroid",
+            "Tag",
+            "tag",
+          ]);
+
+          dom.propertiesTitle.textContent = entity;
+          dom.propertiesSubtitle.textContent = ifcId ? `id: ${ifcId}` : "id unavailable";
+          dom.propertiesEmptyState.hidden = true;
+          state.pickedDbNodeId = dbNodeId || node.dbNodeId || null;
+          setPickedGraphButtonVisible(Boolean(state.pickedDbNodeId));
+
+          const rows = [];
+          if (node.name) {
+            rows.push(["Name", node.name]);
+          }
+          for (const [key, value] of Object.entries(properties)) {
+            if (hiddenKeys.has(key)) {
+              continue;
+            }
+            rows.push([key, value]);
+          }
+
+          const rendered = renderPropertyRows(rows);
+          if (rendered === 0) {
+            resetPropertySections();
+            dom.propertiesEmptyState.hidden = false;
+            dom.propertiesEmptyState.textContent = `No scalar properties found for ${entity}.`;
+          }
+        };
+
+        const loadPickedElementDetails = async (hit, requestId) => {
+          try {
+            const dbNodeId = await findPickedElementNode(hit.elementId);
+            if (requestId !== state.pickDetailsRequestId) {
+              return;
+            }
+            if (!dbNodeId) {
+              dom.propertiesTitle.textContent = "IFC element";
+              dom.propertiesSubtitle.textContent = hit.elementId ? `id: ${hit.elementId}` : "id unavailable";
+              resetPropertySections();
+              dom.propertiesEmptyState.hidden = false;
+              dom.propertiesEmptyState.textContent = "No semantic IFC node was found for this pick.";
+              state.pickedDbNodeId = null;
+              setPickedGraphButtonVisible(false);
+              return;
+            }
+            const details = await viewer.queryGraphNodeProperties(
+              dbNodeId,
+              { maxRelations: 1 },
+              safeViewerCurrentResource(viewer)
+            );
+            if (requestId !== state.pickDetailsRequestId) {
+              return;
+            }
+            renderPickedElementDetails(hit, details, dbNodeId);
+          } catch (error) {
+            if (requestId !== state.pickDetailsRequestId) {
+              return;
+            }
+            dom.propertiesTitle.textContent = "IFC element";
+            dom.propertiesSubtitle.textContent = hit.elementId ? `id: ${hit.elementId}` : "id unavailable";
+            resetPropertySections();
+            dom.propertiesEmptyState.hidden = false;
+            dom.propertiesEmptyState.textContent = `Could not load IFC properties: ${error.message || error}`;
+            state.pickedDbNodeId = null;
+            setPickedGraphButtonVisible(false);
+          }
         };
 
         const mergeGraphRelations = (left = [], right = []) => {
@@ -1938,35 +2826,30 @@
 
         const syncActionButtons = () => {
           const hasSelectedNode = Boolean(currentSelectedNode());
-          const hasRenderableId = Boolean(selectedRenderableId());
           if (dom.graphFocusButton) {
             dom.graphFocusButton.disabled = !hasSelectedNode;
-          }
-          if (dom.propertiesSelectButton) {
-            dom.propertiesSelectButton.disabled = !hasRenderableId;
-          }
-          if (dom.propertiesHideButton) {
-            dom.propertiesHideButton.disabled = !hasRenderableId;
-          }
-          if (dom.propertiesShowButton) {
-            dom.propertiesShowButton.disabled = !hasRenderableId;
           }
         };
 
         const renderProperties = () => {
+          state.activePickHasHit = false;
+          state.pickedDbNodeId = null;
+          setPickedGraphButtonVisible(false);
           const node = currentSelectedNode();
           if (!node) {
-          dom.propertiesTitle.textContent = "No graph node selected";
+            dom.propertiesTitle.textContent = "No graph node selected";
             dom.propertiesSubtitle.textContent =
-              "Select a graph node to inspect its layout, ids, and attached metadata.";
+              "Pick an object or select a graph node to inspect IFC properties.";
             dom.propertiesEmptyState.hidden = false;
-            dom.propertiesCoreSection.hidden = true;
-            dom.propertiesExtraSection.hidden = true;
-            dom.propertiesRelationsSection.hidden = true;
+            dom.propertiesEmptyState.textContent = "Pick an object in the model to inspect its IFC properties.";
+            resetPropertySections();
             syncActionButtons();
             return;
           }
 
+          state.pickedSemanticId = null;
+          state.pickedDbNodeId = null;
+          setPickedGraphButtonVisible(false);
           dom.propertiesTitle.textContent = graphNodeText(node);
           const currentResource = safeViewerCurrentResource(viewer);
           dom.propertiesSubtitle.textContent = currentResource
@@ -1981,10 +2864,6 @@
           const globalId = tryGetFirst(node, ["globalId"]);
           if (globalId) {
             coreRows.push(["GlobalId", String(globalId)]);
-          }
-          const semanticId = graphNodeSemanticId(node);
-          if (semanticId) {
-            coreRows.push(["Semantic id", String(semanticId)]);
           }
           const degree = tryGetFirst(node, ["degree"]);
           if (degree !== null) {
@@ -2023,11 +2902,42 @@
           syncActionButtons();
         };
 
+        const renderPickProperties = (detail) => {
+          const hits = Array.isArray(detail?.hits) ? detail.hits : [];
+          const hit = hits[0] || null;
+          const requestId = state.pickDetailsRequestId + 1;
+          state.pickDetailsRequestId = requestId;
+          state.activePickHasHit = Boolean(hit);
+          state.selectedNodeId = null;
+          state.pickedSemanticId = hit?.elementId ? String(hit.elementId) : null;
+          state.pickedDbNodeId = null;
+          setPickedGraphButtonVisible(false);
+          applySelectionToSigma(null);
+          renderFallbackList();
+
+          if (!hit) {
+            dom.propertiesTitle.textContent = "No element picked";
+            dom.propertiesSubtitle.textContent = "No visible instance was found at that pixel.";
+            dom.propertiesEmptyState.hidden = false;
+            dom.propertiesEmptyState.textContent = "No visible IFC element was found at that pixel.";
+            resetPropertySections();
+            syncActionButtons();
+            return;
+          }
+
+          dom.propertiesTitle.textContent = "Loading IFC properties";
+          dom.propertiesSubtitle.textContent = hit.elementId ? `id: ${hit.elementId}` : "id unavailable";
+          dom.propertiesEmptyState.hidden = true;
+          resetPropertySections();
+          void loadPickedElementDetails(hit, requestId);
+          syncActionButtons();
+        };
+
         const renderFallbackList = () => {
           if (!dom.graphFallbackList) {
             return;
           }
-          if (state.rendererReady) {
+          if (!state.rendererFailed) {
             dom.graphFallbackList.hidden = true;
             return;
           }
@@ -2175,6 +3085,7 @@
             }
             pass += 1;
           }
+          placeRelationshipDots(nodes, positions);
 
           return positions;
         };
@@ -2227,8 +3138,17 @@
           ) {
             for (const node of state.nodes) {
               const key = graphNodeKey(node);
-              const nextLabel = graphNodeRenderLabel(node, shouldExpandNodeLabels);
-              const nextForceLabel = graphNodeShouldForceLabel(node, ratio);
+              const nextLabel = graphNodeRenderLabel(
+                node,
+                shouldExpandNodeLabels,
+                ratio,
+                state.selectedNodeId
+              );
+              const nextForceLabel = graphNodeShouldForceLabel(
+                node,
+                ratio,
+                state.selectedNodeId
+              );
               if (state.graphModel.getNodeAttribute(key, "label") !== nextLabel) {
                 state.graphModel.setNodeAttribute(key, "label", nextLabel);
                 needsRefresh = true;
@@ -2256,13 +3176,29 @@
           for (const node of state.nodes) {
             const key = graphNodeKey(node);
             const selected = key === nodeId;
+            const emphasized = selected || graphRelationshipDotTouchesSelected(node, nodeId);
             if (typeof state.graphModel.setNodeAttribute === "function") {
               state.graphModel.setNodeAttribute(key, "color", graphNodeColor(node, selected));
-              state.graphModel.setNodeAttribute(key, "size", graphNodeSize(node, selected));
+              state.graphModel.setNodeAttribute(key, "size", graphNodeSize(node, emphasized));
+              state.graphModel.setNodeAttribute(key, "zIndex", graphNodeZIndex(node, selected));
               state.graphModel.setNodeAttribute(
                 key,
                 "label",
-                graphNodeRenderLabel(node, state.nodeLabelsExpanded)
+                graphNodeRenderLabel(
+                  node,
+                  state.nodeLabelsExpanded,
+                  Number.POSITIVE_INFINITY,
+                  nodeId
+                )
+              );
+              state.graphModel.setNodeAttribute(
+                key,
+                "forceLabel",
+                graphNodeShouldForceLabel(
+                  node,
+                  Number.POSITIVE_INFINITY,
+                  nodeId
+                )
               );
             }
           }
@@ -2482,9 +3418,15 @@
 
             for (let leftIndex = 0; leftIndex < nodeKeys.length; leftIndex += 1) {
               const leftKey = nodeKeys[leftIndex];
+              if (graphIsRelationshipDot(nodesByKey.get(leftKey))) {
+                continue;
+              }
               const leftPosition = positions.get(leftKey);
               for (let rightIndex = leftIndex + 1; rightIndex < nodeKeys.length; rightIndex += 1) {
                 const rightKey = nodeKeys[rightIndex];
+                if (graphIsRelationshipDot(nodesByKey.get(rightKey))) {
+                  continue;
+                }
                 const rightPosition = positions.get(rightKey);
                 let dx = leftPosition.x - rightPosition.x;
                 let dy = leftPosition.y - rightPosition.y;
@@ -2506,6 +3448,9 @@
             }
 
             for (const edge of state.edges) {
+              if (tryGetFirst(edge, ["isRelationshipSegment"])) {
+                continue;
+              }
               const sourceKey = String(tryGetFirst(edge, ["source", "from", "sourceId"]) || "");
               const targetKey = String(tryGetFirst(edge, ["target", "to", "targetId"]) || "");
               if (!positions.has(sourceKey) || !positions.has(targetKey)) {
@@ -2520,8 +3465,8 @@
               const targetNode = nodesByKey.get(targetKey);
               const desiredLength =
                 graphIsRelationshipNode(sourceNode) || graphIsRelationshipNode(targetNode)
-                  ? 2.2
-                  : 2.95;
+                  ? 2.45
+                  : 3.1;
               const force = (distance - desiredLength) * attraction;
               const fx = (dx / distance) * force;
               const fy = (dy / distance) * force;
@@ -2535,6 +3480,10 @@
             const stepLimit = stepStart * cooling + 0.03;
             for (const key of nodeKeys) {
               if (pinnedNodeIds.has(key)) {
+                continue;
+              }
+              const node = nodesByKey.get(key);
+              if (graphIsRelationshipDot(node)) {
                 continue;
               }
               const position = positions.get(key);
@@ -2553,7 +3502,9 @@
                 position.y += delta.y * scale;
               }
             }
+            placeRelationshipDots(state.nodes, positions);
           }
+          placeRelationshipDots(state.nodes, positions);
 
           for (const key of nodeKeys) {
             if (pinnedNodeIds.has(key) && state.layoutPositions.has(key)) {
@@ -2584,13 +3535,26 @@
           const newNodeKeys = new Set();
           for (const [index, node] of state.nodes.entries()) {
             const key = graphNodeKey(node, index);
+            const selected = key === state.selectedNodeId;
+            const emphasized = selected ||
+              graphRelationshipDotTouchesSelected(node, state.selectedNodeId);
             if (!state.graphModel.hasNode(key)) {
               const position = incrementalGraphNodePosition(node, index);
               state.graphModel.addNode(key, {
-                label: graphNodeRenderLabel(node, state.nodeLabelsExpanded),
-                forceLabel: graphNodeShouldForceLabel(node, GRAPH_NODE_FORCE_LABEL_MAX_RATIO),
-                size: graphNodeSize(node, key === state.selectedNodeId),
-                color: graphNodeColor(node, key === state.selectedNodeId),
+                label: graphNodeRenderLabel(
+                  node,
+                  state.nodeLabelsExpanded,
+                  Number.POSITIVE_INFINITY,
+                  state.selectedNodeId
+                ),
+                forceLabel: graphNodeShouldForceLabel(
+                  node,
+                  GRAPH_NODE_FORCE_LABEL_MAX_RATIO,
+                  state.selectedNodeId
+                ),
+                size: graphNodeSize(node, emphasized),
+                color: graphNodeColor(node, selected),
+                zIndex: graphNodeZIndex(node, selected),
                 x: position.x,
                 y: position.y,
               });
@@ -2599,26 +3563,41 @@
               state.graphModel.setNodeAttribute(
                 key,
                 "label",
-                graphNodeRenderLabel(node, state.nodeLabelsExpanded)
+                graphNodeRenderLabel(
+                  node,
+                  state.nodeLabelsExpanded,
+                  Number.POSITIVE_INFINITY,
+                  state.selectedNodeId
+                )
               );
               state.graphModel.setNodeAttribute(
                 key,
                 "forceLabel",
-                graphNodeShouldForceLabel(node, GRAPH_NODE_FORCE_LABEL_MAX_RATIO)
+                graphNodeShouldForceLabel(
+                  node,
+                  GRAPH_NODE_FORCE_LABEL_MAX_RATIO,
+                  state.selectedNodeId
+                )
               );
               state.graphModel.setNodeAttribute(
                 key,
                 "size",
-                graphNodeSize(node, key === state.selectedNodeId)
+                graphNodeSize(node, emphasized)
               );
               state.graphModel.setNodeAttribute(
                 key,
                 "color",
-                graphNodeColor(node, key === state.selectedNodeId)
+                graphNodeColor(node, selected)
+              );
+              state.graphModel.setNodeAttribute(
+                key,
+                "zIndex",
+                graphNodeZIndex(node, selected)
               );
             }
           }
 
+          const edgePositions = graphNodePositionsFromModel(state.graphModel, state.nodes);
           for (const [index, edge] of state.edges.entries()) {
             const source = String(tryGetFirst(edge, ["source", "from", "sourceId"]));
             const target = String(tryGetFirst(edge, ["target", "to", "targetId"]));
@@ -2632,10 +3611,20 @@
             state.graphModel.addEdgeWithKey(key, source, target, {
               color: "rgba(141, 182, 255, 0.32)",
               size: 1.45,
-              label: tryGetFirst(edge, ["type", "label"]),
+              label: graphEdgeRenderLabel(edge),
               forceLabel: true,
+              isRelationshipPath: Boolean(tryGetFirst(edge, ["isRelationshipPath"])),
+              isRelationshipSegment: Boolean(tryGetFirst(edge, ["isRelationshipSegment"])),
+              edgeId: tryGetFirst(edge, ["edgeId", "id", "key"]),
+              relationshipEdgeId: tryGetFirst(edge, ["relationshipEdgeId"]),
+              relationshipSegment: tryGetFirst(edge, ["relationshipSegment"]),
+              relationNodeId: tryGetFirst(edge, ["relationNodeId"]),
+              relationshipSource: tryGetFirst(edge, ["relationshipSource"]),
+              relationshipTarget: tryGetFirst(edge, ["relationshipTarget"]),
+              relationSiblingIndex: tryGetFirst(edge, ["relationSiblingIndex"]),
+              relationSiblingCount: tryGetFirst(edge, ["relationSiblingCount"]),
               type: "curvedArrow",
-              curvature: graphEdgeCurvature(edge, index),
+              curvature: graphEdgeCurvatureForPositions(edge, index, edgePositions),
             });
           }
 
@@ -2662,16 +3651,29 @@
           }
 
           try {
-            const graph = new state.renderer.GraphConstructor();
+            const graph = new state.renderer.GraphConstructor({ multi: true });
             const layout = computeStableGraphLayout(state.nodes, state.edges, previousPositions);
             for (const [index, node] of state.nodes.entries()) {
               const key = graphNodeKey(node, index);
               const position = layout.get(key) || graphNodePosition(node, index, state.nodes.length);
+              const selected = key === state.selectedNodeId;
+              const emphasized = selected ||
+                graphRelationshipDotTouchesSelected(node, state.selectedNodeId);
               graph.addNode(key, {
-                label: graphNodeRenderLabel(node, false),
-                forceLabel: graphNodeShouldForceLabel(node, GRAPH_NODE_FORCE_LABEL_MAX_RATIO),
-                size: graphNodeSize(node, key === state.selectedNodeId),
-                color: graphNodeColor(node, key === state.selectedNodeId),
+                label: graphNodeRenderLabel(
+                  node,
+                  false,
+                  Number.POSITIVE_INFINITY,
+                  state.selectedNodeId
+                ),
+                forceLabel: graphNodeShouldForceLabel(
+                  node,
+                  GRAPH_NODE_FORCE_LABEL_MAX_RATIO,
+                  state.selectedNodeId
+                ),
+                size: graphNodeSize(node, emphasized),
+                color: graphNodeColor(node, selected),
+                zIndex: graphNodeZIndex(node, selected),
                 x: position.x,
                 y: position.y,
               });
@@ -2689,10 +3691,20 @@
               graph.addEdgeWithKey(key, source, target, {
                 color: "rgba(141, 182, 255, 0.32)",
                 size: 1.45,
-                label: tryGetFirst(edge, ["type", "label"]),
+                label: graphEdgeRenderLabel(edge),
                 forceLabel: true,
+                isRelationshipPath: Boolean(tryGetFirst(edge, ["isRelationshipPath"])),
+                isRelationshipSegment: Boolean(tryGetFirst(edge, ["isRelationshipSegment"])),
+                edgeId: tryGetFirst(edge, ["edgeId", "id", "key"]),
+                relationshipEdgeId: tryGetFirst(edge, ["relationshipEdgeId"]),
+                relationshipSegment: tryGetFirst(edge, ["relationshipSegment"]),
+                relationNodeId: tryGetFirst(edge, ["relationNodeId"]),
+                relationshipSource: tryGetFirst(edge, ["relationshipSource"]),
+                relationshipTarget: tryGetFirst(edge, ["relationshipTarget"]),
+                relationSiblingIndex: tryGetFirst(edge, ["relationSiblingIndex"]),
+                relationSiblingCount: tryGetFirst(edge, ["relationSiblingCount"]),
                 type: "curvedArrow",
-                curvature: graphEdgeCurvature(edge, index),
+                curvature: graphEdgeCurvatureForPositions(edge, index, layout),
               });
             }
             state.graphModel = graph;
@@ -2711,11 +3723,7 @@
               edgeLabelColor: { color: "rgba(224, 233, 255, 0.9)" },
               edgeLabelSize: 10,
               edgeLabelWeight: "500",
-              edgeLabelRenderer: createDrawCurvedEdgeLabel({
-                curvatureAttribute: "curvature",
-                defaultCurvature: DEFAULT_EDGE_CURVATURE * 0.68,
-                keepLabelUpright: true,
-              }),
+              defaultDrawEdgeLabel: DrawCurvedGraphEdgeLabel,
               renderEdgeLabels: true,
               zIndex: true,
             });
@@ -2765,6 +3773,7 @@
               });
             }
           } catch (error) {
+            console.warn("Graph renderer unavailable", error);
             disposeSigma();
             state.rendererReady = false;
             state.rendererFailed = true;
@@ -2772,6 +3781,7 @@
               `Graph renderer unavailable. Falling back to list view. (${error})`,
               "warn"
             );
+            renderFallbackList();
           }
         };
 
@@ -2849,7 +3859,7 @@
           setStatus(summary, payload.truncated ? "warn" : "info");
         };
 
-        const focusSelectedNode = () => {
+        const focusSelectedNode = (options = {}) => {
           const node = currentSelectedNode();
           if (!node || !state.graphModel || !state.sigma) {
             return null;
@@ -2863,15 +3873,27 @@
           }
           const attributes = state.graphModel.getNodeAttributes(key);
           const camera = state.sigma.getCamera();
-          if (camera && typeof camera.animate === "function") {
+          let cameraCenter = {
+            x: attributes.x,
+            y: attributes.y,
+          };
+          if (typeof state.sigma.normalizationFunction === "function") {
+            cameraCenter = state.sigma.normalizationFunction(cameraCenter);
+          }
+          const nextCameraState = {
+            x: cameraCenter.x,
+            y: cameraCenter.y,
+            ratio: options.ratio ?? 0.55,
+          };
+          if (options.instant && camera && typeof camera.setState === "function") {
+            camera.setState(nextCameraState);
+          } else if (camera && typeof camera.animate === "function") {
             camera.animate(
-              {
-                x: attributes.x,
-                y: attributes.y,
-                ratio: 0.55,
-              },
+              nextCameraState,
               { duration: 220 }
             );
+          } else if (camera && typeof camera.setState === "function") {
+            camera.setState(nextCameraState);
           }
           return key;
         };
@@ -2914,12 +3936,21 @@
             const nextId =
               nodeId === null || nodeId === undefined ? null : String(nodeId);
             state.selectedNodeId = nextId && state.nodesById.has(nextId) ? nextId : null;
+            state.pickedSemanticId = null;
             renderFallbackList();
             applySelectionToSigma(state.selectedNodeId);
             renderProperties();
             syncActionButtons();
             if (options.revealProperties) {
-              setActiveTab("properties");
+              if (state.selectedNodeId) {
+                if (Number.isFinite(options.clientX) && Number.isFinite(options.clientY)) {
+                  showPropertiesBalloonAtClientPoint(options.clientX, options.clientY);
+                } else {
+                  showPropertiesBalloonAtViewportCenter();
+                }
+              } else {
+                hidePropertiesBalloon();
+              }
             }
             if (options.syncViewer) {
               performSelectedViewerAction("select");
@@ -2965,12 +3996,16 @@
             state.edges = [];
             state.nodesById = new Map();
             state.selectedNodeId = null;
+            state.pickedSemanticId = null;
+            state.pickedDbNodeId = null;
+            setPickedGraphButtonVisible(false);
             state.expandedNodeIds = new Set();
             state.layoutPositions = new Map();
             state.cameraState = null;
             disposeSigma();
             syncGraphSurface();
             renderProperties();
+            hidePropertiesBalloon();
             if (!options.silent) {
               setStatus(
                 `Graph cleared for ${safeViewerCurrentResource(viewer) || "the current resource"}. Use graph.reset(...) to seed a new view.`
@@ -3126,6 +4161,38 @@
             }
             return result ?? api.snapshot();
           },
+          async seedFromNode(nodeId, options = {}) {
+            const numericNodeId = Number.parseInt(String(nodeId), 10);
+            if (!Number.isFinite(numericNodeId)) {
+              setStatus("Graph needs a valid DB node id for the picked element.", "warn");
+              return {
+                seeded: false,
+                reason: "Invalid DB node id.",
+              };
+            }
+            window.wHeader?.showGraph?.();
+            await waitForAnimationFrames(2);
+            requestGraphResize();
+            await api.mode(options.mode || "semantic");
+            const result = await api.expand([numericNodeId], {
+              replace: true,
+              hops: options.hops ?? 2,
+              maxNodes: options.maxNodes ?? 80,
+              maxEdges: options.maxEdges ?? 160,
+            });
+            api.setSelectedNode(numericNodeId);
+            await waitForAnimationFrames(2);
+            requestGraphResize();
+            focusSelectedNode({ instant: true, ratio: options.ratio ?? 0.55 });
+            setTimeout(() => {
+              focusSelectedNode({ instant: true, ratio: options.ratio ?? 0.55 });
+              requestGraphResize();
+            }, 90);
+            requestAnimationFrame(() => {
+              focusSelectedNode({ instant: true, ratio: options.ratio ?? 0.55 });
+            });
+            return result;
+          },
           async focusSelected() {
             setActiveTab("graph");
             return focusSelectedNode();
@@ -3164,16 +4231,42 @@
           void api.focusSelected();
         });
 
-        dom.propertiesSelectButton?.addEventListener("click", () => {
-          performSelectedViewerAction("select");
+        dom.propertiesGraphButton?.addEventListener("click", () => {
+          const nodeId = state.pickedDbNodeId || state.selectedNodeId;
+          if (!nodeId) {
+            setStatus("Pick an IFC element before opening its graph neighborhood.", "warn");
+            return;
+          }
+          void api.seedFromNode(nodeId).catch((error) => {
+            setStatus(`Graph lookup failed: ${error.message || error}`, "error");
+          });
         });
 
-        dom.propertiesHideButton?.addEventListener("click", () => {
-          performSelectedViewerAction("hide");
+        dom.propertiesCloseButton?.addEventListener("click", hidePropertiesBalloon);
+
+        window.addEventListener("w-viewer-pick", (event) => {
+          renderPickProperties(event.detail || {});
+          const anchor = pickRegionClientCenter(event.detail || {});
+          if (anchor) {
+            showPropertiesBalloonAtClientPoint(anchor.x, anchor.y);
+          } else {
+            showPropertiesBalloonAtViewportCenter();
+          }
         });
 
-        dom.propertiesShowButton?.addEventListener("click", () => {
-          performSelectedViewerAction("show");
+        window.addEventListener("w-viewer-anchor", (event) => {
+          const detail = event.detail || {};
+          if (!detail.visible) {
+            hidePickAnchorMarker();
+            if (state.activePickHasHit) {
+              hidePropertiesBalloon();
+            }
+            return;
+          }
+          showPropertiesBalloonAtClientPoint(detail.clientX, detail.clientY, {
+            anchored: true,
+            marker: true,
+          });
         });
 
         dom.resourcePicker?.addEventListener("change", () => {
@@ -3202,8 +4295,9 @@
           state.rendererReady = true;
           state.rendererFailed = false;
           if (state.nodes.length) {
-            renderSigmaGraph();
+            syncGraphSurface();
           } else {
+            renderFallbackList();
             setStatus(
               "Graph explorer ready. Use graph.reset(...) to seed the panel from the terminal."
             );
@@ -3314,6 +4408,66 @@
           });
         }
 
+        const relationGroups = new Map();
+        const passthroughEdges = [];
+        const relationshipDirectionIsKnown = (direction) =>
+          direction === "from_relation" || direction === "to_relation";
+        const relationGroupKey = (edge) => {
+          const relationDbNodeId = tryGetFirst(edge, ["relationNodeDbNodeId", "relationNodeId"]);
+          if (relationDbNodeId === null || relationDbNodeId === undefined) {
+            return null;
+          }
+          const text = String(relationDbNodeId).trim();
+          return text ? `rel:${text}` : null;
+        };
+        const registerRelationEndpoint = (group, edge, endpoint, endpointNodeId) => {
+          const direction = relationshipEndpointDirection(edge, endpoint);
+          if (!relationshipDirectionIsKnown(direction)) {
+            return;
+          }
+          const key = String(endpointNodeId);
+          const role = relationshipEndpointRole(edge, endpoint);
+          const previous = group.endpoints.get(key);
+          if (!previous) {
+            group.endpoints.set(key, {
+              nodeId: key,
+              direction,
+              roles: role ? new Set([role]) : new Set(),
+            });
+            return;
+          }
+          if (previous.direction !== direction) {
+            previous.direction = "";
+          }
+          if (role) {
+            previous.roles.add(role);
+          }
+        };
+        for (const edge of rawEdges) {
+          const relationshipType = String(edge.relationshipType || edge.type || "RELATION");
+          const source = String(edge.sourceDbNodeId);
+          const target = String(edge.targetDbNodeId);
+          const groupKey = relationshipType.startsWith("IfcRel") ? relationGroupKey(edge) : null;
+          if (!groupKey) {
+            passthroughEdges.push(edge);
+            continue;
+          }
+          const relationDbNodeId = tryGetFirst(edge, ["relationNodeDbNodeId", "relationNodeId"]);
+          if (!relationGroups.has(groupKey)) {
+            relationGroups.set(groupKey, {
+              nodeId: groupKey,
+              relationDbNodeId,
+              relationshipType,
+              edgeIds: new Set(),
+              endpoints: new Map(),
+            });
+          }
+          const group = relationGroups.get(groupKey);
+          group.edgeIds.add(edge.edgeId || groupKey);
+          registerRelationEndpoint(group, edge, "source", source);
+          registerRelationEndpoint(group, edge, "target", target);
+        }
+
         const nodes = (Array.isArray(payload?.nodes) ? payload.nodes : []).map((node) => ({
           id: String(node.dbNodeId),
           dbNodeId: node.dbNodeId,
@@ -3330,6 +4484,7 @@
           },
           relations: relationBuckets.get(String(node.dbNodeId)) || [],
         }));
+        const nodesById = new Map(nodes.map((node) => [String(node.dbNodeId), node]));
 
         const labelsById = new Map(nodes.map((node) => [String(node.dbNodeId), graphNodeText(node)]));
         for (const node of nodes) {
@@ -3341,14 +4496,124 @@
           }
         }
 
-        const edges = rawEdges.map((edge) => ({
-          id: edge.edgeId,
-          edgeId: edge.edgeId,
-          source: String(edge.sourceDbNodeId),
-          target: String(edge.targetDbNodeId),
-          type: edge.relationshipType,
-          label: edge.relationshipType,
+        const edges = [];
+        const relationPairCounts = new Map();
+        const relationPairIndexes = new Map();
+        const relationGroupEntries = Array.from(relationGroups.values()).map((group) => ({
+          ...group,
+          endpoints: Array.from(group.endpoints.values())
+            .filter((endpoint) => relationshipDirectionIsKnown(endpoint.direction))
+            .sort((left, right) => left.nodeId.localeCompare(right.nodeId)),
         }));
+        for (const group of relationGroupEntries) {
+          if (group.endpoints.length !== 2) {
+            continue;
+          }
+          const pairKey = `${group.endpoints[0].nodeId}->${group.endpoints[1].nodeId}`;
+          relationPairCounts.set(pairKey, (relationPairCounts.get(pairKey) || 0) + 1);
+        }
+
+        for (const group of relationGroupEntries) {
+          if (group.endpoints.length < 2) {
+            continue;
+          }
+          const endpointIds = group.endpoints.map((endpoint) => endpoint.nodeId);
+          const [primarySource, primaryTarget] = endpointIds;
+          const selectedCandidate = String(
+            options.selectedNodeId ??
+              (Array.isArray(payload?.seedNodeIds) ? payload.seedNodeIds[0] : "") ??
+              ""
+          );
+          const displaySource =
+            endpointIds.includes(selectedCandidate) ? selectedCandidate : primarySource;
+          const materialEndpoint = group.endpoints.find(
+            (endpoint) => graphNodeEntity(nodesById.get(endpoint.nodeId)) === "IfcMaterial"
+          );
+          const displayTarget =
+            materialEndpoint && materialEndpoint.nodeId !== displaySource
+              ? materialEndpoint.nodeId
+              : endpointIds.find((nodeId) => nodeId !== displaySource) || primaryTarget;
+          const pairKey = group.endpoints.length === 2 ? `${primarySource}->${primaryTarget}` : "";
+          const relationSiblingIndex = pairKey ? relationPairIndexes.get(pairKey) || 0 : 0;
+          if (pairKey) {
+            relationPairIndexes.set(pairKey, relationSiblingIndex + 1);
+          }
+          const relationSiblingCount = pairKey ? relationPairCounts.get(pairKey) || 1 : 1;
+          const endpointHops = group.endpoints
+            .map((endpoint) => Number(tryGetFirst(nodesById.get(endpoint.nodeId), ["properties"])?.hopDistance))
+            .filter(Number.isFinite);
+          nodes.push({
+            id: group.nodeId,
+            label: group.relationshipType,
+            name: null,
+            displayName: group.relationshipType,
+            entity: group.relationshipType,
+            globalId: null,
+            semanticElementId: null,
+            degree: group.endpoints.length,
+            properties: {
+              hopDistance: (endpointHops.length ? Math.min(...endpointHops) : 0) + 0.5,
+              isSeed: false,
+              isRelationshipDot: true,
+              relationshipType: group.relationshipType,
+              relationDbNodeId: group.relationDbNodeId,
+              edgeId: group.nodeId,
+              endpoints: endpointIds,
+              source: displaySource,
+              target: displayTarget,
+              relationSiblingIndex,
+              relationSiblingCount,
+            },
+            relations: group.endpoints.map((endpoint) => ({
+              type: group.relationshipType,
+              target: endpoint.nodeId,
+              targetLabel: labelsById.get(endpoint.nodeId) || endpoint.nodeId,
+            })),
+          });
+          for (const endpoint of group.endpoints) {
+            const fromRelation = endpoint.direction === "from_relation";
+            const segment =
+              endpoint.nodeId === primarySource
+                ? "source"
+                : endpoint.nodeId === primaryTarget
+                  ? "target"
+                  : "endpoint";
+            const role = Array.from(endpoint.roles).filter(Boolean).join(", ");
+            const edgeId = `${group.nodeId}:${endpoint.nodeId}:${endpoint.direction}`;
+            edges.push({
+              id: edgeId,
+              edgeId,
+              source: fromRelation ? group.nodeId : endpoint.nodeId,
+              target: fromRelation ? endpoint.nodeId : group.nodeId,
+              type: "",
+              label: "",
+              role,
+              relationshipType: group.relationshipType,
+              isRelationshipSegment: true,
+              relationshipSegment: segment,
+              relationshipEdgeId: group.nodeId,
+              relationNodeId: group.nodeId,
+              relationshipSource: group.endpoints.length === 2 ? primarySource : "",
+              relationshipTarget: group.endpoints.length === 2 ? primaryTarget : "",
+              relationSiblingIndex,
+              relationSiblingCount,
+            });
+          }
+        }
+
+        for (const edge of passthroughEdges) {
+          const source = String(edge.sourceDbNodeId);
+          const target = String(edge.targetDbNodeId);
+          const relationshipType = String(edge.relationshipType || edge.type || "RELATION");
+          edges.push({
+            id: edge.edgeId,
+            edgeId: edge.edgeId,
+            source,
+            target,
+            type: relationshipType,
+            label: relationshipType,
+          });
+        }
 
         return {
           nodes,
@@ -3408,7 +4673,7 @@
               status: `Graph reset from ${seedNodeIds.length} seed node${seedNodeIds.length === 1 ? "" : "s"} in ${resource}${payload.truncated ? " (truncated)" : ""}.`,
             });
           },
-          async expand({ nodeIds, resource = currentIfcResource(), mode }) {
+          async expand({ nodeIds, resource = currentIfcResource(), mode, options = {} }) {
             resource = currentIfcResource(resource);
             const seedNodeIds = (Array.isArray(nodeIds) ? nodeIds : [nodeIds])
               .map((value) => Number.parseInt(String(value), 10))
@@ -3421,9 +4686,9 @@
             const payload = await viewer.queryGraphSubgraph(
               seedNodeIds,
               {
-                hops: 1,
-                maxNodes: 120,
-                maxEdges: 240,
+                hops: options.hops ?? 1,
+                maxNodes: options.maxNodes ?? 120,
+                maxEdges: options.maxEdges ?? 240,
                 mode,
               },
               resource
@@ -4524,6 +5789,10 @@
           return null;
         }
 
+        void loadAgentCapabilities().catch((error) => {
+          console.warn("AI capabilities unavailable", error);
+        });
+
         shell = {
           ...baseShell,
           activate() {
@@ -5059,9 +6328,11 @@
           const viewer = createViewerApi();
           const graphShell = createGraphShell(viewer);
           graphShell.api.installController(createGraphController(viewer));
+          const headerControls = installHeaderControls(viewer, graphShell);
           const repl = createReplApi(viewer, graphShell.api);
           window.wViewer = viewer;
           window.viewer = viewer;
+          window.wHeader = headerControls;
           window.wGraph = graphShell.api;
           window.graph = graphShell.api;
           window.wGraphShell = graphShell.bridge;

@@ -16,7 +16,9 @@ use cc_w_types::{
 };
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_WEB_RESOURCE: &str = "demo/revolved-solid";
+#[cfg(target_arch = "wasm32")]
+const DEFAULT_WEB_RESOURCE: &str = "ifc/building-architecture";
+const DEFAULT_DEMO_RESOURCE: &str = "demo/revolved-solid";
 #[cfg(target_arch = "wasm32")]
 const WEB_GEOMETRY_BATCH_CHUNK_SIZE: usize = 5_000;
 
@@ -174,7 +176,7 @@ pub struct WebPreparedVertex {
 }
 
 pub fn demo_summary_string() -> String {
-    match build_demo_asset(DEFAULT_WEB_RESOURCE) {
+    match build_demo_asset(DEFAULT_DEMO_RESOURCE) {
         Ok(asset) => asset.summary_line(),
         Err(error) => format!("w web demo failed: {error}"),
     }
@@ -736,23 +738,27 @@ fn map_geometry_backend_error(error: GeometryBackendError) -> GeometryPackageSou
 #[cfg(target_arch = "wasm32")]
 use cc_w_backend::available_demo_resources;
 #[cfg(target_arch = "wasm32")]
-use cc_w_render::{Camera, DepthTarget, MeshRenderer, ViewportSize, fit_camera_to_render_scene};
+use cc_w_render::{
+    Camera, DepthTarget, MeshRenderer, RenderDefaults, ViewportSize, fit_camera_to_render_scene,
+    pick_prepared_scene_cpu,
+};
 #[cfg(target_arch = "wasm32")]
 use cc_w_types::{PickHit, PickRegion, PreparedRenderScene, WORLD_FORWARD, WORLD_RIGHT, WORLD_UP};
 #[cfg(target_arch = "wasm32")]
-use glam::{DVec3, Vec2};
+use glam::{DMat4, DVec3, DVec4, Vec2};
 #[cfg(target_arch = "wasm32")]
-use js_sys::{Array, Promise, decode_uri_component};
+use js_sys::{Array, JSON, Promise, decode_uri_component};
 #[cfg(target_arch = "wasm32")]
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::HashSet, rc::Rc};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{JsCast, closure::Closure, prelude::*};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 #[cfg(target_arch = "wasm32")]
 use web_sys::{
-    CanvasRenderingContext2d, Document, Element, Event, HtmlCanvasElement, HtmlElement,
-    HtmlSelectElement, MouseEvent, RequestInit, Response, WheelEvent, Window,
+    CanvasRenderingContext2d, CustomEvent, CustomEventInit, Document, Element, Event,
+    HtmlCanvasElement, HtmlElement, HtmlSelectElement, MouseEvent, RequestInit, Response,
+    WheelEvent, Window,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -792,6 +798,8 @@ struct WebPickHit {
     instance_id: u64,
     element_id: String,
     definition_id: u64,
+    world_centroid: [f64; 3],
+    world_anchor: [f64; 3],
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -813,11 +821,23 @@ struct WebPickRegion {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn fallback_demo_resources() -> Vec<String> {
-    available_demo_resources()
-        .into_iter()
-        .map(|resource| resource.to_string())
-        .collect()
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebPickAnchorEvent {
+    visible: bool,
+    client_x: f64,
+    client_y: f64,
+    canvas_x: f64,
+    canvas_y: f64,
+    element_id: String,
+    instance_id: u64,
+    definition_id: u64,
+    world_anchor: [f64; 3],
+}
+
+#[cfg(target_arch = "wasm32")]
+fn fallback_web_resources() -> Vec<String> {
+    vec![DEFAULT_WEB_RESOURCE.to_string()]
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -835,16 +855,21 @@ fn is_file_protocol(window: &Window) -> bool {
 #[cfg(target_arch = "wasm32")]
 async fn fetch_available_resources(window: &Window) -> Result<Vec<String>, String> {
     if is_file_protocol(window) {
-        return Ok(fallback_demo_resources());
+        return Ok(fallback_web_resources());
     }
 
     let text = fetch_server_text(window, "/api/resources", "GET", None).await?;
     let catalog: WebResourceCatalog = serde_json::from_str(&text)
         .map_err(|error| format!("invalid /api/resources JSON: {error}"))?;
-    if catalog.resources.is_empty() {
+    let resources = catalog
+        .resources
+        .into_iter()
+        .filter(|resource| resource.starts_with("ifc/"))
+        .collect::<Vec<_>>();
+    if resources.is_empty() {
         return Err("server returned an empty resource catalog".to_string());
     }
-    Ok(catalog.resources)
+    Ok(resources)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1398,6 +1423,7 @@ async fn pick_region_in_state(
     app_state: Rc<RefCell<WebViewerState>>,
     request: WebPickRequest,
 ) -> Result<String, String> {
+    let window = app_state.borrow().window.clone();
     let prepared = {
         let mut state = app_state.borrow_mut();
         state.prepare_pick_readback(request)?
@@ -1417,19 +1443,142 @@ async fn pick_region_in_state(
     drop(mapped);
     prepared.readback.unmap();
 
-    let result = MeshRenderer::decode_pick_pixels_with_targets(
+    JsFuture::from(prepared.depth_map_promise)
+        .await
+        .map_err(|error| format!("GPU pick depth readback failed: {:?}", error))?;
+
+    let depth_mapped = prepared.depth_readback.slice(..).get_mapped_range();
+    let depth_bytes = strip_padded_rows_web(
+        &depth_mapped,
+        prepared.depth_unpadded_bytes_per_row as usize,
+        prepared.depth_padded_bytes_per_row as usize,
+        prepared.region.height as usize,
+    );
+    drop(depth_mapped);
+    prepared.depth_readback.unmap();
+    let depth_values = depth32_values_from_bytes(&depth_bytes)?;
+
+    let mut result = decode_pick_pixels_with_depth(
         prepared.region,
         &rgba8,
         &prepared.pick_targets,
+        &depth_values,
+        prepared.clip_from_world,
+        ViewportSize::new(prepared.viewport_width, prepared.viewport_height),
     );
+    if result.hits.is_empty() {
+        let state = app_state.borrow();
+        let render_scene = state.runtime_scene.compose_render_scene();
+        result = pick_prepared_scene_cpu(
+            &render_scene,
+            state.renderer.camera(),
+            ViewportSize::new(prepared.viewport_width, prepared.viewport_height),
+            prepared.region,
+        );
+    }
     let json = web_pick_response_json(prepared.region, &result.hits)?;
 
-    {
+    let anchor_json = {
         let mut state = app_state.borrow_mut();
         state.apply_pick_hits(result.hits);
-    }
+        state.pick_anchor_event_json()?
+    };
+
+    dispatch_json_event(&window, "w-viewer-pick", &json)?;
+    dispatch_json_event(&window, "w-viewer-anchor", &anchor_json)?;
 
     Ok(json)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn dispatch_json_event(window: &Window, event_name: &str, json: &str) -> Result<(), String> {
+    let detail = JSON::parse(json)
+        .map_err(|error| format!("failed to parse `{event_name}` JSON: {error:?}"))?;
+    let init = CustomEventInit::new();
+    init.set_detail(&detail);
+    let event = CustomEvent::new_with_event_init_dict(event_name, &init).map_err(js_error)?;
+    window.dispatch_event(&event).map_err(js_error)?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn depth32_values_from_bytes(bytes: &[u8]) -> Result<Vec<f32>, String> {
+    if bytes.len() % 4 != 0 {
+        return Err("pick depth readback had a non-f32 byte length".to_string());
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn decode_pick_pixels_with_depth(
+    region: PickRegion,
+    rgba8: &[u8],
+    pick_targets: &[PickHit],
+    depth_values: &[f32],
+    clip_from_world: DMat4,
+    viewport: ViewportSize,
+) -> cc_w_types::PickResult {
+    let mut seen = HashSet::new();
+    let mut hits = Vec::new();
+    let world_from_clip = clip_from_world.inverse();
+
+    for (pixel_index, pixel) in rgba8.chunks_exact(4).enumerate() {
+        let pick_index = decode_web_pick_index(pixel);
+        if pick_index == 0 || !seen.insert(pick_index) {
+            continue;
+        }
+        let Some(target) = pick_targets.get((pick_index - 1) as usize) else {
+            continue;
+        };
+        let mut hit = target.clone();
+        if let Some(depth) = depth_values.get(pixel_index).copied() {
+            if let Some(world_anchor) =
+                unproject_pick_pixel(region, pixel_index, depth, world_from_clip, viewport)
+            {
+                hit.world_anchor = world_anchor;
+            }
+        }
+        hits.push(hit);
+    }
+
+    cc_w_types::PickResult { region, hits }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn decode_web_pick_index(pixel: &[u8]) -> u32 {
+    u32::from(pixel[0])
+        | (u32::from(pixel[1]) << 8)
+        | (u32::from(pixel[2]) << 16)
+        | (u32::from(pixel[3]) << 24)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn unproject_pick_pixel(
+    region: PickRegion,
+    pixel_index: usize,
+    depth: f32,
+    world_from_clip: DMat4,
+    viewport: ViewportSize,
+) -> Option<DVec3> {
+    if !depth.is_finite() {
+        return None;
+    }
+    let viewport = viewport.clamped();
+    let local_x = (pixel_index as u32) % region.width;
+    let local_y = (pixel_index as u32) / region.width;
+    let pixel_x = region.x.saturating_add(local_x);
+    let pixel_y = region.y.saturating_add(local_y);
+    let ndc_x = ((f64::from(pixel_x) + 0.5) / f64::from(viewport.width)) * 2.0 - 1.0;
+    let ndc_y = 1.0 - (((f64::from(pixel_y) + 0.5) / f64::from(viewport.height)) * 2.0);
+    let clip = DVec4::new(ndc_x, ndc_y, f64::from(depth), 1.0);
+    let world = world_from_clip * clip;
+    if world.w.abs() <= f64::EPSILON {
+        return None;
+    }
+    Some(world.truncate() / world.w)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1491,6 +1640,12 @@ fn web_pick_response_json(region: PickRegion, hits: &[PickHit]) -> Result<String
                 instance_id: hit.instance_id.0,
                 element_id: hit.element_id.as_str().to_string(),
                 definition_id: hit.definition_id.0,
+                world_centroid: [
+                    hit.world_centroid.x,
+                    hit.world_centroid.y,
+                    hit.world_centroid.z,
+                ],
+                world_anchor: [hit.world_anchor.x, hit.world_anchor.y, hit.world_anchor.z],
             })
             .collect(),
     };
@@ -1543,9 +1698,9 @@ impl WebViewerApp {
             Ok(resources) => resources,
             Err(error) => {
                 log_viewer_error(&format!(
-                    "w web viewer resource catalog fell back to demo-only resources: {error}"
+                    "w web viewer resource catalog fell back to IFC-only resources: {error}"
                 ));
-                fallback_demo_resources()
+                fallback_web_resources()
             }
         };
         populate_resource_picker(&resource_picker, &resources);
@@ -1585,7 +1740,10 @@ impl WebViewerApp {
         config.height = height;
         surface.configure(&device, &config);
 
-        let defaults = cc_w_render::RenderDefaults::default();
+        let defaults = RenderDefaults {
+            depth_format: wgpu::TextureFormat::Depth32Float,
+            ..RenderDefaults::default()
+        };
         let mut renderer = MeshRenderer::with_defaults(
             &device,
             config.format,
@@ -1779,11 +1937,18 @@ struct WebViewerState {
 #[cfg(target_arch = "wasm32")]
 struct WebPickReadback {
     region: PickRegion,
+    viewport_width: u32,
+    viewport_height: u32,
+    clip_from_world: DMat4,
     pick_targets: Vec<PickHit>,
     readback: wgpu::Buffer,
     map_promise: Promise,
     unpadded_bytes_per_row: u32,
     padded_bytes_per_row: u32,
+    depth_readback: wgpu::Buffer,
+    depth_map_promise: Promise,
+    depth_unpadded_bytes_per_row: u32,
+    depth_padded_bytes_per_row: u32,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1809,6 +1974,7 @@ impl WebViewerState {
         self.current_resource = resource.clone();
         self.resource_picker.set_disabled(false);
         self.resource_picker.set_value(&resource);
+        self.last_pick_hits.clear();
         self.upload_runtime_scene(true);
     }
 
@@ -1831,6 +1997,7 @@ impl WebViewerState {
         self.renderer
             .resize(&self.queue, ViewportSize::new(width, height));
         self.draw_world_axes_overlay()?;
+        self.dispatch_pick_anchor_update()?;
 
         Ok(())
     }
@@ -1845,6 +2012,7 @@ impl WebViewerState {
             self.renderer.set_camera(&self.queue, self.orbit.camera());
         }
         self.refresh_status();
+        let _ = self.dispatch_pick_anchor_update();
     }
 
     fn frame_visible_scene(&mut self) {
@@ -1853,6 +2021,7 @@ impl WebViewerState {
         self.orbit = OrbitCameraController::from_camera(camera);
         self.renderer.set_camera(&self.queue, self.orbit.camera());
         self.refresh_status();
+        let _ = self.dispatch_pick_anchor_update();
     }
 
     fn begin_drag(&mut self, x: f32, y: f32) {
@@ -1877,6 +2046,7 @@ impl WebViewerState {
         }
         self.orbit.orbit_by_pixels(dx, dy);
         self.renderer.set_camera(&self.queue, self.orbit.camera());
+        self.dispatch_pick_anchor_update()?;
         Ok(())
     }
 
@@ -1897,6 +2067,7 @@ impl WebViewerState {
     fn zoom(&mut self, delta_y: f32) -> Result<(), String> {
         self.orbit.zoom_by_wheel(delta_y);
         self.renderer.set_camera(&self.queue, self.orbit.camera());
+        self.dispatch_pick_anchor_update()?;
         Ok(())
     }
 
@@ -2006,12 +2177,30 @@ impl WebViewerState {
             label: Some("w web pick texture view"),
             ..Default::default()
         });
-        let depth_target = DepthTarget::with_defaults(
-            &self.device,
-            ViewportSize::new(self.config.width, self.config.height),
-            self.renderer.defaults(),
-            "w web pick depth target",
-        );
+        let depth_format = self.renderer.defaults().depth_format;
+        if depth_format != wgpu::TextureFormat::Depth32Float {
+            return Err(format!(
+                "pick anchors require Depth32Float readback; renderer uses {depth_format:?}"
+            ));
+        }
+        let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("w web pick depth texture"),
+            size: wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: depth_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("w web pick depth texture view"),
+            ..Default::default()
+        });
         let region = self.clamp_pick_region(region);
         let unpadded_bytes_per_row = region
             .width
@@ -2019,12 +2208,23 @@ impl WebViewerState {
             .ok_or("pick region row is too wide")?;
         let padded_bytes_per_row =
             align_to_web(unpadded_bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let depth_unpadded_bytes_per_row = unpadded_bytes_per_row;
+        let depth_padded_bytes_per_row = padded_bytes_per_row;
         let readback_size = u64::from(padded_bytes_per_row)
             .checked_mul(u64::from(region.height))
             .ok_or("pick region is too large")?;
+        let depth_readback_size = u64::from(depth_padded_bytes_per_row)
+            .checked_mul(u64::from(region.height))
+            .ok_or("pick depth region is too large")?;
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("w web pick readback buffer"),
             size: readback_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let depth_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("w web pick depth readback buffer"),
+            size: depth_readback_size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -2035,7 +2235,7 @@ impl WebViewerState {
                 label: Some("w web pick encoder"),
             });
         self.renderer
-            .render_pick_region(&mut encoder, &view, depth_target.view(), region);
+            .render_pick_region(&mut encoder, &view, &depth_view, region);
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -2061,29 +2261,112 @@ impl WebViewerState {
                 depth_or_array_layers: 1,
             },
         );
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &depth_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: region.x,
+                    y: region.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::DepthOnly,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &depth_readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(depth_padded_bytes_per_row),
+                    rows_per_image: Some(region.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: region.width,
+                height: region.height,
+                depth_or_array_layers: 1,
+            },
+        );
         self.queue.submit([encoder.finish()]);
 
         let map_promise = map_buffer_for_read_web(&readback);
+        let depth_map_promise = map_buffer_for_read_web(&depth_readback);
         let _ = self.device.poll(wgpu::PollType::Poll);
 
         Ok(WebPickReadback {
             region,
+            viewport_width: self.config.width,
+            viewport_height: self.config.height,
+            clip_from_world: self
+                .renderer
+                .camera()
+                .clip_from_world(ViewportSize::new(self.config.width, self.config.height)),
             pick_targets: self.renderer.pick_targets().to_vec(),
             readback,
             map_promise,
             unpadded_bytes_per_row,
             padded_bytes_per_row,
+            depth_readback,
+            depth_map_promise,
+            depth_unpadded_bytes_per_row,
+            depth_padded_bytes_per_row,
         })
     }
 
     fn apply_pick_hits(&mut self, hits: Vec<PickHit>) {
         self.runtime_scene.clear_selection();
-        self.runtime_scene
-            .select_elements(hits.iter().map(|hit| &hit.element_id));
         self.last_pick_hits = hits;
         // Picking should update runtime state only. The ID-color pass is offscreen, and the
-        // visible canvas should keep rendering the normal material scene.
+        // visible canvas should keep rendering the normal material scene. Selection remains an
+        // explicit viewer/API action so picking cannot leak selected-material color into the view.
         self.refresh_status();
+    }
+
+    fn dispatch_pick_anchor_update(&self) -> Result<(), String> {
+        let json = self.pick_anchor_event_json()?;
+        dispatch_json_event(&self.window, "w-viewer-anchor", &json)
+    }
+
+    fn pick_anchor_event_json(&self) -> Result<String, String> {
+        let Some(hit) = self.last_pick_hits.first() else {
+            return Ok(r#"{"visible":false}"#.to_string());
+        };
+        let Some((client_x, client_y, canvas_x, canvas_y)) =
+            self.project_world_to_client(hit.world_anchor)
+        else {
+            return Ok(r#"{"visible":false}"#.to_string());
+        };
+        serde_json::to_string(&WebPickAnchorEvent {
+            visible: true,
+            client_x,
+            client_y,
+            canvas_x,
+            canvas_y,
+            element_id: hit.element_id.as_str().to_string(),
+            instance_id: hit.instance_id.0,
+            definition_id: hit.definition_id.0,
+            world_anchor: [hit.world_anchor.x, hit.world_anchor.y, hit.world_anchor.z],
+        })
+        .map_err(|error| format!("failed to encode pick anchor event JSON: {error}"))
+    }
+
+    fn project_world_to_client(&self, point: DVec3) -> Option<(f64, f64, f64, f64)> {
+        let viewport = ViewportSize::new(self.config.width, self.config.height).clamped();
+        let clip = self.renderer.camera().clip_from_world(viewport)
+            * DVec4::new(point.x, point.y, point.z, 1.0);
+        if clip.w <= f64::EPSILON {
+            return None;
+        }
+        let ndc = clip.truncate() / clip.w;
+        if ndc.z < 0.0 || ndc.z > 1.0 || ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0
+        {
+            return None;
+        }
+        let canvas_x = ((ndc.x + 1.0) * 0.5) * f64::from(viewport.width);
+        let canvas_y = (1.0 - ((ndc.y + 1.0) * 0.5)) * f64::from(viewport.height);
+        let rect = self.canvas_element().get_bounding_client_rect();
+        let client_x = rect.left() + (canvas_x / f64::from(viewport.width)) * rect.width();
+        let client_y = rect.top() + (canvas_y / f64::from(viewport.height)) * rect.height();
+        Some((client_x, client_y, canvas_x, canvas_y))
     }
 
     fn render(&mut self) -> Result<(), String> {
@@ -2742,15 +3025,15 @@ mod tests {
     #[test]
     fn geometry_catalog_response_uses_metadata_only_definition_entries() {
         let package = GeometryBackend::default()
-            .build_demo_package_for(DEFAULT_WEB_RESOURCE)
+            .build_demo_package_for(DEFAULT_DEMO_RESOURCE)
             .expect("demo package should build");
         let response = WebGeometryCatalogResponse::from_geometry_catalog(
-            DEFAULT_WEB_RESOURCE,
+            DEFAULT_DEMO_RESOURCE,
             &package.catalog(),
         );
         let json = serde_json::to_string(&response).expect("catalog response should serialize");
 
-        assert_eq!(response.resource, DEFAULT_WEB_RESOURCE);
+        assert_eq!(response.resource, DEFAULT_DEMO_RESOURCE);
         assert!(!response.catalog.definitions.is_empty());
         assert!(!response.catalog.instances.is_empty());
         assert!(json.contains("vertex_count"));
@@ -2761,12 +3044,12 @@ mod tests {
     #[test]
     fn geometry_batch_requests_convert_to_shared_ids() {
         let instance_request = WebGeometryInstanceBatchRequest {
-            resource: DEFAULT_WEB_RESOURCE.to_owned(),
+            resource: DEFAULT_DEMO_RESOURCE.to_owned(),
             instance_ids: vec![1, 3],
         }
         .to_geometry_instance_batch_request();
         let definition_request = WebGeometryDefinitionBatchRequest {
-            resource: DEFAULT_WEB_RESOURCE.to_owned(),
+            resource: DEFAULT_DEMO_RESOURCE.to_owned(),
             definition_ids: vec![2, 4],
         }
         .to_geometry_definition_batch_request();
@@ -2840,7 +3123,7 @@ mod tests {
     #[test]
     fn streamed_batches_feed_catalog_runtime_directly() {
         let package = GeometryBackend::default()
-            .build_demo_package_for(DEFAULT_WEB_RESOURCE)
+            .build_demo_package_for(DEFAULT_DEMO_RESOURCE)
             .expect("demo package should build");
         let catalog = package.catalog();
         let web_catalog = WebGeometryCatalog::from_geometry_catalog(&catalog);
@@ -2889,7 +3172,7 @@ mod tests {
     #[test]
     fn streamed_runtime_detects_missing_definitions() {
         let package = GeometryBackend::default()
-            .build_demo_package_for(DEFAULT_WEB_RESOURCE)
+            .build_demo_package_for(DEFAULT_DEMO_RESOURCE)
             .expect("demo package should build");
         let catalog = package.catalog();
         let web_catalog = WebGeometryCatalog::from_geometry_catalog(&catalog);

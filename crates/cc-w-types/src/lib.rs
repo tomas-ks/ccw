@@ -1063,14 +1063,16 @@ impl PickRegion {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PickHit {
     pub instance_id: GeometryInstanceId,
     pub element_id: SemanticElementId,
     pub definition_id: GeometryDefinitionId,
+    pub world_centroid: DVec3,
+    pub world_anchor: DVec3,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PickResult {
     pub region: PickRegion,
     pub hits: Vec<PickHit>,
