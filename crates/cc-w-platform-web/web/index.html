@@ -1180,6 +1180,23 @@
             <circle cx="12" cy="12" r="2.8" />
           </svg>
         </button>
+        <button
+          class="icon-button reference-grid-toggle-button"
+          id="reference-grid-toggle-button"
+          type="button"
+          aria-label="Toggle reference grid"
+          aria-pressed="false"
+          title="Reference grid"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 7h16" />
+            <path d="M4 12h16" />
+            <path d="M4 17h16" />
+            <path d="M7 4v16" />
+            <path d="M12 4v16" />
+            <path d="M17 4v16" />
+          </svg>
+        </button>
       </div>
       <div class="header-actions" aria-label="Viewer panels">
         <button
@@ -1497,6 +1514,7 @@
         viewer_list_element_ids,
         viewer_pick_at_json,
         viewer_pick_rect_json,
+        viewer_reference_grid_visible,
         viewer_resize_viewport,
         viewer_resource_catalog_json,
         viewer_reset_all_visibility,
@@ -1505,6 +1523,7 @@
         viewer_selected_element_ids,
         viewer_set_clear_color,
         viewer_set_profile,
+        viewer_set_reference_grid_visible,
         viewer_set_view_mode,
         viewer_show_elements,
         viewer_stream_visible as viewer_stream_newly_visible_geometry,
@@ -2029,6 +2048,11 @@
           currentProfile: () => viewer_current_profile(),
           profile: () => viewer_current_profile(),
           profiles: () => parseRenderProfiles(viewer_available_profiles_json()),
+          referenceGridVisible: () => viewer_reference_grid_visible(),
+          setReferenceGridVisible: (visible) =>
+            parseViewState(viewer_set_reference_grid_visible(Boolean(visible))),
+          toggleReferenceGrid: () =>
+            parseViewState(viewer_set_reference_grid_visible(!viewer_reference_grid_visible())),
           theme: () => currentViewerTheme(),
           setTheme: (theme) => {
             appState.dispatch({ type: "theme/set", theme });
@@ -2614,6 +2638,7 @@
       function installHeaderControls(viewer, graphShell, appStateStore) {
         const toolPicker = document.getElementById("tool-picker");
         const toolButtons = Array.from(document.querySelectorAll("[data-tool-button]"));
+        const referenceGridToggleButton = document.getElementById("reference-grid-toggle-button");
         const graphToggleButton = document.getElementById("graph-toggle-button");
         const terminalToggleButton = document.getElementById("terminal-toggle-button");
         const terminalCloseButton = document.getElementById("terminal-close-button");
@@ -2654,6 +2679,12 @@
             button.classList.toggle("active", active);
             button.setAttribute("aria-pressed", String(active));
           }
+          const referenceGridVisible = Boolean(state.committedViewerState?.referenceGridVisible);
+          referenceGridToggleButton?.classList.toggle("active", referenceGridVisible);
+          referenceGridToggleButton?.setAttribute(
+            "aria-pressed",
+            String(referenceGridVisible)
+          );
 
           const graphVisible = Boolean(state.panels?.graph);
           document.body.classList.toggle("graph-hidden", !graphVisible);
@@ -2712,6 +2743,15 @@
           appStateStore.dispatch({ type: "panel/toggle", panel: "graph" });
         });
 
+        referenceGridToggleButton?.addEventListener("click", () => {
+          try {
+            const visible = Boolean(appStateStore.getState().committedViewerState?.referenceGridVisible);
+            viewer.setReferenceGridVisible(!visible);
+          } catch (error) {
+            console.error("viewer reference grid toggle failed", error);
+          }
+        });
+
         terminalToggleButton?.addEventListener("click", () => {
           appStateStore.dispatch({ type: "panel/toggle", panel: "terminal" });
         });
@@ -2745,6 +2785,10 @@
         return {
           activeTool: () => viewerToolsToPickerValue(appStateStore.getState().tools),
           activeTools: () => appStateStore.getState().tools,
+          referenceGridVisible: () =>
+            Boolean(appStateStore.getState().committedViewerState?.referenceGridVisible),
+          setReferenceGridVisible: (visible) => viewer.setReferenceGridVisible(Boolean(visible)),
+          toggleReferenceGrid: () => viewer.toggleReferenceGrid(),
           setGraphVisible: (visible) =>
             appStateStore.dispatch({ type: "panel/set", panel: "graph", visible }),
           showGraph: () =>
@@ -6563,6 +6607,9 @@
           resource: () => viewer.currentResource(),
           profile: () => viewer.profile(),
           profiles: () => viewer.profiles(),
+          referenceGridVisible: () => viewer.referenceGridVisible(),
+          setReferenceGridVisible: (visible) => viewer.setReferenceGridVisible(visible),
+          toggleReferenceGrid: () => viewer.toggleReferenceGrid(),
           theme: () => viewer.theme(),
           viewState: () => viewer.viewState(),
           state: () => viewer.state(),
@@ -8119,7 +8166,7 @@
           screenId: "repl-screen",
           hostId: "repl-terminal",
           introLines: [
-            'resource(), profile(), profiles(), setProfile(name), theme(), setTheme("light"), allView(), defaultView(), viewState(), state(), pickAt(x,y), pickRect(x0,y0,x1,y1), query(...), ids(...), hide([...]), show([...]), select([...]), graph.reset(...), frame()',
+            'resource(), profile(), profiles(), setProfile(name), referenceGridVisible(), setReferenceGridVisible(true), theme(), setTheme("light"), allView(), defaultView(), viewState(), state(), pickAt(x,y), pickRect(x0,y0,x1,y1), query(...), ids(...), hide([...]), show([...]), select([...]), graph.reset(...), frame()',
             'Example: graph.reset("MATCH (p:IfcProject) RETURN id(p) AS node_id LIMIT 1");',
             'Example: var walls = ids("MATCH (w:IfcWall) RETURN w.GlobalId AS global_id LIMIT 8"); hide(walls);',
             "Enter runs. Up/Down walks history. Ctrl+C clears the line.",
@@ -8130,7 +8177,7 @@
               "api",
               "window",
               "document",
-              `"use strict"; const { viewer, graph, resource, profile, profiles, setProfile, theme, setTheme, viewState, state, setViewMode, defaultView, allView, setViewModeAsync, defaultViewAsync, allViewAsync, pickAt, pickRect, pickAtAsync, pickRectAsync, listIds, visibleIds, selectedIds, selectedInstanceIds, query, queryIds, ids, hide, show, select, resetVisibility, clearSelection, frame, frameVisible, hideQuery, showQuery, selectQuery } = api; return (async () => { ${rewritten} })();`
+              `"use strict"; const { viewer, graph, resource, profile, profiles, setProfile, referenceGridVisible, setReferenceGridVisible, toggleReferenceGrid, theme, setTheme, viewState, state, setViewMode, defaultView, allView, setViewModeAsync, defaultViewAsync, allViewAsync, pickAt, pickRect, pickAtAsync, pickRectAsync, listIds, visibleIds, selectedIds, selectedInstanceIds, query, queryIds, ids, hide, show, select, resetVisibility, clearSelection, frame, frameVisible, hideQuery, showQuery, selectQuery } = api; return (async () => { ${rewritten} })();`
             );
             return fn(replApi, window, document);
           },
@@ -8233,6 +8280,9 @@
           window.profile = repl.profile;
           window.profiles = repl.profiles;
           window.setProfile = repl.setProfile;
+          window.referenceGridVisible = repl.referenceGridVisible;
+          window.setReferenceGridVisible = repl.setReferenceGridVisible;
+          window.toggleReferenceGrid = repl.toggleReferenceGrid;
           window.theme = repl.theme;
           window.setTheme = repl.setTheme;
           window.listIds = repl.listIds;

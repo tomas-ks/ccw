@@ -644,6 +644,38 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+pub const REFERENCE_GRID_SHADER_WGSL: &str = r#"
+struct Camera {
+    clip_from_world : mat4x4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera : Camera;
+
+struct VertexInput {
+    @location(0) position : vec3<f32>,
+    @location(1) alpha : f32,
+};
+
+struct VertexOutput {
+    @builtin(position) position : vec4<f32>,
+    @location(0) alpha : f32,
+};
+
+@vertex
+fn vs_main(input : VertexInput) -> VertexOutput {
+    var out : VertexOutput;
+    out.position = camera.clip_from_world * vec4<f32>(input.position, 1.0);
+    out.alpha = input.alpha;
+    return out;
+}
+
+@fragment
+fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(0.36, 0.43, 0.52, input.alpha);
+}
+"#;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DirectionalLight {
     pub direction: Vec3,
@@ -689,6 +721,26 @@ impl Default for RenderDefaults {
             front_face: wgpu::FrontFace::Ccw,
             cull_mode: Some(wgpu::Face::Back),
             directional_light: DirectionalLight::default(),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+struct GpuReferenceGridVertex {
+    position: [f32; 3],
+    alpha: f32,
+}
+
+impl GpuReferenceGridVertex {
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        const ATTRIBUTES: [wgpu::VertexAttribute; 2] =
+            vertex_attr_array![0 => Float32x3, 1 => Float32];
+
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<GpuReferenceGridVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &ATTRIBUTES,
         }
     }
 }
@@ -1475,6 +1527,7 @@ pub struct MeshRenderer {
     architectural_pipeline: wgpu::RenderPipeline,
     surface_decal_pipeline: wgpu::RenderPipeline,
     architectural_surface_decal_pipeline: wgpu::RenderPipeline,
+    reference_grid_pipeline: wgpu::RenderPipeline,
     normal_pipeline: wgpu::RenderPipeline,
     ssao_pipeline: wgpu::RenderPipeline,
     edge_pipeline: wgpu::RenderPipeline,
@@ -1494,6 +1547,9 @@ pub struct MeshRenderer {
     camera: Camera,
     defaults: RenderDefaults,
     profile: RenderProfileId,
+    reference_grid_visible: bool,
+    reference_grid_vertex_buffer: Option<wgpu::Buffer>,
+    reference_grid_vertex_count: u32,
     meshes: Vec<GpuMesh>,
     instance_batches: Vec<GpuInstanceBatch>,
     pick_targets: Vec<PickHit>,
@@ -1742,6 +1798,50 @@ impl MeshRenderer {
                     targets: &[Some(wgpu::ColorTargetState {
                         format: color_format,
                         blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        let reference_grid_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("w reference grid shader"),
+            source: wgpu::ShaderSource::Wgsl(REFERENCE_GRID_SHADER_WGSL.into()),
+        });
+        let reference_grid_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("w reference grid pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &reference_grid_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[GpuReferenceGridVertex::layout()],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::LineList,
+                    strip_index_format: None,
+                    front_face: defaults.front_face,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: defaults.depth_format,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(defaults.depth_compare),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &reference_grid_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
@@ -2166,6 +2266,7 @@ impl MeshRenderer {
             architectural_pipeline,
             surface_decal_pipeline,
             architectural_surface_decal_pipeline,
+            reference_grid_pipeline,
             normal_pipeline,
             ssao_pipeline,
             edge_pipeline,
@@ -2185,6 +2286,9 @@ impl MeshRenderer {
             camera,
             defaults,
             profile: RenderProfileId::Diffuse,
+            reference_grid_visible: false,
+            reference_grid_vertex_buffer: None,
+            reference_grid_vertex_count: 0,
             meshes: Vec::new(),
             instance_batches: Vec::new(),
             pick_targets: Vec::new(),
@@ -2232,6 +2336,8 @@ impl MeshRenderer {
         self.meshes.clear();
         self.instance_batches.clear();
         self.pick_targets.clear();
+        self.reference_grid_vertex_buffer = None;
+        self.reference_grid_vertex_count = 0;
 
         let uploads = scene
             .definitions
@@ -2286,8 +2392,21 @@ impl MeshRenderer {
             self.upload_instance_batch(device, mesh_index, RenderLayer::SurfaceDecal, &instances);
         }
 
+        self.upload_reference_grid(device, scene.bounds);
         self.update_camera(queue);
         uploads
+    }
+
+    fn upload_reference_grid(&mut self, device: &wgpu::Device, bounds: Bounds3) {
+        let vertices = reference_grid_vertices(bounds);
+        self.reference_grid_vertex_count = vertices.len() as u32;
+        self.reference_grid_vertex_buffer = (!vertices.is_empty()).then(|| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("w reference grid vertex buffer"),
+                contents: cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
     }
 
     fn upload_mesh_definition(
@@ -2395,6 +2514,14 @@ impl MeshRenderer {
 
     pub fn set_profile(&mut self, profile: RenderProfileId) {
         self.profile = profile;
+    }
+
+    pub fn reference_grid_visible(&self) -> bool {
+        self.reference_grid_visible
+    }
+
+    pub fn set_reference_grid_visible(&mut self, visible: bool) {
+        self.reference_grid_visible = visible;
     }
 
     pub fn render(
@@ -2527,6 +2654,10 @@ impl MeshRenderer {
                 pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
             }
 
+            if self.reference_grid_visible {
+                self.draw_reference_grid(&mut pass);
+            }
+
             if self.profile == RenderProfileId::ArchitecturalV1 {
                 self.draw_mesh_edges(&mut pass);
             }
@@ -2549,6 +2680,20 @@ impl MeshRenderer {
                 self.render_screen_space_outline(device, encoder, target, depth_target);
             }
         }
+    }
+
+    fn draw_reference_grid<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
+        let Some(vertex_buffer) = &self.reference_grid_vertex_buffer else {
+            return;
+        };
+        if self.reference_grid_vertex_count == 0 {
+            return;
+        }
+
+        pass.set_pipeline(&self.reference_grid_pipeline);
+        pass.set_bind_group(0, &self.scene_bind_group, &[]);
+        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        pass.draw(0..self.reference_grid_vertex_count, 0..1);
     }
 
     fn draw_mesh_edges<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
@@ -3052,6 +3197,68 @@ fn surface_decal_depth_bias(compare: wgpu::CompareFunction) -> wgpu::DepthBiasSt
     }
 }
 
+fn reference_grid_vertices(bounds: Bounds3) -> Vec<GpuReferenceGridVertex> {
+    let size = bounds.size();
+    let span = size.x.abs().max(size.y.abs()).max(0.01);
+    let spacing = metric_reference_grid_spacing(span / 16.0);
+    let major_spacing = spacing * 10.0;
+    let center = bounds.center();
+    let half_extent = (span * 0.85).max(major_spacing * 2.0);
+    let min_x = ((center.x - half_extent) / spacing).floor() * spacing;
+    let max_x = ((center.x + half_extent) / spacing).ceil() * spacing;
+    let min_y = ((center.y - half_extent) / spacing).floor() * spacing;
+    let max_y = ((center.y + half_extent) / spacing).ceil() * spacing;
+    let z = bounds.min.z - (span * 0.006).max(0.025);
+    let mut vertices = Vec::new();
+
+    let mut x = min_x;
+    while x <= max_x + spacing * 0.5 {
+        let alpha = reference_grid_line_alpha(x, major_spacing);
+        vertices.push(GpuReferenceGridVertex {
+            position: [x as f32, min_y as f32, z as f32],
+            alpha,
+        });
+        vertices.push(GpuReferenceGridVertex {
+            position: [x as f32, max_y as f32, z as f32],
+            alpha,
+        });
+        x += spacing;
+    }
+
+    let mut y = min_y;
+    while y <= max_y + spacing * 0.5 {
+        let alpha = reference_grid_line_alpha(y, major_spacing);
+        vertices.push(GpuReferenceGridVertex {
+            position: [min_x as f32, y as f32, z as f32],
+            alpha,
+        });
+        vertices.push(GpuReferenceGridVertex {
+            position: [max_x as f32, y as f32, z as f32],
+            alpha,
+        });
+        y += spacing;
+    }
+
+    vertices
+}
+
+fn reference_grid_line_alpha(coordinate: f64, major_spacing: f64) -> f32 {
+    let major = (coordinate / major_spacing).round() * major_spacing;
+    if (coordinate - major).abs() <= major_spacing * 0.02 {
+        0.58
+    } else {
+        0.32
+    }
+}
+
+fn metric_reference_grid_spacing(target: f64) -> f64 {
+    if !target.is_finite() || target <= 0.0 {
+        return 1.0;
+    }
+
+    10.0_f64.powf(target.log10().round())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct RenderClassEdgeVisibility {
     boundary: f32,
@@ -3532,6 +3739,34 @@ mod tests {
     }
 
     #[test]
+    fn reference_grid_vertices_follow_scene_footprint() {
+        let bounds = Bounds3 {
+            min: DVec3::new(-2.0, -1.0, 0.5),
+            max: DVec3::new(4.0, 3.0, 4.0),
+        };
+        let vertices = reference_grid_vertices(bounds);
+
+        assert!(!vertices.is_empty());
+        assert_eq!(vertices.len() % 2, 0);
+        assert!(
+            vertices
+                .iter()
+                .all(|vertex| f64::from(vertex.position[2]) < bounds.min.z)
+        );
+        assert!(vertices.iter().any(|vertex| vertex.alpha > 0.50));
+        assert!(vertices.iter().any(|vertex| vertex.alpha < 0.40));
+    }
+
+    #[test]
+    fn reference_grid_spacing_uses_metric_decades() {
+        assert_eq!(metric_reference_grid_spacing(0.006), 0.01);
+        assert_eq!(metric_reference_grid_spacing(0.08), 0.1);
+        assert_eq!(metric_reference_grid_spacing(0.7), 1.0);
+        assert_eq!(metric_reference_grid_spacing(6.0), 10.0);
+        assert_eq!(metric_reference_grid_spacing(70.0), 100.0);
+    }
+
+    #[test]
     fn architectural_profiles_use_matte_surface_lighting() {
         assert!(!uses_architectural_surface_lighting(
             RenderProfileId::Diffuse
@@ -3875,6 +4110,9 @@ mod tests {
             let uploads = renderer.upload_prepared_scene(&device, &queue, &scene);
 
             assert_eq!(uploads.len(), 1);
+            assert!(!renderer.reference_grid_visible());
+            renderer.set_reference_grid_visible(true);
+            assert!(renderer.reference_grid_visible());
             assert_eq!(renderer.meshes.len(), 1);
             assert_eq!(renderer.instance_batches.len(), 2);
             assert_eq!(renderer.pick_targets.len(), 3);
@@ -3888,6 +4126,8 @@ mod tests {
                 RenderLayer::SurfaceDecal
             );
             assert_eq!(renderer.instance_batches[1].instance_count, 1);
+            assert!(renderer.reference_grid_vertex_buffer.is_some());
+            assert!(renderer.reference_grid_vertex_count > 0);
         });
     }
 
@@ -3977,6 +4217,7 @@ mod tests {
                 fit_camera_to_render_scene(&scene),
             );
             renderer.upload_prepared_scene(&device, &queue, &scene);
+            renderer.set_reference_grid_visible(true);
 
             for profile in [
                 RenderProfileId::ArchitecturalV2,

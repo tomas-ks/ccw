@@ -514,6 +514,7 @@ impl AppState {
         let mut selected_start_view_mode = self.selected_start_view_mode;
         let mut selected_render_profile = self.selected_render_profile;
         let mut interaction_mode = self.interaction_mode;
+        let mut reference_grid_visible = self.renderer.reference_grid_visible();
         let render_profiles = self.renderer.available_profiles();
         let stats = self.debug_stats();
         let summary = stats.summary_line();
@@ -533,6 +534,7 @@ impl AppState {
                 &mut selected_render_profile,
                 render_profiles,
                 &mut interaction_mode,
+                &mut reference_grid_visible,
             );
             draw_native_debug_panel(
                 context,
@@ -573,6 +575,11 @@ impl AppState {
 
         if selected_render_profile != self.renderer.profile() {
             self.apply_render_profile(selected_render_profile);
+        }
+
+        if reference_grid_visible != self.renderer.reference_grid_visible() {
+            self.renderer
+                .set_reference_grid_visible(reference_grid_visible);
         }
 
         if interaction_mode != self.interaction_mode {
@@ -1154,6 +1161,7 @@ fn draw_native_toolbar(
     selected_render_profile: &mut RenderProfileId,
     render_profiles: &[RenderProfileDescriptor],
     interaction_mode: &mut NativeInteractionMode,
+    reference_grid_visible: &mut bool,
 ) {
     let accent = Color32::from_rgb(230, 93, 71);
     let muted = Color32::from_rgba_unmultiplied(241, 244, 250, 176);
@@ -1205,6 +1213,7 @@ fn draw_native_toolbar(
                             ui.selectable_value(interaction_mode, mode, mode.label());
                         }
                     });
+                ui.checkbox(reference_grid_visible, "Grid");
                 ui.label(RichText::new(interaction_mode.hint()).color(muted));
             });
         });

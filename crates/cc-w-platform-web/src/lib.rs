@@ -1568,6 +1568,7 @@ struct WebViewerViewState {
     resource: String,
     view_mode: String,
     render_profile: String,
+    reference_grid_visible: bool,
     available_render_profiles: Vec<WebRenderProfileDescriptor>,
     total_elements: usize,
     total_instances: usize,
@@ -2070,6 +2071,33 @@ pub fn viewer_available_profiles_json() -> Result<String, JsValue> {
 #[wasm_bindgen]
 pub fn viewer_current_profile() -> Result<String, JsValue> {
     with_web_viewer_state(|state| Ok(state.renderer.profile().as_str().to_string()))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_reference_grid_visible() -> Result<bool, JsValue> {
+    with_web_viewer_state(|state| Ok(state.renderer.reference_grid_visible()))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_set_reference_grid_visible(visible: bool) -> Result<String, JsValue> {
+    let (json, event) = with_web_viewer_state_mut(|state| {
+        if state.renderer.reference_grid_visible() == visible {
+            return Ok((state.view_state_json()?, None));
+        }
+
+        state.renderer.set_reference_grid_visible(visible);
+        state.refresh_status();
+        Ok((
+            state.view_state_json()?,
+            Some(state.viewer_state_change_event("referenceGrid")?),
+        ))
+    })?;
+    if let Some(event) = event {
+        dispatch_web_events(vec![event]).map_err(|error| JsValue::from_str(&error))?;
+    }
+    Ok(json)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -3633,6 +3661,7 @@ impl WebViewerState {
             resource: self.current_resource.clone(),
             view_mode: web_view_mode_name(self.runtime_scene.start_view_request()).to_string(),
             render_profile: self.renderer.profile().as_str().to_string(),
+            reference_grid_visible: self.renderer.reference_grid_visible(),
             available_render_profiles: web_render_profile_descriptors(
                 self.renderer.available_profiles(),
             ),
