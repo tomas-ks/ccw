@@ -746,6 +746,10 @@ impl RuntimeSceneState {
                         model_from_object: resident_instance.transform,
                         world_bounds: resident_instance.bounds,
                         material: self.material_for_instance(resident_instance),
+                        default_render_class: self
+                            .element(&resident_instance.element_id)
+                            .map(|element| element.default_render_class)
+                            .unwrap_or(DefaultRenderClass::Physical),
                     })
             })
             .collect::<Vec<_>>();
@@ -934,7 +938,14 @@ fn prepared_instance_from_catalog_entry(
 
 fn default_visibility_for_class(class: DefaultRenderClass) -> bool {
     match class {
-        DefaultRenderClass::Physical | DefaultRenderClass::Other => true,
+        DefaultRenderClass::Physical
+        | DefaultRenderClass::Terrain
+        | DefaultRenderClass::TerrainFeature
+        | DefaultRenderClass::Vegetation
+        | DefaultRenderClass::VegetationCover
+        | DefaultRenderClass::Water
+        | DefaultRenderClass::SurfaceDecal
+        | DefaultRenderClass::Other => true,
         DefaultRenderClass::Space | DefaultRenderClass::Zone | DefaultRenderClass::Helper => false,
     }
 }

@@ -1,7 +1,7 @@
 use bytemuck::{Pod, Zeroable, bytes_of, cast_slice};
 use cc_w_types::{
-    Bounds3, GeometryDefinitionId, GeometryInstanceId, PickHit, PickRegion, PickResult,
-    PreparedMaterial, PreparedMesh, PreparedRenderDefinition, PreparedRenderInstance,
+    Bounds3, DefaultRenderClass, GeometryDefinitionId, GeometryInstanceId, PickHit, PickRegion,
+    PickResult, PreparedMaterial, PreparedMesh, PreparedRenderDefinition, PreparedRenderInstance,
     PreparedRenderScene, SemanticElementId, WORLD_FORWARD, WORLD_RIGHT, WORLD_UP,
 };
 use glam::{DMat4, DVec3, DVec4, Mat4, Vec3};
@@ -11,7 +11,20 @@ use std::sync::mpsc;
 use wgpu::util::DeviceExt;
 use wgpu::vertex_attr_array;
 
-pub const DEFAULT_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
+mod mesh_edges;
+mod profile;
+
+pub use mesh_edges::{ExtractedMeshEdges, MeshEdgeExtractionConfig};
+pub use profile::{
+    RenderProfileDescriptor, RenderProfileId, UnknownRenderProfile, available_render_profiles,
+};
+
+pub const DEFAULT_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const ARCHITECTURAL_EDGE_WIDTH_PX: f32 = 3.5;
+const ARCHITECTURAL_CREASE_ANGLE_DEGREES: f32 = 30.0;
+const SCREEN_SPACE_OUTLINE_DEPTH_THRESHOLD: f32 = 0.004;
+const SCREEN_SPACE_OBJECT_ID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Uint;
+const SCREEN_SPACE_NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 pub const BASIC_MESH_SHADER_WGSL: &str = r#"
 struct Camera {
@@ -69,6 +82,64 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+pub const ARCHITECTURAL_MESH_SHADER_WGSL: &str = r#"
+struct Camera {
+    clip_from_world : mat4x4<f32>,
+};
+
+struct Lighting {
+    light_direction : vec4<f32>,
+    factors : vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera : Camera;
+
+@group(0) @binding(1)
+var<uniform> lighting : Lighting;
+
+struct VertexInput {
+    @location(0) position : vec3<f32>,
+    @location(1) normal : vec3<f32>,
+    @location(2) model_col0 : vec4<f32>,
+    @location(3) model_col1 : vec4<f32>,
+    @location(4) model_col2 : vec4<f32>,
+    @location(5) model_col3 : vec4<f32>,
+    @location(6) material_color : vec4<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) position : vec4<f32>,
+    @location(0) normal : vec3<f32>,
+    @location(1) material_color : vec4<f32>,
+};
+
+@vertex
+fn vs_main(input : VertexInput) -> VertexOutput {
+    var out : VertexOutput;
+    let model_from_object = mat4x4<f32>(
+        input.model_col0,
+        input.model_col1,
+        input.model_col2,
+        input.model_col3,
+    );
+    let world_position = model_from_object * vec4<f32>(input.position, 1.0);
+    out.position = camera.clip_from_world * world_position;
+    out.normal = (model_from_object * vec4<f32>(input.normal, 0.0)).xyz;
+    out.material_color = input.material_color;
+    return out;
+}
+
+@fragment
+fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+    let diffuse = max(dot(normalize(input.normal), normalize(lighting.light_direction.xyz)), 0.0);
+    let ambient_fill = max(lighting.factors.x, 0.46);
+    let diffuse_fill = min(lighting.factors.y, 1.0 - ambient_fill);
+    let lit = ambient_fill + (diffuse * diffuse_fill);
+    return vec4<f32>(input.material_color.xyz * lit, input.material_color.w);
+}
+"#;
+
 pub const PICK_MESH_SHADER_WGSL: &str = r#"
 struct Camera {
     clip_from_world : mat4x4<f32>,
@@ -121,6 +192,458 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<u32> {
 }
 "#;
 
+pub const OBJECT_ID_MESH_SHADER_WGSL: &str = r#"
+struct Camera {
+    clip_from_world : mat4x4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera : Camera;
+
+struct VertexInput {
+    @location(0) position : vec3<f32>,
+    @location(2) model_col0 : vec4<f32>,
+    @location(3) model_col1 : vec4<f32>,
+    @location(4) model_col2 : vec4<f32>,
+    @location(5) model_col3 : vec4<f32>,
+    @location(12) outline_index : u32,
+};
+
+struct VertexOutput {
+    @builtin(position) position : vec4<f32>,
+    @location(0) @interpolate(flat) object_color : vec4<u32>,
+};
+
+fn encode_object_index(index : u32) -> vec4<u32> {
+    return vec4<u32>(
+        index & 0xffu,
+        (index >> 8u) & 0xffu,
+        (index >> 16u) & 0xffu,
+        (index >> 24u) & 0xffu,
+    );
+}
+
+@vertex
+fn vs_main(input : VertexInput) -> VertexOutput {
+    var out : VertexOutput;
+    let model_from_object = mat4x4<f32>(
+        input.model_col0,
+        input.model_col1,
+        input.model_col2,
+        input.model_col3,
+    );
+    let world_position = model_from_object * vec4<f32>(input.position, 1.0);
+    out.position = camera.clip_from_world * world_position;
+    out.object_color = encode_object_index(input.outline_index);
+    return out;
+}
+
+@fragment
+fn fs_main(input : VertexOutput) -> @location(0) vec4<u32> {
+    return input.object_color;
+}
+"#;
+
+pub const NORMAL_MESH_SHADER_WGSL: &str = r#"
+struct Camera {
+    clip_from_world : mat4x4<f32>,
+    viewport_and_profile : vec4<f32>,
+    view_from_world : mat4x4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera : Camera;
+
+struct VertexInput {
+    @location(0) position : vec3<f32>,
+    @location(1) normal : vec3<f32>,
+    @location(2) model_col0 : vec4<f32>,
+    @location(3) model_col1 : vec4<f32>,
+    @location(4) model_col2 : vec4<f32>,
+    @location(5) model_col3 : vec4<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) position : vec4<f32>,
+    @location(0) normal : vec3<f32>,
+};
+
+@vertex
+fn vs_main(input : VertexInput) -> VertexOutput {
+    var out : VertexOutput;
+    let model_from_object = mat4x4<f32>(
+        input.model_col0,
+        input.model_col1,
+        input.model_col2,
+        input.model_col3,
+    );
+    let world_position = model_from_object * vec4<f32>(input.position, 1.0);
+    let world_normal = model_from_object * vec4<f32>(input.normal, 0.0);
+    out.position = camera.clip_from_world * world_position;
+    out.normal = normalize((camera.view_from_world * world_normal).xyz);
+    return out;
+}
+
+@fragment
+fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+    let normal = normalize(input.normal);
+    return vec4<f32>((normal * 0.5) + vec3<f32>(0.5), 1.0);
+}
+"#;
+
+pub const EDGE_RIBBON_SHADER_WGSL: &str = r#"
+struct Camera {
+    clip_from_world : mat4x4<f32>,
+    viewport_and_profile : vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera : Camera;
+
+struct VertexInput {
+    @location(0) edge_start : vec3<f32>,
+    @location(1) edge_end : vec3<f32>,
+    @location(2) model_col0 : vec4<f32>,
+    @location(3) model_col1 : vec4<f32>,
+    @location(4) model_col2 : vec4<f32>,
+    @location(5) model_col3 : vec4<f32>,
+    @location(8) corner : vec2<f32>,
+    @location(9) edge_kind : f32,
+    @location(10) boundary_edge_visibility : f32,
+    @location(11) crease_edge_visibility : f32,
+};
+
+struct VertexOutput {
+    @builtin(position) position : vec4<f32>,
+    @location(0) edge_side : f32,
+    @location(1) edge_visibility : f32,
+};
+
+@vertex
+fn vs_main(input : VertexInput) -> VertexOutput {
+    var out : VertexOutput;
+    let model_from_object = mat4x4<f32>(
+        input.model_col0,
+        input.model_col1,
+        input.model_col2,
+        input.model_col3,
+    );
+    let start_clip = camera.clip_from_world * (model_from_object * vec4<f32>(input.edge_start, 1.0));
+    let end_clip = camera.clip_from_world * (model_from_object * vec4<f32>(input.edge_end, 1.0));
+    let start_ndc = start_clip.xy / start_clip.w;
+    let end_ndc = end_clip.xy / end_clip.w;
+    let viewport = max(camera.viewport_and_profile.xy, vec2<f32>(1.0, 1.0));
+    let edge_screen = (end_ndc - start_ndc) * viewport;
+    var normal_screen = vec2<f32>(-edge_screen.y, edge_screen.x);
+    if (dot(normal_screen, normal_screen) < 0.0001) {
+        normal_screen = vec2<f32>(0.0, 1.0);
+    } else {
+        normal_screen = normalize(normal_screen);
+    }
+
+    let half_width_px = camera.viewport_and_profile.z;
+    let offset_ndc = (normal_screen * input.corner.y * half_width_px / viewport) * 2.0;
+    let base_clip = select(start_clip, end_clip, input.corner.x > 0.5);
+    out.position = vec4<f32>(
+        base_clip.x + offset_ndc.x * base_clip.w,
+        base_clip.y + offset_ndc.y * base_clip.w,
+        base_clip.z,
+        base_clip.w,
+    );
+    out.edge_side = input.corner.y;
+    out.edge_visibility = select(
+        input.boundary_edge_visibility,
+        input.crease_edge_visibility,
+        input.edge_kind > 0.5,
+    );
+    return out;
+}
+
+@fragment
+fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+    let half_width_px = max(camera.viewport_and_profile.z, 0.5);
+    let antialias_width = min(0.95, 1.0 / half_width_px);
+    let edge_alpha = 1.0 - smoothstep(1.0 - antialias_width, 1.0, abs(input.edge_side));
+    return vec4<f32>(0.055, 0.075, 0.105, 0.82 * edge_alpha * input.edge_visibility);
+}
+"#;
+
+pub const CREASE_RIBBON_SHADER_WGSL: &str = r#"
+struct Camera {
+    clip_from_world : mat4x4<f32>,
+    viewport_and_profile : vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera : Camera;
+
+struct VertexInput {
+    @location(0) edge_start : vec3<f32>,
+    @location(1) edge_end : vec3<f32>,
+    @location(2) model_col0 : vec4<f32>,
+    @location(3) model_col1 : vec4<f32>,
+    @location(4) model_col2 : vec4<f32>,
+    @location(5) model_col3 : vec4<f32>,
+    @location(8) corner : vec2<f32>,
+    @location(9) edge_kind : f32,
+    @location(11) crease_edge_visibility : f32,
+};
+
+struct VertexOutput {
+    @builtin(position) position : vec4<f32>,
+    @location(0) edge_side : f32,
+    @location(1) edge_visibility : f32,
+    @location(2) edge_kind : f32,
+};
+
+@vertex
+fn vs_main(input : VertexInput) -> VertexOutput {
+    var out : VertexOutput;
+    let model_from_object = mat4x4<f32>(
+        input.model_col0,
+        input.model_col1,
+        input.model_col2,
+        input.model_col3,
+    );
+    let start_clip = camera.clip_from_world * (model_from_object * vec4<f32>(input.edge_start, 1.0));
+    let end_clip = camera.clip_from_world * (model_from_object * vec4<f32>(input.edge_end, 1.0));
+    let start_ndc = start_clip.xy / start_clip.w;
+    let end_ndc = end_clip.xy / end_clip.w;
+    let viewport = max(camera.viewport_and_profile.xy, vec2<f32>(1.0, 1.0));
+    let edge_screen = (end_ndc - start_ndc) * viewport;
+    var normal_screen = vec2<f32>(-edge_screen.y, edge_screen.x);
+    if (dot(normal_screen, normal_screen) < 0.0001) {
+        normal_screen = vec2<f32>(0.0, 1.0);
+    } else {
+        normal_screen = normalize(normal_screen);
+    }
+
+    let half_width_px = max(camera.viewport_and_profile.z * 0.72, 0.9);
+    let offset_ndc = (normal_screen * input.corner.y * half_width_px / viewport) * 2.0;
+    let base_clip = select(start_clip, end_clip, input.corner.x > 0.5);
+    out.position = vec4<f32>(
+        base_clip.x + offset_ndc.x * base_clip.w,
+        base_clip.y + offset_ndc.y * base_clip.w,
+        base_clip.z,
+        base_clip.w,
+    );
+    out.edge_side = input.corner.y;
+    out.edge_visibility = input.crease_edge_visibility;
+    out.edge_kind = input.edge_kind;
+    return out;
+}
+
+@fragment
+fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+    if (input.edge_kind < 0.5 || input.edge_visibility <= 0.01) {
+        discard;
+    }
+
+    let half_width_px = max(camera.viewport_and_profile.z * 0.72, 0.9);
+    let antialias_width = min(0.95, 1.0 / half_width_px);
+    let edge_alpha = 1.0 - smoothstep(1.0 - antialias_width, 1.0, abs(input.edge_side));
+    return vec4<f32>(0.045, 0.060, 0.082, 0.46 * edge_alpha * input.edge_visibility);
+}
+"#;
+
+pub const SCREEN_SPACE_OUTLINE_SHADER_WGSL: &str = r#"
+struct Camera {
+    clip_from_world : mat4x4<f32>,
+    viewport_and_profile : vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera : Camera;
+
+@group(0) @binding(1)
+var depth_texture : texture_depth_2d;
+
+@group(0) @binding(2)
+var object_id_texture : texture_2d<u32>;
+
+struct VertexOutput {
+    @builtin(position) position : vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index : u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -3.0),
+        vec2<f32>(3.0, 1.0),
+        vec2<f32>(-1.0, 1.0),
+    );
+    var out : VertexOutput;
+    out.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
+    return out;
+}
+
+fn clamped_coord(coord : vec2<i32>) -> vec2<i32> {
+    let size = vec2<i32>(
+        max(i32(camera.viewport_and_profile.x), 1),
+        max(i32(camera.viewport_and_profile.y), 1),
+    );
+    return clamp(coord, vec2<i32>(0, 0), size - vec2<i32>(1, 1));
+}
+
+fn load_depth(coord : vec2<i32>) -> f32 {
+    return textureLoad(depth_texture, clamped_coord(coord), 0);
+}
+
+fn decode_object_id(pixel : vec4<u32>) -> u32 {
+    return pixel.x | (pixel.y << 8u) | (pixel.z << 16u) | (pixel.w << 24u);
+}
+
+fn load_object_id(coord : vec2<i32>) -> u32 {
+    return decode_object_id(textureLoad(object_id_texture, clamped_coord(coord), 0));
+}
+
+@fragment
+fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+    let coord = vec2<i32>(floor(input.position.xy));
+    let center_depth = load_depth(coord);
+    let center_id = load_object_id(coord);
+    let depth_threshold = max(camera.viewport_and_profile.w, 0.0001);
+    var depth_edge = 0.0;
+    var object_edge = 0.0;
+    let offsets = array<vec2<i32>, 4>(
+        vec2<i32>(1, 0),
+        vec2<i32>(-1, 0),
+        vec2<i32>(0, 1),
+        vec2<i32>(0, -1),
+    );
+
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let neighbor_coord = coord + offsets[i];
+        let neighbor_depth = load_depth(neighbor_coord);
+        let neighbor_id = load_object_id(neighbor_coord);
+        if ((center_id != neighbor_id) && ((center_id != 0u) || (neighbor_id != 0u))) {
+            object_edge = 1.0;
+        }
+        if ((max(center_depth, neighbor_depth) > 0.000001) &&
+            (abs(center_depth - neighbor_depth) > depth_threshold)) {
+            depth_edge = 1.0;
+        }
+    }
+
+    let alpha = max(object_edge * 0.74, depth_edge * 0.52);
+    if (alpha <= 0.01) {
+        discard;
+    }
+    return vec4<f32>(0.035, 0.052, 0.075, alpha);
+}
+"#;
+
+pub const SCREEN_SPACE_AO_SHADER_WGSL: &str = r#"
+struct Camera {
+    clip_from_world : mat4x4<f32>,
+    viewport_and_profile : vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera : Camera;
+
+@group(0) @binding(1)
+var depth_texture : texture_depth_2d;
+
+@group(0) @binding(2)
+var normal_texture : texture_2d<f32>;
+
+struct VertexOutput {
+    @builtin(position) position : vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index : u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -3.0),
+        vec2<f32>(3.0, 1.0),
+        vec2<f32>(-1.0, 1.0),
+    );
+    var out : VertexOutput;
+    out.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
+    return out;
+}
+
+fn clamped_coord(coord : vec2<i32>) -> vec2<i32> {
+    let size = vec2<i32>(
+        max(i32(camera.viewport_and_profile.x), 1),
+        max(i32(camera.viewport_and_profile.y), 1),
+    );
+    return clamp(coord, vec2<i32>(0, 0), size - vec2<i32>(1, 1));
+}
+
+fn load_depth(coord : vec2<i32>) -> f32 {
+    return textureLoad(depth_texture, clamped_coord(coord), 0);
+}
+
+fn load_normal(coord : vec2<i32>) -> vec3<f32> {
+    let encoded = textureLoad(normal_texture, clamped_coord(coord), 0).xyz;
+    let normal = (encoded * 2.0) - vec3<f32>(1.0);
+    return normalize(normal);
+}
+
+@fragment
+fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+    let coord = vec2<i32>(floor(input.position.xy));
+    let center_depth = load_depth(coord);
+    if (center_depth <= 0.000001) {
+        discard;
+    }
+
+    let center_normal = load_normal(coord);
+    let offsets = array<vec2<i32>, 12>(
+        vec2<i32>(2, 0),
+        vec2<i32>(-2, 0),
+        vec2<i32>(0, 2),
+        vec2<i32>(0, -2),
+        vec2<i32>(3, 3),
+        vec2<i32>(-3, 3),
+        vec2<i32>(3, -3),
+        vec2<i32>(-3, -3),
+        vec2<i32>(7, 0),
+        vec2<i32>(-7, 0),
+        vec2<i32>(0, 7),
+        vec2<i32>(0, -7),
+    );
+    var occlusion = 0.0;
+
+    for (var i = 0u; i < 12u; i = i + 1u) {
+        let sample_coord = coord + offsets[i];
+        let sample_depth = load_depth(sample_coord);
+        if (sample_depth <= 0.000001) {
+            continue;
+        }
+
+        // Reverse-Z: larger depth values are closer to the camera.
+        let depth_delta = sample_depth - center_depth;
+        let absolute_depth_delta = abs(depth_delta);
+        let connected_surface = 1.0 - smoothstep(0.0025, 0.0120, absolute_depth_delta);
+        if (connected_surface <= 0.001) {
+            continue;
+        }
+
+        let close_occluder = smoothstep(0.00002, 0.0022, depth_delta);
+        let range_fade = 1.0 - smoothstep(0.0030, 0.0140, absolute_depth_delta);
+        let sample_normal = load_normal(sample_coord);
+        let normal_difference = 1.0 - clamp(dot(center_normal, sample_normal), 0.0, 1.0);
+        let normal_weight = 0.22 + (normal_difference * 0.64);
+        let contact_occlusion = close_occluder * range_fade * connected_surface * normal_weight;
+        let crease_occlusion = smoothstep(0.18, 0.72, normal_difference)
+            * (1.0 - smoothstep(0.0008, 0.0060, absolute_depth_delta))
+            * connected_surface
+            * 0.30;
+        occlusion = occlusion + max(contact_occlusion, crease_occlusion);
+    }
+
+    let ao = clamp(occlusion / 12.0, 0.0, 1.0);
+    let alpha = pow(ao, 0.82) * 0.52;
+    if (alpha <= 0.003) {
+        discard;
+    }
+    return vec4<f32>(0.0, 0.0, 0.0, alpha);
+}
+"#;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DirectionalLight {
     pub direction: Vec3,
@@ -160,9 +683,9 @@ impl Default for RenderDefaults {
                 a: 1.0,
             },
             depth_format: DEFAULT_DEPTH_FORMAT,
-            depth_clear_value: 1.0,
+            depth_clear_value: 0.0,
             depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_compare: wgpu::CompareFunction::Greater,
             front_face: wgpu::FrontFace::Ccw,
             cull_mode: Some(wgpu::Face::Back),
             directional_light: DirectionalLight::default(),
@@ -184,6 +707,42 @@ impl GpuVertex {
 
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &ATTRIBUTES,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+struct GpuEdgeVertex {
+    start_position: [f32; 3],
+    end_position: [f32; 3],
+    corner: [f32; 2],
+    edge_kind: f32,
+}
+
+impl GpuEdgeVertex {
+    fn new(
+        start_position: [f32; 3],
+        end_position: [f32; 3],
+        corner: [f32; 2],
+        edge_kind: f32,
+    ) -> Self {
+        Self {
+            start_position,
+            end_position,
+            corner,
+            edge_kind,
+        }
+    }
+
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        const ATTRIBUTES: [wgpu::VertexAttribute; 4] =
+            vertex_attr_array![0 => Float32x3, 1 => Float32x3, 8 => Float32x2, 9 => Float32];
+
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<GpuEdgeVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &ATTRIBUTES,
         }
@@ -252,8 +811,8 @@ impl Camera {
         let projection = DMat4::perspective_rh(
             self.vertical_fov_degrees.to_radians(),
             aspect,
-            self.near_plane,
             self.far_plane,
+            self.near_plane,
         );
 
         projection * self.view_from_world()
@@ -447,8 +1006,8 @@ fn pick_ray_for_pixel(
     let ndc_x = ((f64::from(pixel_x) + 0.5) / f64::from(viewport.width)) * 2.0 - 1.0;
     let ndc_y = 1.0 - (((f64::from(pixel_y) + 0.5) / f64::from(viewport.height)) * 2.0);
     let world_from_clip = camera.clip_from_world(viewport).inverse();
-    let near = unproject_clip_point(world_from_clip, DVec4::new(ndc_x, ndc_y, 0.0, 1.0))?;
-    let far = unproject_clip_point(world_from_clip, DVec4::new(ndc_x, ndc_y, 1.0, 1.0))?;
+    let near = unproject_clip_point(world_from_clip, DVec4::new(ndc_x, ndc_y, 1.0, 1.0))?;
+    let far = unproject_clip_point(world_from_clip, DVec4::new(ndc_x, ndc_y, 0.0, 1.0))?;
     let direction = (far - near).try_normalize()?;
     Some(PickRay {
         origin: near,
@@ -636,12 +1195,22 @@ impl RenderBackend for NullRenderBackend {
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 struct CameraUniform {
     clip_from_world: [[f32; 4]; 4],
+    viewport_and_profile: [f32; 4],
+    view_from_world: [[f32; 4]; 4],
 }
 
 impl CameraUniform {
     fn from_camera(camera: Camera, viewport: ViewportSize) -> Self {
+        let viewport = viewport.clamped();
         Self {
             clip_from_world: camera.clip_from_world_f32(viewport).to_cols_array_2d(),
+            viewport_and_profile: [
+                viewport.width as f32,
+                viewport.height as f32,
+                ARCHITECTURAL_EDGE_WIDTH_PX * 0.5,
+                SCREEN_SPACE_OUTLINE_DEPTH_THRESHOLD,
+            ],
+            view_from_world: mat4_from_dmat4(camera.view_from_world()).to_cols_array_2d(),
         }
     }
 }
@@ -692,6 +1261,8 @@ struct GpuMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
+    edge_vertex_buffer: Option<wgpu::Buffer>,
+    edge_vertex_count: u32,
 }
 
 #[derive(Debug)]
@@ -699,6 +1270,22 @@ struct GpuInstanceBatch {
     mesh_index: usize,
     instance_buffer: wgpu::Buffer,
     instance_count: u32,
+    render_layer: RenderLayer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderLayer {
+    Opaque,
+    SurfaceDecal,
+}
+
+impl RenderLayer {
+    fn for_render_class(class: DefaultRenderClass) -> Self {
+        match class {
+            DefaultRenderClass::SurfaceDecal => Self::SurfaceDecal,
+            _ => Self::Opaque,
+        }
+    }
 }
 
 #[repr(C)]
@@ -707,7 +1294,9 @@ struct GpuInstance {
     model_from_object: [[f32; 4]; 4],
     material_color: [f32; 4],
     pick_index: u32,
-    _padding: [u32; 3],
+    boundary_edge_visibility: f32,
+    crease_edge_visibility: f32,
+    outline_index: u32,
 }
 
 impl GpuInstance {
@@ -715,27 +1304,39 @@ impl GpuInstance {
         model_from_object: DMat4,
         material: PreparedMaterial,
         pick_index: u32,
+        default_render_class: DefaultRenderClass,
     ) -> Self {
         // Current instance transforms are assumed rigid-body or uniform-scale, so normals can
         // follow the model matrix with w=0 and be normalized once in the fragment shader.
         let draw = DrawUniform::from_instance(model_from_object, material);
+        let edge_policy = edge_visibility_for_render_class(default_render_class);
+        let outline_index = if object_outline_visible_for_render_class(default_render_class) {
+            pick_index
+        } else {
+            0
+        };
 
         Self {
             model_from_object: draw.model_from_object,
             material_color: draw.material_color,
             pick_index,
-            _padding: [0; 3],
+            boundary_edge_visibility: edge_policy.boundary,
+            crease_edge_visibility: edge_policy.crease,
+            outline_index,
         }
     }
 
     fn layout() -> wgpu::VertexBufferLayout<'static> {
-        const ATTRIBUTES: [wgpu::VertexAttribute; 6] = vertex_attr_array![
+        const ATTRIBUTES: [wgpu::VertexAttribute; 9] = vertex_attr_array![
             2 => Float32x4,
             3 => Float32x4,
             4 => Float32x4,
             5 => Float32x4,
             6 => Float32x4,
-            7 => Uint32
+            7 => Uint32,
+            10 => Float32,
+            11 => Float32,
+            12 => Uint32
         ];
 
         wgpu::VertexBufferLayout {
@@ -771,7 +1372,7 @@ impl DepthTarget {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: defaults.depth_format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
@@ -799,15 +1400,100 @@ impl DepthTarget {
 }
 
 #[derive(Debug)]
+struct ScreenSpaceOutlineTargets {
+    _object_id_texture: wgpu::Texture,
+    object_id_view: wgpu::TextureView,
+}
+
+impl ScreenSpaceOutlineTargets {
+    fn new(device: &wgpu::Device, viewport: ViewportSize) -> Self {
+        let viewport = viewport.clamped();
+        let object_id_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("w screen-space outline object-id texture"),
+            size: wgpu::Extent3d {
+                width: viewport.width,
+                height: viewport.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: SCREEN_SPACE_OBJECT_ID_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let object_id_view = object_id_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("w screen-space outline object-id texture view"),
+            ..Default::default()
+        });
+
+        Self {
+            _object_id_texture: object_id_texture,
+            object_id_view,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ScreenSpaceAmbientOcclusionTargets {
+    _normal_texture: wgpu::Texture,
+    normal_view: wgpu::TextureView,
+}
+
+impl ScreenSpaceAmbientOcclusionTargets {
+    fn new(device: &wgpu::Device, viewport: ViewportSize) -> Self {
+        let viewport = viewport.clamped();
+        let normal_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("w screen-space ao normal texture"),
+            size: wgpu::Extent3d {
+                width: viewport.width,
+                height: viewport.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: SCREEN_SPACE_NORMAL_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let normal_view = normal_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("w screen-space ao normal texture view"),
+            ..Default::default()
+        });
+
+        Self {
+            _normal_texture: normal_texture,
+            normal_view,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct MeshRenderer {
     pipeline: wgpu::RenderPipeline,
+    architectural_pipeline: wgpu::RenderPipeline,
+    surface_decal_pipeline: wgpu::RenderPipeline,
+    architectural_surface_decal_pipeline: wgpu::RenderPipeline,
+    normal_pipeline: wgpu::RenderPipeline,
+    ssao_pipeline: wgpu::RenderPipeline,
+    edge_pipeline: wgpu::RenderPipeline,
+    crease_edge_pipeline: wgpu::RenderPipeline,
+    outline_id_pipeline: wgpu::RenderPipeline,
+    outline_pipeline: wgpu::RenderPipeline,
     pick_pipeline: wgpu::RenderPipeline,
+    pick_surface_decal_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     _lighting_buffer: wgpu::Buffer,
     scene_bind_group: wgpu::BindGroup,
+    outline_bind_group_layout: wgpu::BindGroupLayout,
+    ssao_bind_group_layout: wgpu::BindGroupLayout,
+    outline_targets: ScreenSpaceOutlineTargets,
+    ssao_targets: ScreenSpaceAmbientOcclusionTargets,
     viewport: ViewportSize,
     camera: Camera,
     defaults: RenderDefaults,
+    profile: RenderProfileId,
     meshes: Vec<GpuMesh>,
     instance_batches: Vec<GpuInstanceBatch>,
     pick_targets: Vec<PickHit>,
@@ -856,7 +1542,7 @@ impl MeshRenderer {
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
@@ -899,6 +1585,10 @@ impl MeshRenderer {
             label: Some("w basic mesh shader"),
             source: wgpu::ShaderSource::Wgsl(BASIC_MESH_SHADER_WGSL.into()),
         });
+        let architectural_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("w architectural mesh shader"),
+            source: wgpu::ShaderSource::Wgsl(ARCHITECTURAL_MESH_SHADER_WGSL.into()),
+        });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("w mesh pipeline"),
             layout: Some(&pipeline_layout),
@@ -932,6 +1622,455 @@ impl MeshRenderer {
                 targets: &[Some(wgpu::ColorTargetState {
                     format: color_format,
                     blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let architectural_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("w architectural mesh pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &architectural_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[GpuVertex::layout(), GpuInstance::layout()],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: defaults.front_face,
+                    cull_mode: defaults.cull_mode,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: defaults.depth_format,
+                    depth_write_enabled: Some(defaults.depth_write_enabled),
+                    depth_compare: Some(defaults.depth_compare),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &architectural_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        let surface_decal_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("w surface decal mesh pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[GpuVertex::layout(), GpuInstance::layout()],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: defaults.front_face,
+                    cull_mode: defaults.cull_mode,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: defaults.depth_format,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(depth_compare_equal_variant(defaults.depth_compare)),
+                    stencil: wgpu::StencilState::default(),
+                    bias: surface_decal_depth_bias(defaults.depth_compare),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        let architectural_surface_decal_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("w architectural surface decal mesh pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &architectural_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[GpuVertex::layout(), GpuInstance::layout()],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: defaults.front_face,
+                    cull_mode: defaults.cull_mode,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: defaults.depth_format,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(depth_compare_equal_variant(defaults.depth_compare)),
+                    stencil: wgpu::StencilState::default(),
+                    bias: surface_decal_depth_bias(defaults.depth_compare),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &architectural_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        let normal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("w screen-space ao normal shader"),
+            source: wgpu::ShaderSource::Wgsl(NORMAL_MESH_SHADER_WGSL.into()),
+        });
+        let normal_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("w screen-space ao normal pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &normal_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[GpuVertex::layout(), GpuInstance::layout()],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: defaults.front_face,
+                cull_mode: defaults.cull_mode,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: defaults.depth_format,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(depth_compare_equal_variant(defaults.depth_compare)),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &normal_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: SCREEN_SPACE_NORMAL_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let ssao_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("w screen-space ao bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let ssao_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("w screen-space ao pipeline layout"),
+            bind_group_layouts: &[Some(&ssao_bind_group_layout)],
+            immediate_size: 0,
+        });
+        let ssao_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("w screen-space ao shader"),
+            source: wgpu::ShaderSource::Wgsl(SCREEN_SPACE_AO_SHADER_WGSL.into()),
+        });
+        let ssao_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("w screen-space ao pipeline"),
+            layout: Some(&ssao_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &ssao_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &ssao_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let edge_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("w edge ribbon shader"),
+            source: wgpu::ShaderSource::Wgsl(EDGE_RIBBON_SHADER_WGSL.into()),
+        });
+        let edge_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("w edge ribbon pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &edge_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[GpuEdgeVertex::layout(), GpuInstance::layout()],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: defaults.front_face,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: defaults.depth_format,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(depth_compare_equal_variant(defaults.depth_compare)),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &edge_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let crease_edge_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("w crease ribbon shader"),
+            source: wgpu::ShaderSource::Wgsl(CREASE_RIBBON_SHADER_WGSL.into()),
+        });
+        let crease_edge_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("w crease ribbon pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &crease_edge_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[GpuEdgeVertex::layout(), GpuInstance::layout()],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: defaults.front_face,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: defaults.depth_format,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(depth_compare_equal_variant(defaults.depth_compare)),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &crease_edge_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let outline_id_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("w screen-space outline object-id shader"),
+            source: wgpu::ShaderSource::Wgsl(OBJECT_ID_MESH_SHADER_WGSL.into()),
+        });
+        let outline_id_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("w screen-space outline object-id pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &outline_id_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[GpuVertex::layout(), GpuInstance::layout()],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: defaults.front_face,
+                cull_mode: defaults.cull_mode,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: defaults.depth_format,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(depth_compare_equal_variant(defaults.depth_compare)),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &outline_id_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: SCREEN_SPACE_OBJECT_ID_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let outline_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("w screen-space outline bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Uint,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let outline_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("w screen-space outline pipeline layout"),
+                bind_group_layouts: &[Some(&outline_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let outline_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("w screen-space outline shader"),
+            source: wgpu::ShaderSource::Wgsl(SCREEN_SPACE_OUTLINE_SHADER_WGSL.into()),
+        });
+        let outline_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("w screen-space outline pipeline"),
+            layout: Some(&outline_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &outline_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &outline_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -981,16 +2120,71 @@ impl MeshRenderer {
             multiview_mask: None,
             cache: None,
         });
+        let pick_surface_decal_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("w pick surface decal mesh pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &pick_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[GpuVertex::layout(), GpuInstance::layout()],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: defaults.front_face,
+                    cull_mode: defaults.cull_mode,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: defaults.depth_format,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(depth_compare_equal_variant(defaults.depth_compare)),
+                    stencil: wgpu::StencilState::default(),
+                    bias: surface_decal_depth_bias(defaults.depth_compare),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &pick_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Uint,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
 
         Self {
             pipeline,
+            architectural_pipeline,
+            surface_decal_pipeline,
+            architectural_surface_decal_pipeline,
+            normal_pipeline,
+            ssao_pipeline,
+            edge_pipeline,
+            crease_edge_pipeline,
+            outline_id_pipeline,
+            outline_pipeline,
             pick_pipeline,
+            pick_surface_decal_pipeline,
             camera_buffer,
             _lighting_buffer: lighting_buffer,
             scene_bind_group,
+            outline_bind_group_layout,
+            ssao_bind_group_layout,
+            outline_targets: ScreenSpaceOutlineTargets::new(device, viewport),
+            ssao_targets: ScreenSpaceAmbientOcclusionTargets::new(device, viewport),
             viewport: viewport.clamped(),
             camera,
             defaults,
+            profile: RenderProfileId::Diffuse,
             meshes: Vec::new(),
             instance_batches: Vec::new(),
             pick_targets: Vec::new(),
@@ -1020,6 +2214,7 @@ impl MeshRenderer {
                     model_from_object: DMat4::IDENTITY,
                     world_bounds: mesh.bounds,
                     material: PreparedMaterial::default(),
+                    default_render_class: DefaultRenderClass::Physical,
                 }],
             },
         )
@@ -1044,7 +2239,8 @@ impl MeshRenderer {
             .map(|definition| self.upload_mesh_definition(device, definition))
             .collect::<Vec<_>>();
 
-        let mut instances_by_mesh = vec![Vec::new(); scene.definitions.len()];
+        let mut opaque_instances_by_mesh = vec![Vec::new(); scene.definitions.len()];
+        let mut surface_decal_instances_by_mesh = vec![Vec::new(); scene.definitions.len()];
         for instance in &scene.instances {
             let mesh_index = scene
                 .definitions
@@ -1063,18 +2259,31 @@ impl MeshRenderer {
                 world_centroid,
                 world_anchor: world_centroid,
             });
-            instances_by_mesh[mesh_index].push(GpuInstance::from_instance(
+            let gpu_instance = GpuInstance::from_instance(
                 model_from_object,
                 instance.material,
                 pick_index,
-            ));
+                instance.default_render_class,
+            );
+            match RenderLayer::for_render_class(instance.default_render_class) {
+                RenderLayer::Opaque => opaque_instances_by_mesh[mesh_index].push(gpu_instance),
+                RenderLayer::SurfaceDecal => {
+                    surface_decal_instances_by_mesh[mesh_index].push(gpu_instance);
+                }
+            }
         }
 
-        for (mesh_index, instances) in instances_by_mesh.into_iter().enumerate() {
+        for (mesh_index, instances) in opaque_instances_by_mesh.into_iter().enumerate() {
             if instances.is_empty() {
                 continue;
             }
-            self.upload_instance_batch(device, mesh_index, &instances);
+            self.upload_instance_batch(device, mesh_index, RenderLayer::Opaque, &instances);
+        }
+        for (mesh_index, instances) in surface_decal_instances_by_mesh.into_iter().enumerate() {
+            if instances.is_empty() {
+                continue;
+            }
+            self.upload_instance_batch(device, mesh_index, RenderLayer::SurfaceDecal, &instances);
         }
 
         self.update_camera(queue);
@@ -1105,6 +2314,16 @@ impl MeshRenderer {
             contents: cast_slice(&mesh.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
+        let edges = ExtractedMeshEdges::extract(mesh, architectural_edge_extraction_config());
+        let edge_vertices = edge_ribbon_vertices(mesh, &edges);
+        let edge_vertex_count = edge_vertices.len() as u32;
+        let edge_vertex_buffer = (!edge_vertices.is_empty()).then(|| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("w mesh edge ribbon vertex buffer"),
+                contents: cast_slice(&edge_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
 
         let upload = UploadedMesh {
             mesh_id: self.next_mesh_id,
@@ -1118,6 +2337,8 @@ impl MeshRenderer {
             vertex_buffer,
             index_buffer,
             index_count: mesh.indices.len() as u32,
+            edge_vertex_buffer,
+            edge_vertex_count,
         });
 
         upload
@@ -1127,6 +2348,7 @@ impl MeshRenderer {
         &mut self,
         device: &wgpu::Device,
         mesh_index: usize,
+        render_layer: RenderLayer,
         instances: &[GpuInstance],
     ) {
         let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1139,11 +2361,14 @@ impl MeshRenderer {
             mesh_index,
             instance_buffer,
             instance_count: instances.len() as u32,
+            render_layer,
         });
     }
 
-    pub fn resize(&mut self, queue: &wgpu::Queue, viewport: ViewportSize) {
+    pub fn resize(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, viewport: ViewportSize) {
         self.viewport = viewport.clamped();
+        self.outline_targets = ScreenSpaceOutlineTargets::new(device, self.viewport);
+        self.ssao_targets = ScreenSpaceAmbientOcclusionTargets::new(device, self.viewport);
         self.update_camera(queue);
     }
 
@@ -1160,6 +2385,18 @@ impl MeshRenderer {
         self.defaults
     }
 
+    pub fn available_profiles(&self) -> &'static [RenderProfileDescriptor] {
+        available_render_profiles()
+    }
+
+    pub fn profile(&self) -> RenderProfileId {
+        self.profile
+    }
+
+    pub fn set_profile(&mut self, profile: RenderProfileId) {
+        self.profile = profile;
+    }
+
     pub fn render(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1169,8 +2406,46 @@ impl MeshRenderer {
         self.render_with_clear_color(encoder, target, depth_target, self.defaults.clear_color);
     }
 
+    pub fn render_with_device(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        depth_target: &wgpu::TextureView,
+    ) {
+        self.render_with_clear_color_and_device(
+            device,
+            encoder,
+            target,
+            depth_target,
+            self.defaults.clear_color,
+        );
+    }
+
     pub fn render_with_clear_color(
         &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        depth_target: &wgpu::TextureView,
+        clear_color: wgpu::Color,
+    ) {
+        self.render_with_optional_device(None, encoder, target, depth_target, clear_color);
+    }
+
+    pub fn render_with_clear_color_and_device(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        depth_target: &wgpu::TextureView,
+        clear_color: wgpu::Color,
+    ) {
+        self.render_with_optional_device(Some(device), encoder, target, depth_target, clear_color);
+    }
+
+    fn render_with_optional_device(
+        &self,
+        device: Option<&wgpu::Device>,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         depth_target: &wgpu::TextureView,
@@ -1180,22 +2455,153 @@ impl MeshRenderer {
             return;
         }
 
+        let needs_depth_sampling = matches!(
+            self.profile,
+            RenderProfileId::ArchitecturalV2
+                | RenderProfileId::ArchitecturalV3
+                | RenderProfileId::ArchitecturalV4
+        ) && device.is_some();
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("w mesh pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_target,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.defaults.depth_clear_value),
+                        store: if needs_depth_sampling {
+                            wgpu::StoreOp::Store
+                        } else {
+                            wgpu::StoreOp::Discard
+                        },
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let mesh_pipeline = if uses_architectural_surface_lighting(self.profile) {
+                &self.architectural_pipeline
+            } else {
+                &self.pipeline
+            };
+            let surface_decal_pipeline = if uses_architectural_surface_lighting(self.profile) {
+                &self.architectural_surface_decal_pipeline
+            } else {
+                &self.surface_decal_pipeline
+            };
+            pass.set_pipeline(mesh_pipeline);
+            pass.set_bind_group(0, &self.scene_bind_group, &[]);
+
+            for batch in self
+                .instance_batches
+                .iter()
+                .filter(|batch| batch.render_layer == RenderLayer::Opaque)
+            {
+                let mesh = &self.meshes[batch.mesh_index];
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
+                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
+            }
+
+            pass.set_pipeline(surface_decal_pipeline);
+            for batch in self
+                .instance_batches
+                .iter()
+                .filter(|batch| batch.render_layer == RenderLayer::SurfaceDecal)
+            {
+                let mesh = &self.meshes[batch.mesh_index];
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
+                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
+            }
+
+            if self.profile == RenderProfileId::ArchitecturalV1 {
+                self.draw_mesh_edges(&mut pass);
+            }
+            if self.profile == RenderProfileId::ArchitecturalV3 {
+                self.draw_mesh_crease_edges(&mut pass);
+            }
+        }
+
+        if self.profile == RenderProfileId::ArchitecturalV4 {
+            if let Some(device) = device {
+                self.render_normal_buffer(encoder, depth_target);
+                self.render_screen_space_ambient_occlusion(device, encoder, target, depth_target);
+                self.render_mesh_crease_edges_overlay(encoder, target, depth_target);
+            }
+        }
+
+        if uses_screen_space_outline(self.profile) {
+            if let Some(device) = device {
+                self.render_outline_object_ids(encoder, depth_target);
+                self.render_screen_space_outline(device, encoder, target, depth_target);
+            }
+        }
+    }
+
+    fn draw_mesh_edges<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
+        self.draw_mesh_edges_with_pipeline(pass, &self.edge_pipeline);
+    }
+
+    fn draw_mesh_crease_edges<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
+        self.draw_mesh_edges_with_pipeline(pass, &self.crease_edge_pipeline);
+    }
+
+    fn draw_mesh_edges_with_pipeline<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        pipeline: &'pass wgpu::RenderPipeline,
+    ) {
+        pass.set_pipeline(pipeline);
+        for batch in self
+            .instance_batches
+            .iter()
+            .filter(|batch| batch.render_layer == RenderLayer::Opaque)
+        {
+            let mesh = &self.meshes[batch.mesh_index];
+            let Some(edge_vertex_buffer) = &mesh.edge_vertex_buffer else {
+                continue;
+            };
+            pass.set_vertex_buffer(0, edge_vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
+            pass.draw(0..mesh.edge_vertex_count, 0..batch.instance_count);
+        }
+    }
+
+    fn render_mesh_crease_edges_overlay(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        depth_target: &wgpu::TextureView,
+    ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("w mesh pass"),
+            label: Some("w crease edge overlay pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(clear_color),
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth_target,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(self.defaults.depth_clear_value),
-                    store: wgpu::StoreOp::Discard,
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
             }),
@@ -1203,16 +2609,195 @@ impl MeshRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.scene_bind_group, &[]);
+        self.draw_mesh_crease_edges(&mut pass);
+    }
+
+    fn render_normal_buffer(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        depth_target: &wgpu::TextureView,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("w screen-space ao normal pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.ssao_targets.normal_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.5,
+                        g: 0.5,
+                        b: 1.0,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_target,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.normal_pipeline);
         pass.set_bind_group(0, &self.scene_bind_group, &[]);
 
-        for batch in &self.instance_batches {
+        for batch in self
+            .instance_batches
+            .iter()
+            .filter(|batch| batch.render_layer == RenderLayer::Opaque)
+        {
             let mesh = &self.meshes[batch.mesh_index];
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
             pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
         }
+    }
+
+    fn render_screen_space_ambient_occlusion(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        depth_target: &wgpu::TextureView,
+    ) {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("w screen-space ao bind group"),
+            layout: &self.ssao_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(depth_target),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.ssao_targets.normal_view),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("w screen-space ao pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.ssao_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    fn render_outline_object_ids(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        depth_target: &wgpu::TextureView,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("w screen-space outline object-id pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.outline_targets.object_id_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_target,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.outline_id_pipeline);
+        pass.set_bind_group(0, &self.scene_bind_group, &[]);
+
+        for batch in self
+            .instance_batches
+            .iter()
+            .filter(|batch| batch.render_layer == RenderLayer::Opaque)
+        {
+            let mesh = &self.meshes[batch.mesh_index];
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
+            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
+        }
+    }
+
+    fn render_screen_space_outline(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        depth_target: &wgpu::TextureView,
+    ) {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("w screen-space outline bind group"),
+            layout: &self.outline_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(depth_target),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(
+                        &self.outline_targets.object_id_view,
+                    ),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("w screen-space outline pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.outline_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.draw(0..3, 0..1);
     }
 
     pub fn render_pick_region(
@@ -1251,7 +2836,24 @@ impl MeshRenderer {
         pass.set_pipeline(&self.pick_pipeline);
         pass.set_bind_group(0, &self.scene_bind_group, &[]);
 
-        for batch in &self.instance_batches {
+        for batch in self
+            .instance_batches
+            .iter()
+            .filter(|batch| batch.render_layer == RenderLayer::Opaque)
+        {
+            let mesh = &self.meshes[batch.mesh_index];
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
+            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
+        }
+
+        pass.set_pipeline(&self.pick_surface_decal_pipeline);
+        for batch in self
+            .instance_batches
+            .iter()
+            .filter(|batch| batch.render_layer == RenderLayer::SurfaceDecal)
+        {
             let mesh = &self.meshes[batch.mesh_index];
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
@@ -1422,6 +3024,142 @@ fn decode_pick_index(pixel: &[u8]) -> u32 {
         | (u32::from(pixel[3]) << 24)
 }
 
+fn architectural_edge_extraction_config() -> MeshEdgeExtractionConfig {
+    MeshEdgeExtractionConfig {
+        crease_angle_radians: ARCHITECTURAL_CREASE_ANGLE_DEGREES.to_radians(),
+    }
+}
+
+fn depth_compare_equal_variant(compare: wgpu::CompareFunction) -> wgpu::CompareFunction {
+    match compare {
+        wgpu::CompareFunction::Greater | wgpu::CompareFunction::GreaterEqual => {
+            wgpu::CompareFunction::GreaterEqual
+        }
+        _ => wgpu::CompareFunction::LessEqual,
+    }
+}
+
+fn surface_decal_depth_bias(compare: wgpu::CompareFunction) -> wgpu::DepthBiasState {
+    let direction = match compare {
+        wgpu::CompareFunction::Greater | wgpu::CompareFunction::GreaterEqual => 1,
+        _ => -1,
+    };
+
+    wgpu::DepthBiasState {
+        constant: direction,
+        slope_scale: direction as f32,
+        clamp: 0.0,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RenderClassEdgeVisibility {
+    boundary: f32,
+    crease: f32,
+}
+
+fn edge_visibility_for_render_class(class: DefaultRenderClass) -> RenderClassEdgeVisibility {
+    match class {
+        DefaultRenderClass::Terrain => RenderClassEdgeVisibility {
+            boundary: 0.0,
+            crease: 0.0,
+        },
+        DefaultRenderClass::TerrainFeature => RenderClassEdgeVisibility {
+            boundary: 0.0,
+            crease: 1.0,
+        },
+        DefaultRenderClass::Water => RenderClassEdgeVisibility {
+            boundary: 0.0,
+            crease: 0.0,
+        },
+        DefaultRenderClass::SurfaceDecal => RenderClassEdgeVisibility {
+            boundary: 0.0,
+            crease: 0.0,
+        },
+        DefaultRenderClass::Vegetation => RenderClassEdgeVisibility {
+            boundary: 1.0,
+            crease: 0.0,
+        },
+        DefaultRenderClass::VegetationCover => RenderClassEdgeVisibility {
+            boundary: 0.0,
+            crease: 0.0,
+        },
+        _ => RenderClassEdgeVisibility {
+            boundary: 1.0,
+            crease: 1.0,
+        },
+    }
+}
+
+fn object_outline_visible_for_render_class(class: DefaultRenderClass) -> bool {
+    !matches!(
+        class,
+        DefaultRenderClass::Terrain
+            | DefaultRenderClass::VegetationCover
+            | DefaultRenderClass::Water
+            | DefaultRenderClass::SurfaceDecal
+    )
+}
+
+fn uses_architectural_surface_lighting(profile: RenderProfileId) -> bool {
+    matches!(
+        profile,
+        RenderProfileId::ArchitecturalV1
+            | RenderProfileId::ArchitecturalV2
+            | RenderProfileId::ArchitecturalV3
+            | RenderProfileId::ArchitecturalV4
+    )
+}
+
+fn uses_screen_space_outline(profile: RenderProfileId) -> bool {
+    matches!(
+        profile,
+        RenderProfileId::ArchitecturalV2
+            | RenderProfileId::ArchitecturalV3
+            | RenderProfileId::ArchitecturalV4
+    )
+}
+
+fn edge_ribbon_vertices(mesh: &PreparedMesh, edges: &ExtractedMeshEdges) -> Vec<GpuEdgeVertex> {
+    let edge_count = edges.boundary_edges.len() + edges.crease_edges.len();
+    let mut vertices = Vec::with_capacity(edge_count * 6);
+
+    for [start_index, end_index] in edges.boundary_edges.iter().copied() {
+        append_edge_ribbon_vertices(&mut vertices, mesh, start_index, end_index, 0.0);
+    }
+    for [start_index, end_index] in edges.crease_edges.iter().copied() {
+        append_edge_ribbon_vertices(&mut vertices, mesh, start_index, end_index, 1.0);
+    }
+
+    vertices
+}
+
+fn append_edge_ribbon_vertices(
+    vertices: &mut Vec<GpuEdgeVertex>,
+    mesh: &PreparedMesh,
+    start_index: u32,
+    end_index: u32,
+    edge_kind: f32,
+) {
+    let Some(start) = mesh.vertices.get(start_index as usize) else {
+        return;
+    };
+    let Some(end) = mesh.vertices.get(end_index as usize) else {
+        return;
+    };
+    let start = start.position;
+    let end = end.position;
+
+    vertices.extend_from_slice(&[
+        GpuEdgeVertex::new(start, end, [0.0, -1.0], edge_kind),
+        GpuEdgeVertex::new(start, end, [1.0, -1.0], edge_kind),
+        GpuEdgeVertex::new(start, end, [1.0, 1.0], edge_kind),
+        GpuEdgeVertex::new(start, end, [0.0, -1.0], edge_kind),
+        GpuEdgeVertex::new(start, end, [1.0, 1.0], edge_kind),
+        GpuEdgeVertex::new(start, end, [0.0, 1.0], edge_kind),
+    ]);
+}
+
 #[cfg(test)]
 fn encode_pick_index(index: u32) -> [u8; 4] {
     [
@@ -1506,6 +3244,7 @@ pub async fn render_prepared_mesh_offscreen(
                 model_from_object: DMat4::IDENTITY,
                 world_bounds: mesh.bounds,
                 material: PreparedMaterial::default(),
+                default_render_class: DefaultRenderClass::Physical,
             }],
         },
         viewport,
@@ -1575,7 +3314,7 @@ pub async fn render_prepared_scene_offscreen(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("w offscreen encoder"),
     });
-    renderer.render(&mut encoder, &view, depth_target.view());
+    renderer.render_with_device(&device, &mut encoder, &view, depth_target.view());
     encoder.copy_texture_to_buffer(
         texture.as_image_copy(),
         wgpu::TexelCopyBufferInfo {
@@ -1713,14 +3452,102 @@ mod tests {
     fn render_defaults_preserve_current_baseline() {
         let defaults = RenderDefaults::default();
 
-        assert_eq!(defaults.depth_format, wgpu::TextureFormat::Depth24Plus);
+        assert_eq!(defaults.depth_format, wgpu::TextureFormat::Depth32Float);
+        assert_eq!(defaults.depth_clear_value, 0.0);
         assert_eq!(defaults.front_face, wgpu::FrontFace::Ccw);
         assert_eq!(defaults.cull_mode, Some(wgpu::Face::Back));
-        assert_eq!(defaults.depth_compare, wgpu::CompareFunction::Less);
+        assert_eq!(defaults.depth_compare, wgpu::CompareFunction::Greater);
         assert_eq!(
             defaults.directional_light.direction,
             Vec3::new(0.35, -0.45, 0.82)
         );
+    }
+
+    #[test]
+    fn render_classes_control_architectural_edge_overlay_by_edge_kind() {
+        let physical = GpuInstance::from_instance(
+            DMat4::IDENTITY,
+            PreparedMaterial::default(),
+            1,
+            DefaultRenderClass::Physical,
+        );
+        let terrain = GpuInstance::from_instance(
+            DMat4::IDENTITY,
+            PreparedMaterial::default(),
+            2,
+            DefaultRenderClass::Terrain,
+        );
+        let terrain_feature = GpuInstance::from_instance(
+            DMat4::IDENTITY,
+            PreparedMaterial::default(),
+            3,
+            DefaultRenderClass::TerrainFeature,
+        );
+        let vegetation = GpuInstance::from_instance(
+            DMat4::IDENTITY,
+            PreparedMaterial::default(),
+            4,
+            DefaultRenderClass::Vegetation,
+        );
+        let vegetation_cover = GpuInstance::from_instance(
+            DMat4::IDENTITY,
+            PreparedMaterial::default(),
+            5,
+            DefaultRenderClass::VegetationCover,
+        );
+        let water = GpuInstance::from_instance(
+            DMat4::IDENTITY,
+            PreparedMaterial::default(),
+            6,
+            DefaultRenderClass::Water,
+        );
+        let surface_decal = GpuInstance::from_instance(
+            DMat4::IDENTITY,
+            PreparedMaterial::default(),
+            7,
+            DefaultRenderClass::SurfaceDecal,
+        );
+
+        assert_eq!(physical.boundary_edge_visibility, 1.0);
+        assert_eq!(physical.crease_edge_visibility, 1.0);
+        assert_eq!(physical.outline_index, 1);
+        assert_eq!(terrain.boundary_edge_visibility, 0.0);
+        assert_eq!(terrain.crease_edge_visibility, 0.0);
+        assert_eq!(terrain.outline_index, 0);
+        assert_eq!(terrain_feature.boundary_edge_visibility, 0.0);
+        assert_eq!(terrain_feature.crease_edge_visibility, 1.0);
+        assert_eq!(terrain_feature.outline_index, 3);
+        assert_eq!(vegetation.boundary_edge_visibility, 1.0);
+        assert_eq!(vegetation.crease_edge_visibility, 0.0);
+        assert_eq!(vegetation.outline_index, 4);
+        assert_eq!(vegetation_cover.boundary_edge_visibility, 0.0);
+        assert_eq!(vegetation_cover.crease_edge_visibility, 0.0);
+        assert_eq!(vegetation_cover.outline_index, 0);
+        assert_eq!(water.boundary_edge_visibility, 0.0);
+        assert_eq!(water.crease_edge_visibility, 0.0);
+        assert_eq!(water.outline_index, 0);
+        assert_eq!(surface_decal.boundary_edge_visibility, 0.0);
+        assert_eq!(surface_decal.crease_edge_visibility, 0.0);
+        assert_eq!(surface_decal.outline_index, 0);
+    }
+
+    #[test]
+    fn architectural_profiles_use_matte_surface_lighting() {
+        assert!(!uses_architectural_surface_lighting(
+            RenderProfileId::Diffuse
+        ));
+        assert!(uses_architectural_surface_lighting(
+            RenderProfileId::ArchitecturalV1
+        ));
+        assert!(uses_architectural_surface_lighting(
+            RenderProfileId::ArchitecturalV2
+        ));
+        assert!(uses_architectural_surface_lighting(
+            RenderProfileId::ArchitecturalV3
+        ));
+        assert!(uses_architectural_surface_lighting(
+            RenderProfileId::ArchitecturalV4
+        ));
     }
 
     #[test]
@@ -1762,6 +3589,24 @@ mod tests {
         let tall = camera.clip_from_world(ViewportSize::new(720, 1280));
 
         assert_ne!(wide, tall);
+    }
+
+    #[test]
+    fn camera_projection_uses_reverse_z_depth() {
+        let camera = Camera::default();
+        let view_direction = (camera.target - camera.eye).normalize();
+        let near_point = camera.eye + view_direction * camera.near_plane;
+        let far_point = camera.eye + view_direction * camera.far_plane;
+        let clip_from_world = camera.clip_from_world(ViewportSize::new(160, 120));
+        let (_, _, near_depth) =
+            project_world_point(clip_from_world, ViewportSize::new(160, 120), near_point)
+                .expect("near plane projects");
+        let (_, _, far_depth) =
+            project_world_point(clip_from_world, ViewportSize::new(160, 120), far_point)
+                .expect("far plane projects");
+
+        assert!(near_depth > 0.999);
+        assert!(far_depth < 0.001);
     }
 
     #[test]
@@ -1887,6 +3732,7 @@ mod tests {
                     model_from_object: left_transform,
                     world_bounds: mesh.bounds.transformed(left_transform),
                     material: PreparedMaterial::default(),
+                    default_render_class: DefaultRenderClass::Physical,
                 },
                 PreparedRenderInstance {
                     id: GeometryInstanceId(2),
@@ -1895,6 +3741,7 @@ mod tests {
                     model_from_object: right_transform,
                     world_bounds: mesh.bounds.transformed(right_transform),
                     material: PreparedMaterial::default(),
+                    default_render_class: DefaultRenderClass::Physical,
                 },
             ],
         };
@@ -1992,6 +3839,7 @@ mod tests {
                         model_from_object: DMat4::IDENTITY,
                         world_bounds: mesh.bounds,
                         material: PreparedMaterial::default(),
+                        default_render_class: DefaultRenderClass::Physical,
                     },
                     PreparedRenderInstance {
                         id: GeometryInstanceId(2),
@@ -2002,6 +3850,18 @@ mod tests {
                             .bounds
                             .transformed(DMat4::from_translation(DVec3::new(5.0, 0.0, 0.0))),
                         material: PreparedMaterial::new(DisplayColor::new(0.9, 0.3, 0.2)),
+                        default_render_class: DefaultRenderClass::Physical,
+                    },
+                    PreparedRenderInstance {
+                        id: GeometryInstanceId(3),
+                        element_id: SemanticElementId::new("synthetic/marking"),
+                        definition_id: GeometryDefinitionId(7),
+                        model_from_object: DMat4::from_translation(DVec3::new(2.5, 0.0, 0.0)),
+                        world_bounds: mesh
+                            .bounds
+                            .transformed(DMat4::from_translation(DVec3::new(2.5, 0.0, 0.0))),
+                        material: PreparedMaterial::new(DisplayColor::new(1.0, 1.0, 1.0)),
+                        default_render_class: DefaultRenderClass::SurfaceDecal,
                     },
                 ],
             };
@@ -2016,8 +3876,18 @@ mod tests {
 
             assert_eq!(uploads.len(), 1);
             assert_eq!(renderer.meshes.len(), 1);
-            assert_eq!(renderer.instance_batches.len(), 1);
+            assert_eq!(renderer.instance_batches.len(), 2);
+            assert_eq!(renderer.pick_targets.len(), 3);
+            assert_eq!(
+                renderer.instance_batches[0].render_layer,
+                RenderLayer::Opaque
+            );
             assert_eq!(renderer.instance_batches[0].instance_count, 2);
+            assert_eq!(
+                renderer.instance_batches[1].render_layer,
+                RenderLayer::SurfaceDecal
+            );
+            assert_eq!(renderer.instance_batches[1].instance_count, 1);
         });
     }
 
@@ -2086,6 +3956,7 @@ mod tests {
                         model_from_object: left_transform,
                         world_bounds: mesh.bounds.transformed(left_transform),
                         material: PreparedMaterial::default(),
+                        default_render_class: DefaultRenderClass::Physical,
                     },
                     PreparedRenderInstance {
                         id: GeometryInstanceId(2),
@@ -2094,6 +3965,7 @@ mod tests {
                         model_from_object: right_transform,
                         world_bounds: mesh.bounds.transformed(right_transform),
                         material: PreparedMaterial::new(DisplayColor::new(0.9, 0.3, 0.2)),
+                        default_render_class: DefaultRenderClass::Physical,
                     },
                 ],
             };
@@ -2105,6 +3977,51 @@ mod tests {
                 fit_camera_to_render_scene(&scene),
             );
             renderer.upload_prepared_scene(&device, &queue, &scene);
+
+            for profile in [
+                RenderProfileId::ArchitecturalV2,
+                RenderProfileId::ArchitecturalV3,
+                RenderProfileId::ArchitecturalV4,
+            ] {
+                renderer.set_profile(profile);
+                let color_texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("w architectural profile smoke color texture"),
+                    size: wgpu::Extent3d {
+                        width: 160,
+                        height: 120,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+                let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let depth_target = DepthTarget::with_label(
+                    &device,
+                    ViewportSize::new(160, 120),
+                    "w architectural smoke depth",
+                );
+                let mut render_encoder =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("w architectural profile smoke encoder"),
+                    });
+                renderer.render_with_device(
+                    &device,
+                    &mut render_encoder,
+                    &color_view,
+                    depth_target.view(),
+                );
+                let submission = queue.submit([render_encoder.finish()]);
+                device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: Some(submission),
+                        timeout: None,
+                    })
+                    .expect("architectural profile render completes");
+            }
 
             let result = renderer
                 .pick_region(&device, &queue, PickRegion::rect(0, 0, 160, 120))

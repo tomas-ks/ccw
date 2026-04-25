@@ -10,7 +10,8 @@ use cc_w_backend::{
     available_demo_resources,
 };
 use cc_w_render::{
-    Camera, DepthTarget, MeshRenderer, RenderDefaults, ViewportSize, fit_camera_to_render_scene,
+    Camera, DepthTarget, MeshRenderer, RenderDefaults, RenderProfileDescriptor, RenderProfileId,
+    ViewportSize, fit_camera_to_render_scene,
 };
 use cc_w_runtime::{
     FullPackageGeometryStreamProvider, GeometryPackageSource, GeometryPackageSourceError,
@@ -214,6 +215,7 @@ struct AppState {
     selected_resource: String,
     start_view_mode: NativeStartViewMode,
     selected_start_view_mode: NativeStartViewMode,
+    selected_render_profile: RenderProfileId,
     interaction_mode: NativeInteractionMode,
     resource_options: Vec<String>,
     last_load_error: Option<String>,
@@ -280,6 +282,7 @@ impl AppState {
             defaults,
         );
         renderer.upload_prepared_scene(&device, &queue, &render_scene);
+        let selected_render_profile = renderer.profile();
         let depth_target = DepthTarget::with_defaults(
             &device,
             ViewportSize::new(config.width, config.height),
@@ -312,6 +315,7 @@ impl AppState {
             selected_resource: resource.to_string(),
             start_view_mode,
             selected_start_view_mode: start_view_mode,
+            selected_render_profile,
             interaction_mode: NativeInteractionMode::Orbit,
             resource_options,
             last_load_error: None,
@@ -343,6 +347,7 @@ impl AppState {
             "w surface depth target",
         );
         self.renderer.resize(
+            &self.device,
             &self.queue,
             ViewportSize::new(self.config.width, self.config.height),
         );
@@ -381,8 +386,12 @@ impl AppState {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("w frame encoder"),
             });
-        self.renderer
-            .render(&mut encoder, &view, self.depth_target.view());
+        self.renderer.render_with_device(
+            &self.device,
+            &mut encoder,
+            &view,
+            self.depth_target.view(),
+        );
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("w egui pass"),
@@ -503,7 +512,9 @@ impl AppState {
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let mut selected_resource = self.selected_resource.clone();
         let mut selected_start_view_mode = self.selected_start_view_mode;
+        let mut selected_render_profile = self.selected_render_profile;
         let mut interaction_mode = self.interaction_mode;
+        let render_profiles = self.renderer.available_profiles();
         let stats = self.debug_stats();
         let summary = stats.summary_line();
         let load_error = self.last_load_error.clone();
@@ -519,6 +530,8 @@ impl AppState {
                 &mut selected_resource,
                 &self.resource_options,
                 &mut selected_start_view_mode,
+                &mut selected_render_profile,
+                render_profiles,
                 &mut interaction_mode,
             );
             draw_native_debug_panel(
@@ -552,6 +565,14 @@ impl AppState {
 
         if selected_start_view_mode != self.start_view_mode {
             self.apply_start_view_mode(selected_start_view_mode);
+        }
+
+        if selected_render_profile != self.selected_render_profile {
+            self.selected_render_profile = selected_render_profile;
+        }
+
+        if selected_render_profile != self.renderer.profile() {
+            self.apply_render_profile(selected_render_profile);
         }
 
         if interaction_mode != self.interaction_mode {
@@ -615,6 +636,12 @@ impl AppState {
             resolved.visible_element_ids.len()
         ));
         self.upload_current_runtime_scene();
+    }
+
+    fn apply_render_profile(&mut self, profile: RenderProfileId) {
+        self.renderer.set_profile(profile);
+        self.selected_render_profile = profile;
+        self.last_load_error = None;
     }
 
     fn install_runtime_scene(&mut self, loaded_scene: NativeLoadedScene) {
@@ -1124,6 +1151,8 @@ fn draw_native_toolbar(
     selected_resource: &mut String,
     resource_options: &[String],
     selected_start_view_mode: &mut NativeStartViewMode,
+    selected_render_profile: &mut RenderProfileId,
+    render_profiles: &[RenderProfileDescriptor],
     interaction_mode: &mut NativeInteractionMode,
 ) {
     let accent = Color32::from_rgb(230, 93, 71);
@@ -1156,6 +1185,15 @@ fn draw_native_toolbar(
                     .show_ui(ui, |ui| {
                         for mode in NativeStartViewMode::ALL {
                             ui.selectable_value(selected_start_view_mode, mode, mode.label());
+                        }
+                    });
+                ui.label(RichText::new("Profile").strong());
+                ComboBox::from_id_salt("render-profile-picker")
+                    .selected_text(selected_render_profile.label())
+                    .width(150.0)
+                    .show_ui(ui, |ui| {
+                        for profile in render_profiles {
+                            ui.selectable_value(selected_render_profile, profile.id, profile.label);
                         }
                     });
                 ui.label(RichText::new("Tool").strong());

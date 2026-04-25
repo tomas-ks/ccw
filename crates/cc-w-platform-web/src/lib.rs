@@ -1459,6 +1459,12 @@ fn default_render_class_name(class: DefaultRenderClass) -> &'static str {
         DefaultRenderClass::Space => "space",
         DefaultRenderClass::Zone => "zone",
         DefaultRenderClass::Helper => "helper",
+        DefaultRenderClass::Terrain => "terrain",
+        DefaultRenderClass::TerrainFeature => "terrain-feature",
+        DefaultRenderClass::Vegetation => "vegetation",
+        DefaultRenderClass::VegetationCover => "vegetation-cover",
+        DefaultRenderClass::Water => "water",
+        DefaultRenderClass::SurfaceDecal => "surface-decal",
         DefaultRenderClass::Other => "other",
     }
 }
@@ -1469,6 +1475,12 @@ fn parse_default_render_class(name: &str) -> Result<DefaultRenderClass, String> 
         "space" => Ok(DefaultRenderClass::Space),
         "zone" => Ok(DefaultRenderClass::Zone),
         "helper" => Ok(DefaultRenderClass::Helper),
+        "terrain" => Ok(DefaultRenderClass::Terrain),
+        "terrain-feature" => Ok(DefaultRenderClass::TerrainFeature),
+        "vegetation" => Ok(DefaultRenderClass::Vegetation),
+        "vegetation-cover" => Ok(DefaultRenderClass::VegetationCover),
+        "water" => Ok(DefaultRenderClass::Water),
+        "surface-decal" => Ok(DefaultRenderClass::SurfaceDecal),
         "other" => Ok(DefaultRenderClass::Other),
         other => Err(format!("unknown default render class `{other}`")),
     }
@@ -1476,7 +1488,14 @@ fn parse_default_render_class(name: &str) -> Result<DefaultRenderClass, String> 
 
 fn web_default_visibility_for_class_name(name: &str) -> Result<bool, String> {
     Ok(match parse_default_render_class(name)? {
-        DefaultRenderClass::Physical | DefaultRenderClass::Other => true,
+        DefaultRenderClass::Physical
+        | DefaultRenderClass::Terrain
+        | DefaultRenderClass::TerrainFeature
+        | DefaultRenderClass::Vegetation
+        | DefaultRenderClass::VegetationCover
+        | DefaultRenderClass::Water
+        | DefaultRenderClass::SurfaceDecal
+        | DefaultRenderClass::Other => true,
         DefaultRenderClass::Space | DefaultRenderClass::Zone | DefaultRenderClass::Helper => false,
     })
 }
@@ -1514,8 +1533,8 @@ fn map_geometry_backend_error(error: GeometryBackendError) -> GeometryPackageSou
 use cc_w_backend::available_demo_resources;
 #[cfg(target_arch = "wasm32")]
 use cc_w_render::{
-    Camera, DepthTarget, MeshRenderer, RenderDefaults, ViewportSize, fit_camera_to_render_scene,
-    pick_prepared_scene_cpu,
+    Camera, DepthTarget, MeshRenderer, RenderDefaults, RenderProfileDescriptor, RenderProfileId,
+    ViewportSize, fit_camera_to_render_scene, pick_prepared_scene_cpu,
 };
 #[cfg(target_arch = "wasm32")]
 use cc_w_types::{PickHit, PickRegion, PreparedRenderScene, WORLD_FORWARD, WORLD_RIGHT, WORLD_UP};
@@ -1548,6 +1567,8 @@ struct WebPackageRequest<'a> {
 struct WebViewerViewState {
     resource: String,
     view_mode: String,
+    render_profile: String,
+    available_render_profiles: Vec<WebRenderProfileDescriptor>,
     total_elements: usize,
     total_instances: usize,
     total_definitions: usize,
@@ -1566,6 +1587,15 @@ struct WebViewerViewState {
     missing_definition_ids: Vec<u64>,
     triangles: usize,
     draws: usize,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebRenderProfileDescriptor {
+    id: String,
+    name: String,
+    label: String,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2028,6 +2058,41 @@ pub fn viewer_resource_catalog_json() -> Result<String, JsValue> {
 #[wasm_bindgen]
 pub fn viewer_view_state_json() -> Result<String, JsValue> {
     with_web_viewer_state(|state| state.view_state_json())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_available_profiles_json() -> Result<String, JsValue> {
+    with_web_viewer_state(|state| state.render_profiles_json())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_current_profile() -> Result<String, JsValue> {
+    with_web_viewer_state(|state| Ok(state.renderer.profile().as_str().to_string()))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_set_profile(profile: String) -> Result<String, JsValue> {
+    let (json, event) = with_web_viewer_state_mut(|state| {
+        let event = state.apply_render_profile_name(&profile)?;
+        Ok((state.view_state_json()?, event))
+    })?;
+    if let Some(event) = event {
+        dispatch_web_events(vec![event]).map_err(|error| JsValue::from_str(&error))?;
+    }
+    Ok(json)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_set_clear_color(red: f64, green: f64, blue: f64) -> Result<String, JsValue> {
+    with_web_viewer_state_mut(|state| {
+        state.set_clear_color(red, green, blue);
+        state.render()?;
+        state.view_state_json()
+    })
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2595,6 +2660,7 @@ pub fn start() {
 struct WebViewerApp {
     _state: Rc<RefCell<WebViewerState>>,
     _resource_change: Closure<dyn FnMut(Event)>,
+    _profile_change: Closure<dyn FnMut(Event)>,
     _tool_change: Closure<dyn FnMut(Event)>,
     _mouse_down: Closure<dyn FnMut(MouseEvent)>,
     _mouse_move: Closure<dyn FnMut(MouseEvent)>,
@@ -2616,6 +2682,8 @@ impl WebViewerApp {
         let canvas = typed_element::<HtmlCanvasElement>(&document, "viewer-canvas")?;
         let axes_overlay = typed_element::<HtmlCanvasElement>(&document, "axes-overlay")?;
         let resource_picker = typed_element::<HtmlSelectElement>(&document, "resource-picker")?;
+        let profile_picker =
+            typed_element::<HtmlSelectElement>(&document, "render-profile-picker")?;
         let tool_picker = typed_element::<HtmlSelectElement>(&document, "tool-picker")?;
         let status_line = typed_element::<HtmlElement>(&document, "status-line")?;
         let resource_catalog = fetch_available_resource_catalog(&window).await?;
@@ -2669,6 +2737,8 @@ impl WebViewerApp {
             defaults,
         );
         renderer.upload_prepared_scene(&device, &queue, &render_scene);
+        populate_render_profile_picker(&profile_picker, renderer.available_profiles());
+        profile_picker.set_value(renderer.profile().as_str());
         let depth_target = DepthTarget::with_defaults(
             &device,
             ViewportSize::new(config.width, config.height),
@@ -2682,6 +2752,7 @@ impl WebViewerApp {
             axes_overlay,
             axes_overlay_context,
             resource_picker: resource_picker.clone(),
+            profile_picker: profile_picker.clone(),
             tool_picker: tool_picker.clone(),
             status_line,
             resource_catalog,
@@ -2693,6 +2764,7 @@ impl WebViewerApp {
             config,
             renderer,
             depth_target,
+            clear_color: defaults.clear_color,
             orbit,
             drag: DragState::default(),
             last_pick_hits: Vec::new(),
@@ -2711,6 +2783,34 @@ impl WebViewerApp {
         }) as Box<dyn FnMut(Event)>);
         resource_picker
             .add_event_listener_with_callback("change", resource_change.as_ref().unchecked_ref())
+            .map_err(js_error)?;
+
+        let profile_state = state.clone();
+        let profile_change = Closure::wrap(Box::new(move |_event: Event| {
+            let result = {
+                let mut state = profile_state.borrow_mut();
+                let profile = state.profile_picker.value();
+                state.apply_render_profile_name(&profile)
+            };
+            match result {
+                Ok(Some(event)) => {
+                    if let Err(error) = event.dispatch() {
+                        log_viewer_error(&error);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let state = profile_state.borrow_mut();
+                    state
+                        .profile_picker
+                        .set_value(state.renderer.profile().as_str());
+                    state.set_status(&format!("Failed to set render profile: {error}"));
+                    log_viewer_error(&error);
+                }
+            }
+        }) as Box<dyn FnMut(Event)>);
+        profile_picker
+            .add_event_listener_with_callback("change", profile_change.as_ref().unchecked_ref())
             .map_err(js_error)?;
 
         let tool_state = state.clone();
@@ -2877,6 +2977,7 @@ impl WebViewerApp {
         Ok(Self {
             _state: state,
             _resource_change: resource_change,
+            _profile_change: profile_change,
             _tool_change: tool_change,
             _mouse_down: mouse_down,
             _mouse_move: mouse_move,
@@ -2897,6 +2998,7 @@ struct WebViewerState {
     axes_overlay: HtmlCanvasElement,
     axes_overlay_context: CanvasRenderingContext2d,
     resource_picker: HtmlSelectElement,
+    profile_picker: HtmlSelectElement,
     tool_picker: HtmlSelectElement,
     status_line: HtmlElement,
     resource_catalog: WebResourceCatalog,
@@ -2908,6 +3010,7 @@ struct WebViewerState {
     config: wgpu::SurfaceConfiguration,
     renderer: MeshRenderer,
     depth_target: DepthTarget,
+    clear_color: wgpu::Color,
     orbit: OrbitCameraController,
     drag: DragState,
     last_pick_hits: Vec<PickHit>,
@@ -2986,6 +3089,31 @@ impl WebViewerState {
         ])
     }
 
+    fn apply_render_profile_name(
+        &mut self,
+        profile_name: &str,
+    ) -> Result<Option<DeferredWebEvent>, String> {
+        let profile = parse_render_profile_id(profile_name, self.renderer.available_profiles())?;
+        self.profile_picker.set_value(profile.as_str());
+        if profile == self.renderer.profile() {
+            self.refresh_status();
+            return Ok(None);
+        }
+
+        self.renderer.set_profile(profile);
+        self.refresh_status();
+        Ok(Some(self.viewer_state_change_event("renderProfile")?))
+    }
+
+    fn set_clear_color(&mut self, red: f64, green: f64, blue: f64) {
+        self.clear_color = wgpu::Color {
+            r: red.clamp(0.0, 1.0),
+            g: green.clamp(0.0, 1.0),
+            b: blue.clamp(0.0, 1.0),
+            a: 1.0,
+        };
+    }
+
     fn resize_to_window(&mut self) -> Result<Option<DeferredWebEvent>, String> {
         let (width, height) =
             resize_canvases_to_window(&self.window, &self.canvas, &self.axes_overlay)?;
@@ -3003,7 +3131,7 @@ impl WebViewerState {
             "w web depth target",
         );
         self.renderer
-            .resize(&self.queue, ViewportSize::new(width, height));
+            .resize(&self.device, &self.queue, ViewportSize::new(width, height));
         self.draw_world_axes_overlay()?;
 
         Ok(Some(self.pick_anchor_event()?))
@@ -3084,7 +3212,10 @@ impl WebViewerState {
             None
         };
         self.drag.active = false;
-        (request, self.web_event("w-viewer-drag-end", r#"{}"#.to_string()))
+        (
+            request,
+            self.web_event("w-viewer-drag-end", r#"{}"#.to_string()),
+        )
     }
 
     fn cancel_drag(&mut self) -> Option<DeferredWebEvent> {
@@ -3452,8 +3583,13 @@ impl WebViewerState {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("w web frame encoder"),
             });
-        self.renderer
-            .render(&mut encoder, &view, self.depth_target.view());
+        self.renderer.render_with_clear_color_and_device(
+            &self.device,
+            &mut encoder,
+            &view,
+            self.depth_target.view(),
+            self.clear_color,
+        );
         self.queue.submit([encoder.finish()]);
         frame.present();
         self.draw_world_axes_overlay()?;
@@ -3466,7 +3602,17 @@ impl WebViewerState {
     }
 
     fn refresh_status(&self) {
-        self.set_status(&web_viewer_status_line(&self.runtime_scene));
+        self.set_status(&web_viewer_status_line(
+            &self.runtime_scene,
+            self.renderer.profile(),
+        ));
+    }
+
+    fn render_profiles_json(&self) -> Result<String, String> {
+        serde_json::to_string(&web_render_profile_descriptors(
+            self.renderer.available_profiles(),
+        ))
+        .map_err(|error| format!("failed to encode renderer profiles JSON: {error}"))
     }
 
     fn view_state_json(&self) -> Result<String, String> {
@@ -3486,6 +3632,10 @@ impl WebViewerState {
         let snapshot = WebViewerViewState {
             resource: self.current_resource.clone(),
             view_mode: web_view_mode_name(self.runtime_scene.start_view_request()).to_string(),
+            render_profile: self.renderer.profile().as_str().to_string(),
+            available_render_profiles: web_render_profile_descriptors(
+                self.renderer.available_profiles(),
+            ),
             total_elements: catalog.elements.len(),
             total_instances: catalog.instances.len(),
             total_definitions: catalog.definitions.len(),
@@ -3770,6 +3920,60 @@ fn populate_resource_picker(resource_picker: &HtmlSelectElement, resources: &[St
         .join("");
     let element: &Element = resource_picker.unchecked_ref();
     element.set_inner_html(&options);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn populate_render_profile_picker(
+    profile_picker: &HtmlSelectElement,
+    profiles: &[RenderProfileDescriptor],
+) {
+    let options = profiles
+        .iter()
+        .map(|profile| {
+            format!(
+                "<option value=\"{}\">{}</option>",
+                profile.name, profile.label
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let element: &Element = profile_picker.unchecked_ref();
+    element.set_inner_html(&options);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_render_profile_id(
+    profile_name: &str,
+    available_profiles: &[RenderProfileDescriptor],
+) -> Result<RenderProfileId, String> {
+    let profile = profile_name
+        .parse::<RenderProfileId>()
+        .map_err(|error| error.to_string())?;
+    if available_profiles
+        .iter()
+        .any(|descriptor| descriptor.id == profile)
+    {
+        Ok(profile)
+    } else {
+        Err(format!(
+            "render profile `{}` is not available",
+            profile.as_str()
+        ))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_render_profile_descriptors(
+    profiles: &[RenderProfileDescriptor],
+) -> Vec<WebRenderProfileDescriptor> {
+    profiles
+        .iter()
+        .map(|profile| WebRenderProfileDescriptor {
+            id: profile.id.as_str().to_string(),
+            name: profile.name.to_string(),
+            label: profile.label.to_string(),
+        })
+        .collect()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -4066,7 +4270,7 @@ fn web_view_mode_name(request: &GeometryStartViewRequest) -> &'static str {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn web_viewer_status_line(runtime_scene: &RuntimeSceneState) -> String {
+fn web_viewer_status_line(runtime_scene: &RuntimeSceneState, profile: RenderProfileId) -> String {
     let render_scene: PreparedRenderScene = runtime_scene.compose_render_scene();
     let catalog = runtime_scene.catalog();
     let missing = runtime_scene.missing_stream_plan_for_visible_elements();
@@ -4090,7 +4294,8 @@ fn web_viewer_status_line(runtime_scene: &RuntimeSceneState) -> String {
         )
     };
     format!(
-        "{view_mode} · {} meshes · {} tris · {} draws · {visible_elements}/{total_elements} visible · {selected_elements} selected · {stream_status}",
+        "{} · {view_mode} · {} meshes · {} tris · {} draws · {visible_elements}/{total_elements} visible · {selected_elements} selected · {stream_status}",
+        profile.label(),
         render_scene.definitions.len(),
         render_scene.triangle_count(),
         render_scene.draw_count(),

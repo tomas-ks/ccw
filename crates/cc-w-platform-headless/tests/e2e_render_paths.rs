@@ -414,6 +414,7 @@ fn offscreen_renderer_uses_material_color() {
                 ])
                 .expect("bounds"),
                 material: PreparedMaterial::new(DisplayColor::new(0.92, 0.24, 0.18)),
+                default_render_class: DefaultRenderClass::Physical,
             }],
         },
         VIEWPORT,

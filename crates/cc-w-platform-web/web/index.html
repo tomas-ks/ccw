@@ -1,19 +1,122 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>w web viewer</title>
+    <script>
+      (() => {
+        const stored = window.localStorage?.getItem("w-viewer-theme");
+        if (stored === "light" || stored === "dark") {
+          document.documentElement.dataset.theme = stored;
+        }
+      })();
+    </script>
     <link rel="stylesheet" href="./vendor/xterm.css" />
     <style>
       :root {
-        color-scheme: dark;
         font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        background: #0f1320;
-        color: #f3f6ff;
         --side-panel-width: 648px;
         --terminal-height: 220px;
         --resizer-size: 10px;
+        --radius-control: 6px;
+        --radius-panel: 8px;
+        --accent: #8db6ff;
+        --accent-strong: #6ea8fe;
+        --danger: #ffb8aa;
+        --warning: #f2c879;
+      }
+
+      :root[data-theme="dark"] {
+        color-scheme: dark;
+        --surface-app: #0f1320;
+        --surface-viewer: #0f1320;
+        --surface-header: #151b2a;
+        --surface-footer: #151b2a;
+        --surface-panel: #121827;
+        --surface-panel-strong: #101622;
+        --surface-elevated: rgba(18, 24, 39, 0.9);
+        --surface-elevated-solid: #121827;
+        --surface-terminal: #0d1117;
+        --surface-terminal-strong: #0c1018;
+        --surface-graph: #20242c;
+        --surface-control: #101622;
+        --surface-control-hover: #172033;
+        --surface-control-active: #203052;
+        --text-primary: #f3f6ff;
+        --text-secondary: rgba(243, 246, 255, 0.72);
+        --text-muted: rgba(243, 246, 255, 0.58);
+        --text-soft: rgba(243, 246, 255, 0.68);
+        --text-disabled: rgba(243, 246, 255, 0.36);
+        --border-subtle: rgba(255, 255, 255, 0.08);
+        --border-strong: rgba(255, 255, 255, 0.12);
+        --border-accent: rgba(141, 182, 255, 0.54);
+        --hover-accent: rgba(141, 182, 255, 0.12);
+        --shadow-panel: 0 18px 38px rgba(0, 0, 0, 0.32);
+        --viewer-clear: #0f1320;
+        --terminal-foreground: #d7deee;
+        --terminal-selection: rgba(141, 182, 255, 0.24);
+        --balloon-arrow-border: rgba(255, 255, 255, 0.13);
+        --graph-label: #d8e4ff;
+        --graph-edge: rgba(141, 182, 255, 0.32);
+        --graph-edge-size: 1.45;
+        --graph-edge-label: rgba(224, 233, 255, 0.9);
+        --graph-hover-fill: rgba(243, 246, 255, 0.12);
+        --graph-hover-panel: rgba(15, 19, 32, 0.92);
+        --graph-hover-border: rgba(141, 182, 255, 0.28);
+        --graph-node-selected: #f2c879;
+        --graph-node-relation: #9fb5d9;
+        --graph-node-spatial: #8ec2ff;
+        --graph-node-wall: #79d8b7;
+        --graph-node-slab: #f0c187;
+        --graph-node-space: #dba8ff;
+        --graph-node-default: #7fb1e6;
+      }
+
+      :root[data-theme="light"] {
+        color-scheme: light;
+        --surface-app: #eff1f2;
+        --surface-viewer: #fafbfb;
+        --surface-header: #d7dadd;
+        --surface-footer: #d7dadd;
+        --surface-panel: #f0f2f3;
+        --surface-panel-strong: #e7eaec;
+        --surface-elevated: rgba(255, 255, 255, 0.9);
+        --surface-elevated-solid: #ffffff;
+        --surface-terminal: #eceff2;
+        --surface-terminal-strong: #f7f8f8;
+        --surface-graph: #f5f6f7;
+        --surface-control: #f8f9fb;
+        --surface-control-hover: #ffffff;
+        --surface-control-active: #dbe8ff;
+        --text-primary: #20242c;
+        --text-secondary: rgba(32, 36, 44, 0.74);
+        --text-muted: rgba(32, 36, 44, 0.58);
+        --text-soft: rgba(32, 36, 44, 0.66);
+        --text-disabled: rgba(32, 36, 44, 0.38);
+        --border-subtle: rgba(33, 37, 45, 0.14);
+        --border-strong: rgba(33, 37, 45, 0.2);
+        --border-accent: rgba(67, 119, 205, 0.46);
+        --hover-accent: rgba(67, 119, 205, 0.11);
+        --shadow-panel: 0 18px 42px rgba(32, 36, 44, 0.16);
+        --viewer-clear: #fafbfb;
+        --terminal-foreground: #242a34;
+        --terminal-selection: rgba(67, 119, 205, 0.2);
+        --balloon-arrow-border: rgba(33, 37, 45, 0.18);
+        --graph-label: #223044;
+        --graph-edge: rgba(48, 105, 164, 0.72);
+        --graph-edge-size: 1.85;
+        --graph-edge-label: rgba(28, 42, 62, 0.82);
+        --graph-hover-fill: rgba(76, 112, 150, 0.1);
+        --graph-hover-panel: rgba(255, 255, 255, 0.92);
+        --graph-hover-border: rgba(76, 112, 150, 0.28);
+        --graph-node-selected: #c79a3e;
+        --graph-node-relation: #9aa7b6;
+        --graph-node-spatial: #5f90c2;
+        --graph-node-wall: #5b9d8a;
+        --graph-node-slab: #b98258;
+        --graph-node-space: #8f82b5;
+        --graph-node-default: #6b8fac;
       }
 
       * {
@@ -30,8 +133,8 @@
         display: flex;
         flex-direction: column;
         overflow: hidden;
-        background: #0f1320;
-        color: #f3f6ff;
+        background: var(--surface-app);
+        color: var(--text-primary);
       }
 
       body.is-resizing {
@@ -71,8 +174,8 @@
         justify-content: space-between;
         gap: 12px;
         padding: 5px 12px;
-        background: #151b2a;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        background: var(--surface-header);
+        border-bottom: 1px solid var(--border-subtle);
       }
 
       .header-tools,
@@ -89,30 +192,30 @@
         align-items: center;
         justify-content: center;
         padding: 0;
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        border-radius: 6px;
-        background: #101622;
-        color: rgba(243, 246, 255, 0.72);
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-control);
+        background: var(--surface-control);
+        color: var(--text-secondary);
         cursor: pointer;
       }
 
       .icon-button:hover {
-        color: #f3f6ff;
-        border-color: rgba(141, 182, 255, 0.32);
+        color: var(--text-primary);
+        border-color: var(--border-accent);
       }
 
       .icon-button:disabled {
         opacity: 0.45;
         cursor: default;
-        color: rgba(243, 246, 255, 0.44);
-        border-color: rgba(255, 255, 255, 0.08);
+        color: var(--text-disabled);
+        border-color: var(--border-subtle);
       }
 
       .icon-button.active,
       .icon-button[aria-pressed="true"] {
-        color: #f3f6ff;
-        background: #203052;
-        border-color: rgba(141, 182, 255, 0.54);
+        color: var(--text-primary);
+        background: var(--surface-control-active);
+        border-color: var(--border-accent);
       }
 
       .icon-button svg {
@@ -126,6 +229,48 @@
         stroke-linejoin: round;
       }
 
+      .settings-menu {
+        position: relative;
+      }
+
+      .settings-dropdown {
+        position: absolute;
+        top: calc(100% + 8px);
+        right: 0;
+        z-index: 24;
+        width: 210px;
+        padding: 10px;
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-panel);
+        background: var(--surface-elevated);
+        box-shadow: var(--shadow-panel);
+        backdrop-filter: blur(10px);
+      }
+
+      .settings-dropdown[hidden] {
+        display: none;
+      }
+
+      .settings-label {
+        margin: 0 0 7px;
+        color: var(--text-muted);
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+
+      .settings-select {
+        width: 100%;
+        height: 28px;
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-control);
+        background: var(--surface-control);
+        color: var(--text-primary);
+        font: inherit;
+        padding: 0 8px;
+      }
+
       .outliner-window {
         position: absolute;
         top: 12px;
@@ -136,10 +281,10 @@
         display: flex;
         flex-direction: column;
         overflow: hidden;
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        border-radius: 8px;
-        background: rgba(18, 24, 39, 0.9);
-        box-shadow: 0 18px 38px rgba(0, 0, 0, 0.32);
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-panel);
+        background: var(--surface-elevated);
+        box-shadow: var(--shadow-panel);
         backdrop-filter: blur(10px);
       }
 
@@ -153,7 +298,7 @@
         justify-content: space-between;
         gap: 10px;
         padding: 11px 12px;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        border-bottom: 1px solid var(--border-subtle);
       }
 
       .outliner-title {
@@ -165,7 +310,7 @@
       .outliner-subtitle {
         margin: 2px 0 0;
         font-size: 11px;
-        color: rgba(243, 246, 255, 0.58);
+        color: var(--text-muted);
       }
 
       .outliner-close-button {
@@ -182,7 +327,7 @@
 
       .outliner-empty {
         padding: 10px;
-        color: rgba(243, 246, 255, 0.64);
+        color: var(--text-soft);
         font-size: 12px;
       }
 
@@ -198,12 +343,12 @@
       }
 
       .outliner-row:hover {
-        background: rgba(141, 182, 255, 0.08);
+        background: var(--hover-accent);
       }
 
       .outliner-row input {
         margin: 0;
-        accent-color: #8db6ff;
+        accent-color: var(--accent);
       }
 
       .outliner-name {
@@ -217,7 +362,7 @@
 
       .outliner-count {
         font-size: 11px;
-        color: rgba(243, 246, 255, 0.56);
+        color: var(--text-muted);
         white-space: nowrap;
       }
 
@@ -228,8 +373,8 @@
         align-items: center;
         gap: 12px;
         padding: 5px 12px;
-        background: #151b2a;
-        border-top: 1px solid rgba(255, 255, 255, 0.08);
+        background: var(--surface-footer);
+        border-top: 1px solid var(--border-subtle);
       }
 
       .viewer-footer label {
@@ -237,7 +382,7 @@
         align-items: center;
         gap: 6px;
         font-size: 12px;
-        color: rgba(243, 246, 255, 0.72);
+        color: var(--text-secondary);
         white-space: nowrap;
       }
 
@@ -245,9 +390,9 @@
         height: 24px;
         min-width: 148px;
         max-width: 280px;
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        border-radius: 6px;
-        background: #0f1320;
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-control);
+        background: var(--surface-control);
         color: inherit;
         padding: 0 8px;
         font: inherit;
@@ -257,7 +402,7 @@
         min-width: 0;
         flex: 1 1 auto;
         font-size: 12px;
-        color: rgba(243, 246, 255, 0.68);
+        color: var(--text-soft);
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -283,7 +428,7 @@
         flex: 1;
         min-height: 320px;
         overflow: hidden;
-        background: #0f1320;
+        background: var(--surface-viewer);
       }
 
       #viewer-canvas,
@@ -296,7 +441,7 @@
       }
 
       #viewer-canvas {
-        background: #0f1320;
+        background: var(--surface-viewer);
         touch-action: none;
       }
 
@@ -311,8 +456,8 @@
         display: grid;
         grid-template-rows: 1fr;
         overflow: hidden;
-        background: #121827;
-        border-left: 1px solid rgba(255, 255, 255, 0.08);
+        background: var(--surface-panel);
+        border-left: 1px solid var(--border-subtle);
       }
 
       body.graph-hidden .side-panel,
@@ -341,7 +486,7 @@
 
       .splitter:hover::before,
       .splitter.active::before {
-        background: rgba(141, 182, 255, 0.22);
+        background: color-mix(in srgb, var(--accent) 28%, transparent);
       }
 
       .splitter.vertical {
@@ -353,7 +498,7 @@
         left: 50%;
         width: 1px;
         transform: translateX(-50%);
-        background: rgba(255, 255, 255, 0.08);
+        background: var(--border-subtle);
       }
 
       .splitter.horizontal {
@@ -365,7 +510,7 @@
         top: 50%;
         height: 1px;
         transform: translateY(-50%);
-        background: rgba(255, 255, 255, 0.08);
+        background: var(--border-subtle);
       }
 
       .panel-tabs {
@@ -374,8 +519,8 @@
         padding: 0 16px;
         height: 48px;
         align-items: end;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-        background: #151b2a;
+        border-bottom: 1px solid var(--border-subtle);
+        background: var(--surface-header);
       }
 
       .panel-tab {
@@ -385,7 +530,7 @@
         border-bottom: 2px solid transparent;
         border-radius: 0;
         background: transparent;
-        color: rgba(243, 246, 255, 0.68);
+        color: var(--text-soft);
         font: inherit;
         font-size: 13px;
         font-weight: 600;
@@ -393,12 +538,12 @@
       }
 
       .panel-tab:hover {
-        color: #f3f6ff;
+        color: var(--text-primary);
       }
 
       .panel-tab.active {
-        color: #f3f6ff;
-        border-bottom-color: #8db6ff;
+        color: var(--text-primary);
+        border-bottom-color: var(--accent);
       }
 
       .side-panel-body {
@@ -424,15 +569,15 @@
         justify-content: space-between;
         gap: 12px;
         padding: 7px 12px;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        border-bottom: 1px solid var(--border-subtle);
       }
 
       .ui-button {
         height: 28px;
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        border-radius: 6px;
-        background: #172033;
-        color: #f3f6ff;
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-control);
+        background: var(--surface-control-hover);
+        color: var(--text-primary);
         padding: 0 10px;
         font: inherit;
         font-size: 12px;
@@ -451,7 +596,7 @@
       }
 
       .graph-status {
-        color: rgba(243, 246, 255, 0.72);
+        color: var(--text-secondary);
       }
 
       .graph-floating-button {
@@ -461,14 +606,14 @@
         z-index: 5;
         width: 26px;
         height: 24px;
-        background: rgba(16, 22, 34, 0.86);
+        background: color-mix(in srgb, var(--surface-control) 86%, transparent);
         backdrop-filter: blur(6px);
       }
 
       .graph-floating-button:disabled {
         opacity: 0.45;
         cursor: default;
-        border-color: rgba(255, 255, 255, 0.08);
+        border-color: var(--border-subtle);
       }
 
       .graph-floating-button:focus:not(:focus-visible) {
@@ -476,11 +621,11 @@
       }
 
       .graph-status[data-tone="warn"] {
-        color: #f2c879;
+        color: var(--warning);
       }
 
       .graph-status[data-tone="error"] {
-        color: #ffb8aa;
+        color: var(--danger);
       }
 
       .graph-shell {
@@ -488,7 +633,7 @@
         flex: 1;
         min-height: 0;
         overflow: hidden;
-        background: #20242c;
+        background: var(--surface-graph);
       }
 
       .graph-view,
@@ -498,7 +643,7 @@
       }
 
       .graph-view {
-        background: #20242c;
+        background: var(--surface-graph);
       }
 
       .graph-fallback-list {
@@ -510,7 +655,7 @@
         width: 100%;
         padding: 10px 12px;
         border: none;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        border-bottom: 1px solid var(--border-subtle);
         background: transparent;
         color: inherit;
         text-align: left;
@@ -519,7 +664,7 @@
 
       .graph-fallback-row:hover,
       .graph-fallback-row.active {
-        background: rgba(141, 182, 255, 0.12);
+        background: var(--hover-accent);
       }
 
       .graph-fallback-row strong {
@@ -532,12 +677,12 @@
         display: block;
         margin-top: 4px;
         font-size: 12px;
-        color: rgba(243, 246, 255, 0.68);
+        color: var(--text-soft);
       }
 
       .properties-header {
         padding: 14px;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        border-bottom: 1px solid var(--border-subtle);
       }
 
       .properties-balloon {
@@ -549,10 +694,10 @@
         display: flex;
         flex-direction: column;
         overflow: visible;
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        border-radius: 8px;
-        background: rgba(18, 24, 39, 0.88);
-        box-shadow: 0 18px 38px rgba(0, 0, 0, 0.32);
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-panel);
+        background: var(--surface-elevated);
+        box-shadow: var(--shadow-panel);
         backdrop-filter: blur(10px);
         pointer-events: none;
       }
@@ -579,28 +724,28 @@
         left: -14px;
         border-top: 10px solid transparent;
         border-bottom: 10px solid transparent;
-        border-right: 14px solid rgba(255, 255, 255, 0.13);
+        border-right: 14px solid var(--balloon-arrow-border);
       }
 
       .properties-balloon[data-side="right"]::after {
         left: -11px;
         border-top: 8px solid transparent;
         border-bottom: 8px solid transparent;
-        border-right: 11px solid rgba(18, 24, 39, 0.88);
+        border-right: 11px solid var(--surface-elevated);
       }
 
       .properties-balloon[data-side="left"]::before {
         right: -14px;
         border-top: 10px solid transparent;
         border-bottom: 10px solid transparent;
-        border-left: 14px solid rgba(255, 255, 255, 0.13);
+        border-left: 14px solid var(--balloon-arrow-border);
       }
 
       .properties-balloon[data-side="left"]::after {
         right: -11px;
         border-top: 8px solid transparent;
         border-bottom: 8px solid transparent;
-        border-left: 11px solid rgba(18, 24, 39, 0.88);
+        border-left: 11px solid var(--surface-elevated);
       }
 
       .properties-balloon[data-side="center"]::before,
@@ -611,8 +756,8 @@
       .properties-balloon .properties-header {
         padding: 12px 14px;
         overflow: hidden;
-        border-top-left-radius: 8px;
-        border-top-right-radius: 8px;
+        border-top-left-radius: var(--radius-panel);
+        border-top-right-radius: var(--radius-panel);
       }
 
       .properties-balloon .properties-title {
@@ -639,18 +784,18 @@
         align-items: center;
         justify-content: center;
         padding: 0;
-        border: 1px solid rgba(141, 182, 255, 0.24);
-        border-radius: 6px;
-        background: rgba(141, 182, 255, 0.08);
-        color: rgba(243, 246, 255, 0.76);
+        border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+        border-radius: var(--radius-control);
+        background: color-mix(in srgb, var(--accent) 9%, transparent);
+        color: var(--text-secondary);
         cursor: pointer;
         pointer-events: auto;
       }
 
       .properties-graph-button:hover {
-        color: #f3f6ff;
-        border-color: rgba(141, 182, 255, 0.48);
-        background: rgba(141, 182, 255, 0.14);
+        color: var(--text-primary);
+        border-color: var(--border-accent);
+        background: var(--hover-accent);
       }
 
       .properties-graph-button svg {
@@ -674,17 +819,17 @@
         right: 9px;
         width: 24px;
         height: 24px;
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 6px;
-        background: rgba(255, 255, 255, 0.04);
-        color: rgba(243, 246, 255, 0.72);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-control);
+        background: color-mix(in srgb, var(--surface-control-hover) 55%, transparent);
+        color: var(--text-secondary);
         cursor: pointer;
         pointer-events: auto;
       }
 
       .properties-close:hover {
-        color: #f3f6ff;
-        border-color: rgba(141, 182, 255, 0.34);
+        color: var(--text-primary);
+        border-color: var(--border-accent);
       }
 
       body.viewer-dragging .properties-close,
@@ -697,10 +842,10 @@
         z-index: 19;
         width: 12px;
         height: 12px;
-        border: 2px solid #f3f6ff;
+        border: 2px solid var(--surface-elevated-solid);
         border-radius: 999px;
-        background: #8db6ff;
-        box-shadow: 0 0 0 5px rgba(141, 182, 255, 0.18), 0 8px 18px rgba(0, 0, 0, 0.28);
+        background: var(--accent);
+        box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 22%, transparent), 0 8px 18px rgba(0, 0, 0, 0.2);
         transform: translate(-50%, -50%);
         pointer-events: none;
       }
@@ -708,7 +853,7 @@
       .properties-kicker {
         margin: 0 0 6px;
         font-size: 12px;
-        color: rgba(243, 246, 255, 0.58);
+        color: var(--text-muted);
         text-transform: uppercase;
         letter-spacing: 0.04em;
       }
@@ -722,7 +867,7 @@
       .properties-subtitle {
         margin: 8px 0 0;
         font-size: 13px;
-        color: rgba(243, 246, 255, 0.72);
+        color: var(--text-secondary);
       }
 
       .properties-content {
@@ -737,7 +882,7 @@
 
       .properties-empty {
         font-size: 13px;
-        color: rgba(243, 246, 255, 0.72);
+        color: var(--text-secondary);
       }
 
       .properties-section {
@@ -761,12 +906,12 @@
 
       .property-label {
         font-size: 12px;
-        color: rgba(243, 246, 255, 0.6);
+        color: var(--text-muted);
       }
 
       .property-value {
         font-size: 12px;
-        color: #f3f6ff;
+        color: var(--text-primary);
         word-break: break-word;
       }
 
@@ -778,7 +923,7 @@
 
       .relation-row {
         padding-bottom: 8px;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        border-bottom: 1px solid var(--border-subtle);
       }
 
       .relation-row:last-child {
@@ -795,7 +940,7 @@
         display: block;
         margin-top: 3px;
         font-size: 12px;
-        color: rgba(243, 246, 255, 0.68);
+        color: var(--text-soft);
       }
 
       .terminal {
@@ -804,7 +949,7 @@
         min-height: 0;
         display: flex;
         overflow: hidden;
-        background: #0d1117;
+        background: var(--surface-terminal);
       }
 
       .terminal-tools {
@@ -837,7 +982,7 @@
         border-bottom: 2px solid transparent;
         border-radius: 0;
         background: transparent;
-        color: rgba(243, 246, 255, 0.72);
+        color: var(--text-secondary);
         font: inherit;
         font-size: 12px;
         font-weight: 700;
@@ -846,12 +991,12 @@
       }
 
       .terminal-tool-tab:hover {
-        color: #f3f6ff;
+        color: var(--text-primary);
       }
 
       .terminal-tool-tab.active {
-        color: #f3f6ff;
-        border-bottom-color: #8db6ff;
+        color: var(--text-primary);
+        border-bottom-color: var(--accent);
       }
 
       .terminal-screen {
@@ -863,7 +1008,7 @@
         flex: 1;
         overflow: hidden;
         padding: 8px 12px 12px;
-        background: #0d1117;
+        background: var(--surface-terminal);
       }
 
       .terminal-side {
@@ -873,8 +1018,8 @@
         flex-direction: column;
         align-items: stretch;
         justify-content: flex-start;
-        background: #0c1018;
-        border-right: 1px solid rgba(255, 255, 255, 0.04);
+        background: var(--surface-terminal-strong);
+        border-right: 1px solid var(--border-subtle);
         padding-top: 8px;
       }
 
@@ -885,7 +1030,7 @@
         min-width: 0;
         min-height: 0;
         overflow: hidden;
-        background: #0c1018;
+        background: var(--surface-terminal-strong);
         font: 12px/1.5 ui-monospace, SFMono-Regular, SF Mono, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
         display: none;
       }
@@ -902,7 +1047,7 @@
         align-items: center;
         justify-content: flex-end;
         gap: 8px;
-        color: rgba(243, 246, 255, 0.52);
+        color: var(--text-muted);
         font-size: 12px;
       }
 
@@ -917,17 +1062,17 @@
         height: 24px;
         min-width: 112px;
         max-width: 190px;
-        border: 1px solid rgba(141, 182, 255, 0.2);
-        border-radius: 6px;
-        background: #101622;
-        color: rgba(243, 246, 255, 0.78);
+        border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
+        border-radius: var(--radius-control);
+        background: var(--surface-control);
+        color: var(--text-secondary);
         font: inherit;
         padding: 0 20px 0 6px;
       }
 
       .agent-capability-controls select:disabled {
-        color: rgba(243, 246, 255, 0.36);
-        border-color: rgba(255, 255, 255, 0.08);
+        color: var(--text-disabled);
+        border-color: var(--border-subtle);
       }
 
       .terminal-host .xterm {
@@ -935,9 +1080,9 @@
       }
 
       .terminal-host .xterm-viewport {
-        background-color: #0c1018 !important;
+        background-color: var(--surface-terminal-strong) !important;
         overflow-y: auto !important;
-        scrollbar-color: rgba(255, 255, 255, 0.18) #0c1018;
+        scrollbar-color: var(--border-strong) var(--surface-terminal-strong);
       }
 
       .terminal-host .xterm-screen {
@@ -949,11 +1094,11 @@
       }
 
       .terminal-host .xterm-viewport::-webkit-scrollbar-track {
-        background: #0c1018;
+        background: var(--surface-terminal-strong);
       }
 
       .terminal-host .xterm-viewport::-webkit-scrollbar-thumb {
-        background: rgba(255, 255, 255, 0.16);
+        background: var(--border-strong);
         border-radius: 999px;
       }
 
@@ -1090,6 +1235,33 @@
             <path d="M6.4 9.2l.4 6.4" />
           </svg>
         </button>
+        <div class="settings-menu">
+          <button
+            class="icon-button settings-toggle-button"
+            id="settings-toggle-button"
+            type="button"
+            aria-label="Open settings"
+            aria-expanded="false"
+            title="Settings"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="3.2" />
+              <path d="M12 3.8v2.3" />
+              <path d="M12 17.9v2.3" />
+              <path d="M4.9 7.9l2 1.2" />
+              <path d="M17.1 14.9l2 1.2" />
+              <path d="M19.1 7.9l-2 1.2" />
+              <path d="M6.9 14.9l-2 1.2" />
+            </svg>
+          </button>
+          <div class="settings-dropdown" id="settings-dropdown" hidden>
+            <p class="settings-label">Theme</p>
+            <select class="settings-select" id="theme-select" aria-label="Theme">
+              <option value="dark">Dark</option>
+              <option value="light">Light</option>
+            </select>
+          </div>
+        </div>
       </div>
     </header>
     <main class="workspace">
@@ -1276,6 +1448,10 @@
         Model
         <select id="resource-picker"></select>
       </label>
+      <label>
+        Profile
+        <select id="render-profile-picker"></select>
+      </label>
       <div class="status" id="status-line">Starting w web viewer…</div>
       <div class="agent-capability-controls" id="agent-capability-controls" aria-label="AI model controls">
         <label>
@@ -1312,7 +1488,9 @@
       import { Terminal } from "./vendor/xterm.mjs";
       import init, {
         viewer_clear_selection,
+        viewer_available_profiles_json,
         viewer_current_resource,
+        viewer_current_profile,
         viewer_default_element_ids,
         viewer_frame_visible,
         viewer_hide_elements,
@@ -1325,6 +1503,8 @@
         viewer_reset_element_visibility,
         viewer_select_elements,
         viewer_selected_element_ids,
+        viewer_set_clear_color,
+        viewer_set_profile,
         viewer_set_view_mode,
         viewer_show_elements,
         viewer_stream_visible as viewer_stream_newly_visible_geometry,
@@ -1371,6 +1551,8 @@
         height: 640,
       };
       const GRAPH_CAMERA_BASE_PADDING = 1.18;
+      const VIEWER_THEME_STORAGE_KEY = "w-viewer-theme";
+      const VIEWER_THEMES = new Set(["dark", "light"]);
       const resourceCatalogState = {
         resources: [],
         projects: [],
@@ -1411,8 +1593,160 @@
         return "none";
       }
 
+      function normalizeViewerTheme(theme) {
+        const normalized = String(theme || "").trim().toLowerCase();
+        return VIEWER_THEMES.has(normalized) ? normalized : "dark";
+      }
+
+      function readStoredViewerTheme() {
+        return normalizeViewerTheme(
+          window.localStorage?.getItem(VIEWER_THEME_STORAGE_KEY) ||
+            document.documentElement.dataset.theme ||
+            "dark"
+        );
+      }
+
+      function currentViewerTheme() {
+        return normalizeViewerTheme(document.documentElement.dataset.theme || "dark");
+      }
+
+      function cssVariable(name) {
+        return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      }
+
+      function cssVariableOr(name, fallback) {
+        return cssVariable(name) || fallback;
+      }
+
+      function parseCssColorToRgb(color) {
+        const value = String(color || "").trim();
+        const hex = value.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+        if (hex) {
+          const raw = hex[1].length === 3
+            ? hex[1].split("").map((ch) => `${ch}${ch}`).join("")
+            : hex[1];
+          return [
+            parseInt(raw.slice(0, 2), 16) / 255,
+            parseInt(raw.slice(2, 4), 16) / 255,
+            parseInt(raw.slice(4, 6), 16) / 255,
+          ];
+        }
+        const rgb = value.match(/^rgba?\(([^)]+)\)$/i);
+        if (rgb) {
+          const parts = rgb[1].split(",").map((part) => Number.parseFloat(part.trim()));
+          if (parts.length >= 3 && parts.slice(0, 3).every(Number.isFinite)) {
+            return parts.slice(0, 3).map((part) => Math.max(0, Math.min(255, part)) / 255);
+          }
+        }
+        return null;
+      }
+
+      function viewerClearColorFromTheme() {
+        return parseCssColorToRgb(cssVariable("--viewer-clear")) || [0.04, 0.05, 0.08];
+      }
+
+      function graphPalette() {
+        return {
+          label: cssVariableOr("--graph-label", "#d8e4ff"),
+          edge: cssVariableOr("--graph-edge", "rgba(141, 182, 255, 0.32)"),
+          edgeSize: Number.parseFloat(cssVariableOr("--graph-edge-size", "1.45")) || 1.45,
+          edgeLabel: cssVariableOr("--graph-edge-label", "rgba(224, 233, 255, 0.9)"),
+          hoverFill: cssVariableOr("--graph-hover-fill", "rgba(243, 246, 255, 0.12)"),
+          hoverPanel: cssVariableOr("--graph-hover-panel", "rgba(15, 19, 32, 0.92)"),
+          hoverBorder: cssVariableOr("--graph-hover-border", "rgba(141, 182, 255, 0.28)"),
+          selected: cssVariableOr("--graph-node-selected", "#f2c879"),
+          relation: cssVariableOr("--graph-node-relation", "#9fb5d9"),
+          spatial: cssVariableOr("--graph-node-spatial", "#8ec2ff"),
+          wall: cssVariableOr("--graph-node-wall", "#79d8b7"),
+          slab: cssVariableOr("--graph-node-slab", "#f0c187"),
+          space: cssVariableOr("--graph-node-space", "#dba8ff"),
+          fallback: cssVariableOr("--graph-node-default", "#7fb1e6"),
+        };
+      }
+
+      function terminalThemeForTheme(theme = currentViewerTheme()) {
+        const normalized = normalizeViewerTheme(theme);
+        const background = cssVariable("--surface-terminal-strong") || TERMINAL_SURFACE_BACKGROUND;
+        const foreground = cssVariable("--terminal-foreground") || "#d7deee";
+        const selectionBackground = cssVariable("--terminal-selection") || "rgba(141, 182, 255, 0.24)";
+        if (normalized === "light") {
+          return {
+            background,
+            foreground,
+            cursor: "#3f6fbf",
+            cursorAccent: background,
+            selectionBackground,
+            black: "#242a34",
+            red: "#a9473b",
+            green: "#2f7d4e",
+            yellow: "#90620f",
+            blue: "#3f6fbf",
+            magenta: "#7954a8",
+            cyan: "#247985",
+            white: "#f7f8f8",
+            brightBlack: "#77808d",
+            brightRed: "#c95a4e",
+            brightGreen: "#39965e",
+            brightYellow: "#a77714",
+            brightBlue: "#477ed8",
+            brightMagenta: "#9165c8",
+            brightCyan: "#2b929f",
+            brightWhite: "#ffffff",
+          };
+        }
+        return {
+          background,
+          foreground,
+          cursor: "#8db6ff",
+          cursorAccent: background,
+          selectionBackground,
+          black: background,
+          red: "#ff9d8a",
+          green: "#8fe0a2",
+          yellow: "#f2c879",
+          blue: "#8db6ff",
+          magenta: "#d4a7ff",
+          cyan: "#7edfe6",
+          white: "#d7deee",
+          brightBlack: "#4e576c",
+          brightRed: "#ffb8aa",
+          brightGreen: "#a9efb9",
+          brightYellow: "#f7dca0",
+          brightBlue: "#abc8ff",
+          brightMagenta: "#dfbeff",
+          brightCyan: "#9be9ef",
+          brightWhite: "#f3f6ff",
+        };
+      }
+
+      function applyViewerTheme(theme, { viewer = null, terminals = [] } = {}) {
+        const normalized = normalizeViewerTheme(theme);
+        document.documentElement.dataset.theme = normalized;
+        window.localStorage?.setItem(VIEWER_THEME_STORAGE_KEY, normalized);
+        const [red, green, blue] = viewerClearColorFromTheme();
+        if (viewer?.setClearColor) {
+          viewer.setClearColor(red, green, blue);
+        } else if (typeof viewer_set_clear_color === "function") {
+          try {
+            viewer_set_clear_color(red, green, blue);
+          } catch (_error) {
+            // The WASM viewer may not be ready yet during early boot; the next state sync applies it.
+          }
+        }
+        for (const terminal of terminals) {
+          terminal?.setTheme?.(normalized);
+        }
+        window.dispatchEvent(
+          new CustomEvent("w-theme-change", {
+            detail: { theme: normalized },
+          })
+        );
+        return normalized;
+      }
+
       function createAppStateStore(initial = {}) {
         const defaultState = {
+          theme: readStoredViewerTheme(),
           requestedResource: null,
           committedViewerState: null,
           panels: {
@@ -1500,6 +1834,13 @@
                     committedResource && committedResource === previous.requestedResource
                       ? null
                       : previous.requestedResource,
+                }));
+              }
+              case "theme/set": {
+                const theme = normalizeViewerTheme(action.theme);
+                return patch(action, (previous) => ({
+                  ...previous,
+                  theme,
                 }));
               }
               case "panel/set": {
@@ -1651,6 +1992,7 @@
         const parseViewState = (json) => JSON.parse(json);
         const parsePickResult = (json) => JSON.parse(json);
         const parseResourceCatalog = (json) => JSON.parse(json);
+        const parseRenderProfiles = (json) => JSON.parse(json);
         const currentViewerElementIds = (ids, options = {}) =>
           semanticIdsForViewerResource(ids, viewer_current_resource(), options);
         const setViewModeAsync = async (mode) => {
@@ -1684,9 +2026,20 @@
         };
         const api = {
           currentResource: () => viewer_current_resource(),
+          currentProfile: () => viewer_current_profile(),
+          profile: () => viewer_current_profile(),
+          profiles: () => parseRenderProfiles(viewer_available_profiles_json()),
+          theme: () => currentViewerTheme(),
+          setTheme: (theme) => {
+            appState.dispatch({ type: "theme/set", theme });
+            return currentViewerTheme();
+          },
+          setClearColor: (red, green, blue) =>
+            parseViewState(viewer_set_clear_color(red, green, blue)),
           resourceCatalog: () => parseResourceCatalog(viewer_resource_catalog_json()),
           viewState: () => parseViewState(viewer_view_state_json()),
           state: () => api.viewState(),
+          setProfile: (profile) => parseViewState(viewer_set_profile(profile)),
           setViewMode: (mode) => setViewModeSoon(mode),
           defaultView: () => setViewModeSoon("default"),
           allView: () => setViewModeSoon("all"),
@@ -2264,14 +2617,30 @@
         const graphToggleButton = document.getElementById("graph-toggle-button");
         const terminalToggleButton = document.getElementById("terminal-toggle-button");
         const terminalCloseButton = document.getElementById("terminal-close-button");
+        const settingsToggleButton = document.getElementById("settings-toggle-button");
+        const settingsDropdown = document.getElementById("settings-dropdown");
+        const themeSelect = document.getElementById("theme-select");
         let lastToolValue = null;
         let lastGraphVisible = null;
         let lastTerminalVisible = null;
+        let lastTheme = null;
         let renderingTools = false;
+        let renderingTheme = false;
         graphToggleButton?.removeAttribute("disabled");
         terminalToggleButton?.removeAttribute("disabled");
 
         const render = (state) => {
+          const theme = normalizeViewerTheme(state.theme);
+          if (themeSelect && themeSelect.value !== theme) {
+            renderingTheme = true;
+            themeSelect.value = theme;
+            renderingTheme = false;
+          }
+          if (lastTheme !== theme) {
+            applyViewerTheme(theme, { viewer });
+            lastTheme = theme;
+          }
+
           const nextTools = state.tools || { orbit: false, pick: false };
           const nextTool = viewerToolsToPickerValue(nextTools);
           if (toolPicker && toolPicker.value !== nextTool) {
@@ -2349,6 +2718,29 @@
         terminalCloseButton?.addEventListener("click", () => {
           appStateStore.dispatch({ type: "panel/set", panel: "terminal", visible: false });
         });
+        settingsToggleButton?.addEventListener("click", (event) => {
+          event.stopPropagation();
+          const open = Boolean(settingsDropdown?.hidden);
+          if (settingsDropdown) {
+            settingsDropdown.hidden = !open;
+          }
+          settingsToggleButton.setAttribute("aria-expanded", String(open));
+        });
+        settingsDropdown?.addEventListener("click", (event) => {
+          event.stopPropagation();
+        });
+        document.addEventListener("click", () => {
+          if (!settingsDropdown?.hidden) {
+            settingsDropdown.hidden = true;
+            settingsToggleButton?.setAttribute("aria-expanded", "false");
+          }
+        });
+        themeSelect?.addEventListener("change", () => {
+          if (renderingTheme) {
+            return;
+          }
+          appStateStore.dispatch({ type: "theme/set", theme: themeSelect.value });
+        });
 
         return {
           activeTool: () => viewerToolsToPickerValue(appStateStore.getState().tools),
@@ -2368,6 +2760,8 @@
             appStateStore.dispatch({ type: "panel/set", panel: "terminal", visible: false }),
           toggleTerminal: () =>
             appStateStore.dispatch({ type: "panel/toggle", panel: "terminal" }),
+          theme: () => appStateStore.getState().theme,
+          setTheme: (theme) => appStateStore.dispatch({ type: "theme/set", theme }),
         };
       }
 
@@ -2668,26 +3062,27 @@
       }
 
       function graphNodeColor(node, selected = false) {
+        const palette = graphPalette();
         if (selected) {
-          return "#f2c879";
+          return palette.selected;
         }
         const entity = graphNodeEntity(node).toLowerCase();
         if (entity.includes("ifcrel")) {
-          return "#9fb5d9";
+          return palette.relation;
         }
         if (entity.includes("project") || entity.includes("site") || entity.includes("building")) {
-          return "#8ec2ff";
+          return palette.spatial;
         }
         if (entity.includes("wall")) {
-          return "#79d8b7";
+          return palette.wall;
         }
         if (entity.includes("slab") || entity.includes("roof")) {
-          return "#f0c187";
+          return palette.slab;
         }
         if (entity.includes("space")) {
-          return "#dba8ff";
+          return palette.space;
         }
-        return "#7fb1e6";
+        return palette.fallback;
       }
 
       function graphIsRelationshipNode(node) {
@@ -2987,6 +3382,7 @@
         const label =
           typeof data.label === "string" && data.label.trim().length ? data.label.trim() : "";
         const nodeRadius = Math.max(data.size, 4);
+        const palette = graphPalette();
 
         context.save();
         context.shadowOffsetX = 0;
@@ -2995,13 +3391,13 @@
         context.shadowColor = "rgba(0, 0, 0, 0.45)";
 
         context.beginPath();
-        context.fillStyle = "rgba(243, 246, 255, 0.12)";
+        context.fillStyle = palette.hoverFill;
         context.arc(data.x, data.y, nodeRadius + 5, 0, Math.PI * 2);
         context.fill();
 
         context.shadowBlur = 0;
         context.beginPath();
-        context.fillStyle = data.color || "#d8e4ff";
+        context.fillStyle = data.color || palette.label;
         context.arc(data.x, data.y, nodeRadius + 1.5, 0, Math.PI * 2);
         context.fill();
 
@@ -3035,13 +3431,13 @@
           context.lineTo(boxX, boxY + radius);
           context.quadraticCurveTo(boxX, boxY, boxX + radius, boxY);
           context.closePath();
-          context.fillStyle = "rgba(15, 19, 32, 0.92)";
-          context.strokeStyle = "rgba(141, 182, 255, 0.28)";
+          context.fillStyle = palette.hoverPanel;
+          context.strokeStyle = palette.hoverBorder;
           context.lineWidth = 1;
           context.fill();
           context.stroke();
 
-          context.fillStyle = "#f3f6ff";
+          context.fillStyle = palette.label;
           context.fillText(label, boxX + paddingX, data.y + fontSize / 3);
         }
 
@@ -4695,6 +5091,48 @@
           }
         };
 
+        const applyGraphTheme = ({ refresh = true } = {}) => {
+          const palette = graphPalette();
+          if (state.sigma && typeof state.sigma.setSetting === "function") {
+            state.sigma.setSetting("labelColor", { color: palette.label });
+            state.sigma.setSetting("edgeLabelColor", { color: palette.edgeLabel });
+          }
+          if (
+            state.graphModel &&
+            typeof state.graphModel.setNodeAttribute === "function"
+          ) {
+            for (const node of state.nodes) {
+              const key = graphNodeKey(node);
+              if (state.graphModel.hasNode && !state.graphModel.hasNode(key)) {
+                continue;
+              }
+              state.graphModel.setNodeAttribute(
+                key,
+                "color",
+                graphNodeColor(node, key === state.selectedNodeId)
+              );
+            }
+          }
+          if (
+            state.graphModel &&
+            typeof state.graphModel.setEdgeAttribute === "function"
+          ) {
+            for (const [index, edge] of state.edges.entries()) {
+              const key = graphEdgeKey(edge, index);
+              if (state.graphModel.hasEdge && !state.graphModel.hasEdge(key)) {
+                continue;
+              }
+              state.graphModel.setEdgeAttribute(key, "color", palette.edge);
+              state.graphModel.setEdgeAttribute(key, "size", palette.edgeSize);
+            }
+          }
+          if (refresh) {
+            refreshGraphRenderer();
+          }
+        };
+
+        window.addEventListener("w-theme-change", () => applyGraphTheme());
+
         const focusGraphLayoutCenter = (layout, options = {}) => {
           if (!state.sigma || typeof state.sigma.getCamera !== "function" || !layout.size) {
             return;
@@ -4878,9 +5316,10 @@
             if (state.graphModel.hasEdge(key)) {
               continue;
             }
+            const palette = graphPalette();
             state.graphModel.addEdgeWithKey(key, source, target, {
-              color: "rgba(141, 182, 255, 0.32)",
-              size: 1.45,
+              color: palette.edge,
+              size: palette.edgeSize,
               label: graphEdgeRenderLabel(edge),
               forceLabel: true,
               isRelationshipPath: Boolean(tryGetFirst(edge, ["isRelationshipPath"])),
@@ -4921,6 +5360,7 @@
           }
 
           try {
+            const palette = graphPalette();
             const graph = new state.renderer.GraphConstructor({ multi: true });
             const layout = computeStableGraphLayout(state.nodes, state.edges, previousPositions);
             for (const [index, node] of state.nodes.entries()) {
@@ -4959,8 +5399,8 @@
                 continue;
               }
               graph.addEdgeWithKey(key, source, target, {
-                color: "rgba(141, 182, 255, 0.32)",
-                size: 1.45,
+                color: palette.edge,
+                size: palette.edgeSize,
                 label: graphEdgeRenderLabel(edge),
                 forceLabel: true,
                 isRelationshipPath: Boolean(tryGetFirst(edge, ["isRelationshipPath"])),
@@ -4986,11 +5426,11 @@
                 curvedArrow: EmphasizedCurvedArrowProgram,
               },
               hoverRenderer: graphHoverRenderer,
-              labelColor: { color: "#d8e4ff" },
+              labelColor: { color: palette.label },
               labelDensity: 0.035,
               labelGridCellSize: 110,
               labelRenderedSizeThreshold: 10,
-              edgeLabelColor: { color: "rgba(224, 233, 255, 0.9)" },
+              edgeLabelColor: { color: palette.edgeLabel },
               edgeLabelSize: 10,
               edgeLabelWeight: "500",
               defaultDrawEdgeLabel: DrawCurvedGraphEdgeLabel,
@@ -6121,8 +6561,13 @@
           viewer,
           graph,
           resource: () => viewer.currentResource(),
+          profile: () => viewer.profile(),
+          profiles: () => viewer.profiles(),
+          theme: () => viewer.theme(),
           viewState: () => viewer.viewState(),
           state: () => viewer.state(),
+          setProfile: (profile) => viewer.setProfile(profile),
+          setTheme: (theme) => viewer.setTheme(theme),
           setViewMode: (mode) => viewer.setViewMode(mode),
           defaultView: () => viewer.defaultView(),
           allView: () => viewer.allView(),
@@ -7275,29 +7720,7 @@
           lineHeight: 1.35,
           scrollback: 2000,
           smoothScrollDuration: 0,
-          theme: {
-            background: TERMINAL_SURFACE_BACKGROUND,
-            foreground: "#d7deee",
-            cursor: "#8db6ff",
-            cursorAccent: TERMINAL_SURFACE_BACKGROUND,
-            selectionBackground: "rgba(141, 182, 255, 0.24)",
-            black: TERMINAL_SURFACE_BACKGROUND,
-            red: "#ff9d8a",
-            green: "#8fe0a2",
-            yellow: "#f2c879",
-            blue: "#8db6ff",
-            magenta: "#d4a7ff",
-            cyan: "#7edfe6",
-            white: "#d7deee",
-            brightBlack: "#4e576c",
-            brightRed: "#ffb8aa",
-            brightGreen: "#a9efb9",
-            brightYellow: "#f7dca0",
-            brightBlue: "#abc8ff",
-            brightMagenta: "#dfbeff",
-            brightCyan: "#9be9ef",
-            brightWhite: "#f3f6ff",
-          },
+          theme: terminalThemeForTheme(),
         });
         const fitAddon = new FitAddon();
         term.loadAddon(fitAddon);
@@ -7663,6 +8086,9 @@
         shellApi = {
           resize: fitTerminal,
           focus: () => term.focus(),
+          setTheme: (theme) => {
+            term.options.theme = terminalThemeForTheme(theme);
+          },
           writeLine,
           writeLines,
           writeRawLine,
@@ -7682,6 +8108,9 @@
             host.hidden = true;
           },
         };
+        window.addEventListener("w-theme-change", (event) => {
+          shellApi?.setTheme?.(event.detail?.theme);
+        });
         return shellApi;
       }
 
@@ -7690,7 +8119,7 @@
           screenId: "repl-screen",
           hostId: "repl-terminal",
           introLines: [
-            'resource(), allView(), defaultView(), viewState(), state(), pickAt(x,y), pickRect(x0,y0,x1,y1), query(...), ids(...), hide([...]), show([...]), select([...]), graph.reset(...), frame()',
+            'resource(), profile(), profiles(), setProfile(name), theme(), setTheme("light"), allView(), defaultView(), viewState(), state(), pickAt(x,y), pickRect(x0,y0,x1,y1), query(...), ids(...), hide([...]), show([...]), select([...]), graph.reset(...), frame()',
             'Example: graph.reset("MATCH (p:IfcProject) RETURN id(p) AS node_id LIMIT 1");',
             'Example: var walls = ids("MATCH (w:IfcWall) RETURN w.GlobalId AS global_id LIMIT 8"); hide(walls);',
             "Enter runs. Up/Down walks history. Ctrl+C clears the line.",
@@ -7701,7 +8130,7 @@
               "api",
               "window",
               "document",
-              `"use strict"; const { viewer, graph, resource, viewState, state, setViewMode, defaultView, allView, setViewModeAsync, defaultViewAsync, allViewAsync, pickAt, pickRect, pickAtAsync, pickRectAsync, listIds, visibleIds, selectedIds, selectedInstanceIds, query, queryIds, ids, hide, show, select, resetVisibility, clearSelection, frame, frameVisible, hideQuery, showQuery, selectQuery } = api; return (async () => { ${rewritten} })();`
+              `"use strict"; const { viewer, graph, resource, profile, profiles, setProfile, theme, setTheme, viewState, state, setViewMode, defaultView, allView, setViewModeAsync, defaultViewAsync, allViewAsync, pickAt, pickRect, pickAtAsync, pickRectAsync, listIds, visibleIds, selectedIds, selectedInstanceIds, query, queryIds, ids, hide, show, select, resetVisibility, clearSelection, frame, frameVisible, hideQuery, showQuery, selectQuery } = api; return (async () => { ${rewritten} })();`
             );
             return fn(replApi, window, document);
           },
@@ -7801,6 +8230,11 @@
           window.showQuery = repl.showQuery;
           window.selectQuery = repl.selectQuery;
           window.resource = repl.resource;
+          window.profile = repl.profile;
+          window.profiles = repl.profiles;
+          window.setProfile = repl.setProfile;
+          window.theme = repl.theme;
+          window.setTheme = repl.setTheme;
           window.listIds = repl.listIds;
           window.visibleIds = repl.visibleIds;
           window.selectedIds = repl.selectedIds;

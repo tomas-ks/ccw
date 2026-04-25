@@ -12,9 +12,13 @@ The first profiles are:
 
 - `diffuse`: the current baseline renderer
 - `architectural-v1`: solid shaded geometry plus geometry-derived crease and boundary lines
+- `architectural-v2`: solid shaded geometry plus screen-space depth and object-id outlines
+- `architectural-v3`: solid shaded geometry plus screen-space outlines and selective crease lines
+- `architectural-v4`: experimental `architectural-v3` plus normal-aware screen-space ambient
+  occlusion
 
-Later experimental profiles may include screen-space silhouettes, object-id outlines, hidden-line
-views, x-ray display, analysis colors, or other technical illustration styles.
+Later experimental profiles may include normal-buffer edges, hidden-line views, x-ray display,
+analysis colors, or other technical illustration styles.
 
 ## Ownership
 
@@ -79,7 +83,7 @@ The first architectural experiment.
 
 Pass stack:
 
-1. Solid shaded geometry pass.
+1. Matte solid shaded geometry pass.
 2. Geometry-derived edge pass for boundary edges.
 3. Geometry-derived edge pass for crease edges.
 
@@ -92,29 +96,92 @@ Crease edges are triangle edges shared by two triangles whose adjacent face norm
 the profile threshold. The initial threshold should be conservative, around 30 degrees, and kept as a
 profile parameter so it can be tuned without changing the geometry payload contract.
 
-## Future Profiles
-
 ### `architectural-v2`
 
-Likely next experiment:
+The second architectural experiment.
 
-- solid shaded geometry
-- screen-space depth/object-id silhouette and visible object boundary pass
-- optional screen-space normal discontinuity linework
+Pass stack:
 
-Screen-space silhouettes are view-dependent and should be derived from the final visible image using
-depth, normal, and/or object-id buffers.
+1. Matte solid shaded geometry pass.
+2. Visible object-id pass into an offscreen `Rgba8Uint` target.
+3. Fullscreen screen-space outline pass that samples:
+   - final depth, for visible silhouette and depth-discontinuity edges
+   - visible object id, for semantic/object boundary edges
+
+This version intentionally does not use mesh crease lines. It is meant to compare v1's
+geometry-derived linework against a view-dependent architectural illustration style.
+
+Object boundaries are not the same as pick identity. The first implementation uses per-instance
+outline ids with semantic class suppression for terrain, water, vegetation cover, and surface decals
+so terrain tiles, water surfaces, and road markings do not create noisy object seams. A later pass
+should promote this to an explicit `outline_group_id` carried by the prepared instance payload.
+
+Picking remains profile-independent. The profile's object-id target is presentation-only and does
+not replace the ID-color pick pass.
 
 ### `architectural-v3`
 
-Likely hybrid:
+The first hybrid architectural experiment.
 
-- solid shaded geometry
-- screen-space silhouettes and object boundaries
-- subtle geometry crease lines
+Pass stack:
 
-This lets us compare pure mesh linework against screen-space visible outlines without collapsing the
-experiments into one hardcoded architectural mode.
+1. Matte solid shaded geometry pass.
+2. Selective geometry-derived crease/detail line pass.
+3. Visible object-id pass into an offscreen `Rgba8Uint` target.
+4. Fullscreen screen-space outline pass that samples final depth and visible object id.
+
+This version keeps v2's clean view-dependent silhouettes and semantic/object boundaries while
+bringing back v1's useful crease/detail lines. The crease pass intentionally ignores boundary edges
+because object boundaries are already handled by the screen-space pass.
+
+Crease/detail lines are controlled by semantic render class. For example, physical BIM objects and
+terrain features can draw creases, while tree crowns, vegetation cover, water, and surface decals do
+not expose tessellation or z-fighting noise as detail lines.
+
+This profile should become the main comparison point for a more professional BIM/architecture
+presentation style.
+
+The architectural profiles intentionally use a softer matte surface shader than `diffuse`: the
+directional light is still present, but dark-facing surfaces keep a stronger ambient fill so models
+read more like architectural presentation geometry and less like game-lit assets.
+
+### `architectural-v4`
+
+An experimental ambient-occlusion variant, kept for comparison rather than as the preferred
+architectural profile.
+
+Pass stack:
+
+1. Matte solid shaded geometry pass.
+2. View-space normal pass into an offscreen `Rgba16Float` target.
+3. Depth/normal screen-space ambient occlusion overlay.
+4. Selective geometry-derived crease/detail line pass.
+5. Visible object-id pass into an offscreen `Rgba8Uint` target.
+6. Fullscreen screen-space outline pass that samples final depth and visible object id.
+
+This version keeps v3's clean BIM linework but adds screen-space contact depth under overhangs,
+bridge decks, roof/wall junctions, curbs, rails, and other tight geometry. In practice, this is a
+tradeoff rather than a clear improvement: the AO can help locally, but it can also read as imprecise
+on sparse IFC presentation geometry. `architectural-v3` remains the cleaner architectural baseline.
+
+The AO pass uses the reverse-Z depth buffer plus view-space normals, so flat surfaces and shallow
+depth variation are less likely to become dirty than they would be with a depth-only AO pass.
+Samples whose depth jumps outside a small connected-surface window are ignored, so thin standalone
+objects such as signs do not receive or cast broad fake occlusion from unrelated background pixels.
+
+The AO is intentionally an overlay, not a replacement lighting model. It should add depth without
+undoing the matte fill used by the architectural profiles.
+
+## Future Profiles
+
+Future hybrids may add:
+
+- normal-buffer discontinuity edges
+- explicit `outline_group_id` semantics instead of per-instance outline ids
+- hidden-line or x-ray modes
+- class-specific line palettes and weights
+
+These should stay separate profiles until the visual contract settles.
 
 ## Enabling Profiles
 
@@ -123,7 +190,7 @@ The shared renderer should expose profile APIs:
 ```rust
 renderer.profile();
 renderer.available_profiles();
-renderer.set_profile(&device, color_format, RenderProfileId::ArchitecturalV1);
+renderer.set_profile(RenderProfileId::ArchitecturalV4);
 ```
 
 Changing a profile may rebuild pipelines and profile-specific GPU buffers, but it should not reload
@@ -132,9 +199,9 @@ the active project, reset visibility, clear selection, or change the runtime sce
 The web shell should expose the same capability through the viewer bridge:
 
 ```js
-viewer.renderProfile()
-viewer.renderProfiles()
-viewer.setRenderProfile("architectural-v1")
+viewer.profile()
+viewer.profiles()
+viewer.setProfile("architectural-v4")
 ```
 
 The native shell should expose a profile selector because native is the rendering debug interface.
@@ -178,6 +245,24 @@ profile. The renderer should decide which passes and pipelines that profile impl
     - `diffuse` still draws the current baseline
     - `architectural-v1` draws with an additional edge pass
     - picking returns the same ids under both profiles
+11. Implement `architectural-v2` as solid shaded triangles plus screen-space outline passes:
+    - keep the main depth target sampleable
+    - draw visible outline ids into an offscreen `Rgba8Uint` target
+    - composite depth and object-id discontinuities in a fullscreen pass
+    - suppress noisy object-id outlines for semantic classes such as terrain, water, vegetation
+      cover, and surface decals
+12. Add render smoke coverage for `architectural-v2` so the fullscreen pass is validated by an
+    actual GPU render call.
+13. Implement `architectural-v3` as the hybrid profile:
+    - reuse the v2 screen-space outline stack
+    - add a crease-only mesh edge pass before the fullscreen outline composite
+    - keep boundary edges out of the v3 mesh pass to avoid double-drawing object boundaries
+14. Add render smoke coverage for `architectural-v3`.
+15. Implement `architectural-v4` as the normal-aware SSAO profile:
+    - render visible opaque geometry into a view-space normal target
+    - sample normal plus reverse-Z depth in a fullscreen AO overlay
+    - draw v3 crease/detail lines and screen-space outlines after AO
+16. Add render smoke coverage for `architectural-v4`.
 
 ## Open Decisions
 
@@ -186,4 +271,7 @@ profile. The renderer should decide which passes and pipelines that profile impl
 - Whether `architectural-v1` selection should keep the current material override or use an
   edge/outline highlight.
 - What crease threshold best fits IFC sample models without exposing too much tessellation noise.
-- Whether terrain and faceted organic meshes need per-render-class edge suppression.
+- Whether `architectural-v3` should keep its crease-only mesh pass or eventually use a normal buffer
+  for detail edges.
+- Which semantic classes should receive explicit `outline_group_id` values once terrain tile seams
+  and aggregate objects need finer control than per-instance outline suppression.

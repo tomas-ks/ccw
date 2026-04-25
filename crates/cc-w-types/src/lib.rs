@@ -1029,6 +1029,7 @@ pub struct PreparedRenderInstance {
     pub model_from_object: DMat4,
     pub world_bounds: Bounds3,
     pub material: PreparedMaterial,
+    pub default_render_class: DefaultRenderClass,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1153,6 +1154,12 @@ pub enum DefaultRenderClass {
     Space,
     Zone,
     Helper,
+    Terrain,
+    TerrainFeature,
+    Vegetation,
+    VegetationCover,
+    Water,
+    SurfaceDecal,
     Other,
 }
 

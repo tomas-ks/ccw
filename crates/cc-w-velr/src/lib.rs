@@ -35,7 +35,7 @@ query {
 }
 "#;
 
-const BODY_PACKAGE_CACHE_VERSION: u32 = 10;
+const BODY_PACKAGE_CACHE_VERSION: u32 = 19;
 const BODY_PACKAGE_CACHE_FILE: &str = "prepared-package.json";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -662,6 +662,11 @@ struct IfcBodyRecord {
     item_id: u64,
     global_id: Option<String>,
     name: Option<String>,
+    object_type: Option<String>,
+    predefined_type: Option<String>,
+    type_object_type: Option<String>,
+    type_predefined_type: Option<String>,
+    classification_identification: Option<String>,
     display_color: Option<DisplayColor>,
     declared_entity: String,
     item_transform: DMat4,
@@ -892,14 +897,18 @@ impl VelrIfcModel {
             r#"
 MATCH (p:IfcProduct)-[:REPRESENTATION]->(:IfcProductDefinitionShape)-[:REPRESENTATIONS]->(rep:IfcShapeRepresentation)-[:ITEMS]->(item:IfcTriangulatedFaceSet)-[:COORDINATES]->(pl:IfcCartesianPointList3D)
 OPTIONAL MATCH (p)-[:OBJECT_PLACEMENT]->(placement:IfcLocalPlacement)
+OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelDefinesByType)-[:RELATING_TYPE]->(type_node)
+OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelAssociatesClassification)-[:RELATING_CLASSIFICATION]->(classification_ref)
 OPTIONAL MATCH (item)<-[:ITEM]-(styled:IfcStyledItem)
 OPTIONAL MATCH (styled)-[:STYLES]->(surface_style:IfcSurfaceStyle)
 OPTIONAL MATCH (surface_style)-[:STYLES]->(rendering:IfcSurfaceStyleRendering)
 OPTIONAL MATCH (rendering)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
 WHERE rep.RepresentationIdentifier = 'Body'
 WITH p, placement, item, pl,
+     head(collect(DISTINCT { object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType })) AS type_semantics,
+     head(collect(DISTINCT classification_ref.Identification)) AS classification_identification,
      head(collect(DISTINCT { red: rgb.Red, green: rgb.Green, blue: rgb.Blue })) AS surface_rgb
-RETURN id(p) AS product_id, id(placement) AS placement_id, id(item) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.declared_entity AS declared_entity, pl.CoordList AS coord_list, item.CoordIndex AS coord_index, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue
+RETURN id(p) AS product_id, id(placement) AS placement_id, id(item) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, pl.CoordList AS coord_list, item.CoordIndex AS coord_index, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue
 ORDER BY item_id
 "#,
         )?;
@@ -912,13 +921,18 @@ ORDER BY item_id
                 let item_id = parse_u64_cell(row.get(2), "item_id")?;
                 let global_id = parse_optional_string_cell(row.get(3));
                 let name = parse_optional_string_cell(row.get(4));
+                let object_type = parse_optional_string_cell(row.get(5));
+                let predefined_type = parse_optional_string_cell(row.get(6));
+                let type_object_type = parse_optional_string_cell(row.get(7));
+                let type_predefined_type = parse_optional_string_cell(row.get(8));
+                let classification_identification = parse_optional_string_cell(row.get(9));
                 let display_color =
-                    parse_optional_display_color_cells(row.get(8), row.get(9), row.get(10))?;
+                    parse_optional_display_color_cells(row.get(13), row.get(14), row.get(15))?;
                 let declared_entity =
-                    parse_required_string_cell(row.get(5), "declared_entity")?.to_string();
+                    parse_required_string_cell(row.get(10), "declared_entity")?.to_string();
                 let primitive = GeometryPrimitive::Tessellated(tessellated_geometry_from_row(
-                    parse_required_string_cell(row.get(6), "coord_list")?,
-                    parse_required_string_cell(row.get(7), "coord_index")?,
+                    parse_required_string_cell(row.get(11), "coord_list")?,
+                    parse_required_string_cell(row.get(12), "coord_index")?,
                 )?);
 
                 Ok(IfcBodyRecord {
@@ -927,6 +941,11 @@ ORDER BY item_id
                     item_id,
                     global_id,
                     name,
+                    object_type,
+                    predefined_type,
+                    type_object_type,
+                    type_predefined_type,
+                    classification_identification,
                     display_color,
                     declared_entity,
                     item_transform: DMat4::IDENTITY,
@@ -942,6 +961,8 @@ ORDER BY item_id
 MATCH (p:IfcProduct)-[:REPRESENTATION]->(:IfcProductDefinitionShape)-[:REPRESENTATIONS]->(rep:IfcShapeRepresentation)-[:ITEMS]->(solid:IfcExtrudedAreaSolid)-[:SWEPT_AREA]->(profile:IfcArbitraryClosedProfileDef)-[:OUTER_CURVE]->(poly:IfcPolyline)-[edge:POINTS]->(pt:IfcCartesianPoint)
 MATCH (solid)-[:EXTRUDED_DIRECTION]->(dir:IfcDirection)
 OPTIONAL MATCH (p)-[:OBJECT_PLACEMENT]->(placement:IfcLocalPlacement)
+OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelDefinesByType)-[:RELATING_TYPE]->(type_node)
+OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelAssociatesClassification)-[:RELATING_CLASSIFICATION]->(classification_ref)
 OPTIONAL MATCH (solid)-[:POSITION]->(solid_position:IfcAxis2Placement3D)
 OPTIONAL MATCH (solid_position)-[:LOCATION]->(solid_location:IfcCartesianPoint)
 OPTIONAL MATCH (solid_position)-[:AXIS]->(solid_axis:IfcDirection)
@@ -953,8 +974,10 @@ OPTIONAL MATCH (rendering)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
 WHERE rep.RepresentationIdentifier = 'Body'
 WITH p, placement, solid, dir, solid_location, solid_axis, solid_ref_direction,
      collect(DISTINCT { ordinal: edge.ordinal, coordinates: pt.Coordinates }) AS point_rows,
+     head(collect(DISTINCT { object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType })) AS type_semantics,
+     head(collect(DISTINCT classification_ref.Identification)) AS classification_identification,
      head(collect(DISTINCT { red: rgb.Red, green: rgb.Green, blue: rgb.Blue })) AS surface_rgb
-RETURN id(p) AS product_id, id(placement) AS placement_id, id(solid) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.declared_entity AS declared_entity, solid.Depth AS depth, dir.DirectionRatios AS extruded_direction, point_rows, solid_location.Coordinates AS solid_position_location, solid_axis.DirectionRatios AS solid_position_axis, solid_ref_direction.DirectionRatios AS solid_position_ref_direction, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue
+RETURN id(p) AS product_id, id(placement) AS placement_id, id(solid) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, solid.Depth AS depth, dir.DirectionRatios AS extruded_direction, point_rows, solid_location.Coordinates AS solid_position_location, solid_axis.DirectionRatios AS solid_position_axis, solid_ref_direction.DirectionRatios AS solid_position_ref_direction, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue
 ORDER BY item_id
 "#,
         )?;
@@ -967,20 +990,25 @@ ORDER BY item_id
                 let item_id = parse_u64_cell(row.get(2), "item_id")?;
                 let global_id = parse_optional_string_cell(row.get(3));
                 let name = parse_optional_string_cell(row.get(4));
+                let object_type = parse_optional_string_cell(row.get(5));
+                let predefined_type = parse_optional_string_cell(row.get(6));
+                let type_object_type = parse_optional_string_cell(row.get(7));
+                let type_predefined_type = parse_optional_string_cell(row.get(8));
+                let classification_identification = parse_optional_string_cell(row.get(9));
                 let item_transform =
-                    parse_optional_axis2_placement3d_cells(row.get(9), row.get(10), row.get(11))?
+                    parse_optional_axis2_placement3d_cells(row.get(14), row.get(15), row.get(16))?
                         .unwrap_or(DMat4::IDENTITY);
                 let display_color =
-                    parse_optional_display_color_cells(row.get(12), row.get(13), row.get(14))?;
+                    parse_optional_display_color_cells(row.get(17), row.get(18), row.get(19))?;
                 let declared_entity =
-                    parse_required_string_cell(row.get(5), "declared_entity")?.to_string();
-                let depth = parse_f64_cell(row.get(6), "depth")?;
+                    parse_required_string_cell(row.get(10), "declared_entity")?.to_string();
+                let depth = parse_f64_cell(row.get(11), "depth")?;
                 let extruded_direction = parse_direction3_json(parse_required_string_cell(
-                    row.get(7),
+                    row.get(12),
                     "extruded_direction",
                 )?)?;
                 let primitive = GeometryPrimitive::SweptSolid(swept_solid_from_row(
-                    parse_required_string_cell(row.get(8), "point_rows")?,
+                    parse_required_string_cell(row.get(13), "point_rows")?,
                     extruded_direction * depth,
                 )?);
 
@@ -990,6 +1018,11 @@ ORDER BY item_id
                     item_id,
                     global_id,
                     name,
+                    object_type,
+                    predefined_type,
+                    type_object_type,
+                    type_predefined_type,
+                    classification_identification,
                     display_color,
                     declared_entity,
                     item_transform,
@@ -1394,6 +1427,91 @@ fn is_ifc_building_element_proxy_helper(record: &IfcBodyRecord) -> bool {
     )
 }
 
+fn is_ifc_surface_decal_body(record: &IfcBodyRecord) -> bool {
+    record.declared_entity == "IfcSurfaceFeature"
+        && record_has_ifc_semantic(record, &["LINEMARKING", "MARKING", "SURFACEMARKING"])
+}
+
+fn is_ifc_terrain_body(record: &IfcBodyRecord) -> bool {
+    let entity = record.declared_entity.as_str();
+    if matches!(
+        entity,
+        "IfcSite" | "IfcSurfaceFeature" | "IfcTopographyElement"
+    ) {
+        return true;
+    }
+
+    entity == "IfcGeographicElement"
+        && record_has_ifc_semantic(record, &["TERRAIN", "GROUND", "LANDFORM", "SOIL"])
+}
+
+fn is_ifc_terrain_feature_body(record: &IfcBodyRecord) -> bool {
+    record.declared_entity.starts_with("IfcEarthworks")
+        || record_has_ifc_semantic(
+            record,
+            &["BANK", "BED", "CUT", "DITCH", "FILL", "SLOPE", "TRENCH"],
+        )
+}
+
+fn is_ifc_water_body(record: &IfcBodyRecord) -> bool {
+    if record.declared_entity == "IfcWater" {
+        return true;
+    }
+
+    record_has_ifc_semantic(
+        record,
+        &[
+            "WATER",
+            "WATERBODY",
+            "WATER_BODY",
+            "RIVER",
+            "STREAM",
+            "POND",
+            "CANAL",
+        ],
+    )
+}
+
+fn is_ifc_vegetation_body(record: &IfcBodyRecord) -> bool {
+    record.declared_entity == "IfcGeographicElement"
+        && record_has_ifc_semantic(record, &["VEGETATION", "PLANTING", "PLANT", "TREE"])
+        && record.classification_identification.is_some()
+}
+
+fn is_ifc_vegetation_cover_body(record: &IfcBodyRecord) -> bool {
+    record.declared_entity == "IfcGeographicElement"
+        && record_has_ifc_semantic(record, &["VEGETATION", "PLANTING", "PLANT", "TREE"])
+}
+
+fn record_has_ifc_semantic(record: &IfcBodyRecord, values: &[&str]) -> bool {
+    [
+        record.type_predefined_type.as_deref(),
+        record.predefined_type.as_deref(),
+        record.type_object_type.as_deref(),
+        record.object_type.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| ifc_semantic_matches(value, values))
+}
+
+fn ifc_semantic_matches(value: &str, expected_values: &[&str]) -> bool {
+    let normalized = normalize_ifc_semantic_value(value);
+    expected_values
+        .iter()
+        .any(|expected| normalized == normalize_ifc_semantic_value(expected))
+}
+
+fn normalize_ifc_semantic_value(value: &str) -> String {
+    value
+        .trim()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_ascii_uppercase)
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
 fn parse_optional_string_cell(cell: Option<&String>) -> Option<String> {
     let value = cell?.trim();
     if value.is_empty() {
@@ -1535,6 +1653,25 @@ fn ifc_element_id_for_record(record: &IfcBodyRecord) -> SemanticElementId {
 }
 
 fn default_render_class_for_ifc_body_record(record: &IfcBodyRecord) -> DefaultRenderClass {
+    if is_ifc_surface_decal_body(record) {
+        return DefaultRenderClass::SurfaceDecal;
+    }
+    if is_ifc_water_body(record) {
+        return DefaultRenderClass::Water;
+    }
+    if is_ifc_vegetation_body(record) {
+        return DefaultRenderClass::Vegetation;
+    }
+    if is_ifc_vegetation_cover_body(record) {
+        return DefaultRenderClass::VegetationCover;
+    }
+    if is_ifc_terrain_feature_body(record) {
+        return DefaultRenderClass::TerrainFeature;
+    }
+    if is_ifc_terrain_body(record) {
+        return DefaultRenderClass::Terrain;
+    }
+
     match record.declared_entity.as_str() {
         "IfcSpace" => DefaultRenderClass::Space,
         "IfcSpatialZone" => DefaultRenderClass::Zone,
@@ -1551,6 +1688,12 @@ fn cached_render_class_name(class: DefaultRenderClass) -> &'static str {
         DefaultRenderClass::Space => "space",
         DefaultRenderClass::Zone => "zone",
         DefaultRenderClass::Helper => "helper",
+        DefaultRenderClass::Terrain => "terrain",
+        DefaultRenderClass::TerrainFeature => "terrain-feature",
+        DefaultRenderClass::Vegetation => "vegetation",
+        DefaultRenderClass::VegetationCover => "vegetation-cover",
+        DefaultRenderClass::Water => "water",
+        DefaultRenderClass::SurfaceDecal => "surface-decal",
         DefaultRenderClass::Other => "other",
     }
 }
@@ -1561,6 +1704,12 @@ fn parse_cached_render_class(value: &str) -> DefaultRenderClass {
         "space" => DefaultRenderClass::Space,
         "zone" => DefaultRenderClass::Zone,
         "helper" => DefaultRenderClass::Helper,
+        "terrain" => DefaultRenderClass::Terrain,
+        "terrain-feature" => DefaultRenderClass::TerrainFeature,
+        "vegetation" => DefaultRenderClass::Vegetation,
+        "vegetation-cover" => DefaultRenderClass::VegetationCover,
+        "water" => DefaultRenderClass::Water,
+        "surface-decal" => DefaultRenderClass::SurfaceDecal,
         "other" => DefaultRenderClass::Other,
         _ => DefaultRenderClass::Other,
     }
@@ -2718,6 +2867,11 @@ mod tests {
             item_id: 1,
             global_id: None,
             name: Some(name.to_string()),
+            object_type: None,
+            predefined_type: None,
+            type_object_type: None,
+            type_predefined_type: None,
+            classification_identification: None,
             display_color: None,
             declared_entity: "IfcBuildingElementProxy".to_string(),
             item_transform: DMat4::IDENTITY,
@@ -2756,6 +2910,11 @@ mod tests {
             item_id: 1,
             global_id: None,
             name: Some("semantic volume".to_string()),
+            object_type: None,
+            predefined_type: None,
+            type_object_type: None,
+            type_predefined_type: None,
+            classification_identification: None,
             display_color: None,
             declared_entity: declared_entity.to_string(),
             item_transform: DMat4::IDENTITY,
@@ -2784,6 +2943,130 @@ mod tests {
             default_render_class_for_ifc_body_record(&semantic_body("IfcWall")),
             DefaultRenderClass::Physical
         );
+        assert_eq!(
+            default_render_class_for_ifc_body_record(&semantic_body("IfcEarthworksFill")),
+            DefaultRenderClass::TerrainFeature
+        );
+        assert_eq!(
+            default_render_class_for_ifc_body_record(&semantic_body("IfcWater")),
+            DefaultRenderClass::Water
+        );
+    }
+
+    #[test]
+    fn terrain_and_water_classification_uses_ifc_semantics_not_display_names() {
+        let body_record =
+            |declared_entity: &str,
+             name: &str,
+             object_type: Option<&str>,
+             type_predefined_type: Option<&str>,
+             classification_identification: Option<&str>| IfcBodyRecord {
+                product_id: 1,
+                placement_id: None,
+                item_id: 1,
+                global_id: None,
+                name: Some(name.to_string()),
+                object_type: object_type.map(str::to_string),
+                predefined_type: None,
+                type_object_type: None,
+                type_predefined_type: type_predefined_type.map(str::to_string),
+                classification_identification: classification_identification.map(str::to_string),
+                display_color: None,
+                declared_entity: declared_entity.to_string(),
+                item_transform: DMat4::IDENTITY,
+                primitive: GeometryPrimitive::Tessellated(
+                    TessellatedGeometry::new(
+                        vec![
+                            DVec3::ZERO,
+                            DVec3::new(1.0, 0.0, 0.0),
+                            DVec3::new(0.0, 1.0, 0.0),
+                        ],
+                        vec![IndexedPolygon::new(vec![0, 1, 2], vec![], 3).expect("triangle")],
+                    )
+                    .expect("geometry"),
+                ),
+            };
+
+        assert_eq!(
+            default_render_class_for_ifc_body_record(&body_record(
+                "IfcGeographicElement",
+                "river stream",
+                Some("water"),
+                None,
+                None
+            )),
+            DefaultRenderClass::Water
+        );
+        assert_eq!(
+            default_render_class_for_ifc_body_record(&body_record(
+                "IfcGeographicElement",
+                "river bed",
+                Some("terrain"),
+                Some("TERRAIN"),
+                None
+            )),
+            DefaultRenderClass::Terrain
+        );
+        assert_eq!(
+            default_render_class_for_ifc_body_record(&body_record(
+                "IfcGeographicElement",
+                "road river bridge - grass",
+                Some("vegetation"),
+                Some("VEGETATION"),
+                None
+            )),
+            DefaultRenderClass::VegetationCover
+        );
+        assert_eq!(
+            default_render_class_for_ifc_body_record(&body_record(
+                "IfcGeographicElement",
+                "tree",
+                Some("vegetation"),
+                Some("VEGETATION"),
+                Some("L-TRA")
+            )),
+            DefaultRenderClass::Vegetation
+        );
+        assert_eq!(
+            default_render_class_for_ifc_body_record(&body_record(
+                "IfcBuildingElementProxy",
+                "underground - road",
+                Some("terrain"),
+                Some("TERRAIN"),
+                None
+            )),
+            DefaultRenderClass::Physical
+        );
+        assert_eq!(
+            default_render_class_for_ifc_body_record(&body_record(
+                "IfcSurfaceFeature",
+                "road - line marking",
+                Some("linemarking"),
+                None,
+                None
+            )),
+            DefaultRenderClass::SurfaceDecal
+        );
+        assert_eq!(
+            default_render_class_for_ifc_body_record(&body_record(
+                "IfcBuildingElementProxy",
+                "underground - river",
+                Some("ditch"),
+                None,
+                None
+            )),
+            DefaultRenderClass::TerrainFeature
+        );
+        assert_eq!(
+            default_render_class_for_ifc_body_record(&body_record(
+                "IfcGeographicElement",
+                "tree",
+                None,
+                None,
+                None
+            )),
+            DefaultRenderClass::Physical
+        );
     }
 
     #[test]
@@ -2809,6 +3092,11 @@ mod tests {
                     item_id,
                     global_id: Some(format!("global-{product_id}")),
                     name: Some(name.to_string()),
+                    object_type: None,
+                    predefined_type: None,
+                    type_object_type: None,
+                    type_predefined_type: None,
+                    classification_identification: None,
                     display_color: None,
                     declared_entity: declared_entity.to_string(),
                     item_transform: DMat4::IDENTITY,
@@ -3353,6 +3641,11 @@ mod tests {
                 item_id: 77,
                 global_id: Some("product-a".to_string()),
                 name: Some("Shared A".to_string()),
+                object_type: None,
+                predefined_type: None,
+                type_object_type: None,
+                type_predefined_type: None,
+                classification_identification: None,
                 display_color: Some(DisplayColor::new(0.95, 0.56, 0.24)),
                 declared_entity: "IfcBuildingElementProxy".to_string(),
                 item_transform: DMat4::from_translation(DVec3::new(1.5, 0.0, 0.0)),
@@ -3364,6 +3657,11 @@ mod tests {
                 item_id: 77,
                 global_id: Some("product-b".to_string()),
                 name: Some("Shared B".to_string()),
+                object_type: None,
+                predefined_type: None,
+                type_object_type: None,
+                type_predefined_type: None,
+                classification_identification: None,
                 display_color: Some(DisplayColor::new(0.24, 0.78, 0.55)),
                 declared_entity: "IfcBuildingElementProxy".to_string(),
                 item_transform: DMat4::from_translation(DVec3::new(0.0, 2.0, 0.0)),
