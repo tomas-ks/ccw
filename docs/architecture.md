@@ -406,6 +406,8 @@ The rendering backend on top of `wgpu`:
 - material binding model
 
 This crate consumes prepared assets and view data. It should not know about IFC or STEP semantics.
+Named rendering profiles such as `diffuse` and `architectural-v1` are owned here; the profile
+contract and implementation plan live in [rendering-profiles.md](./rendering-profiles.md).
 
 #### `cc-w-runtime`
 
@@ -828,6 +830,7 @@ Version 1 should focus on:
 
 - opaque shaded triangle rendering
 - optional edge/line overlay path
+- named rendering profiles for baseline and architectural linework experiments
 - object and feature picking
 - frustum culling
 - async CPU-to-GPU upload
