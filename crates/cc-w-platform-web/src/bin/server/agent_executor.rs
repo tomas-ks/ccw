@@ -29,6 +29,15 @@ pub trait AgentReadonlyCypherRuntime {
         query: &str,
         why: Option<&str>,
     ) -> Result<AgentReadonlyCypherResult, String>;
+    fn run_project_readonly_cypher(
+        &mut self,
+        query: &str,
+        why: Option<&str>,
+        resource_filter: &[String],
+    ) -> Result<AgentReadonlyCypherResult, String> {
+        let _ = (query, why, resource_filter);
+        Err("project-level read-only Cypher is not implemented for this runtime".to_owned())
+    }
     fn get_schema_context(&mut self) -> Result<AgentSchemaContext, String>;
     fn get_entity_reference(
         &mut self,
@@ -207,15 +216,35 @@ pub enum AgentTranscriptEventKind {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum AgentUiAction {
     #[serde(rename = "graph.set_seeds")]
-    GraphSetSeeds { db_node_ids: Vec<i64> },
+    GraphSetSeeds {
+        db_node_ids: Vec<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "properties.show_node")]
-    PropertiesShowNode { db_node_id: i64 },
+    PropertiesShowNode {
+        db_node_id: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "elements.hide")]
-    ElementsHide { semantic_ids: Vec<String> },
+    ElementsHide {
+        semantic_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "elements.show")]
-    ElementsShow { semantic_ids: Vec<String> },
+    ElementsShow {
+        semantic_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "elements.select")]
-    ElementsSelect { semantic_ids: Vec<String> },
+    ElementsSelect {
+        semantic_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "viewer.frame_visible")]
     ViewerFrameVisible,
 }
@@ -226,6 +255,8 @@ pub struct AgentActionCandidate {
     pub kind: String,
     pub semantic_ids: Vec<String>,
     pub db_node_ids: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
 }
 
 impl AgentActionCandidate {
@@ -234,6 +265,7 @@ impl AgentActionCandidate {
             kind: "graph.set_seeds".to_owned(),
             semantic_ids: Vec::new(),
             db_node_ids,
+            resource: None,
         }
     }
 
@@ -242,6 +274,7 @@ impl AgentActionCandidate {
             kind: "elements.hide".to_owned(),
             semantic_ids,
             db_node_ids: Vec::new(),
+            resource: None,
         }
     }
 
@@ -250,6 +283,7 @@ impl AgentActionCandidate {
             kind: "elements.show".to_owned(),
             semantic_ids,
             db_node_ids: Vec::new(),
+            resource: None,
         }
     }
 
@@ -258,6 +292,7 @@ impl AgentActionCandidate {
             kind: "elements.select".to_owned(),
             semantic_ids,
             db_node_ids: Vec::new(),
+            resource: None,
         }
     }
 
@@ -266,6 +301,7 @@ impl AgentActionCandidate {
             kind: "properties.show_node".to_owned(),
             semantic_ids: Vec::new(),
             db_node_ids: vec![db_node_id],
+            resource: None,
         }
     }
 
@@ -274,7 +310,16 @@ impl AgentActionCandidate {
             kind: "viewer.frame_visible".to_owned(),
             semantic_ids: Vec::new(),
             db_node_ids: Vec::new(),
+            resource: None,
         }
+    }
+
+    pub fn with_resource(mut self, resource: impl Into<String>) -> Self {
+        let resource = resource.into();
+        if !resource.trim().is_empty() {
+            self.resource = Some(resource);
+        }
+        self
     }
 }
 
@@ -595,7 +640,10 @@ pub fn validate_agent_action_candidate(
                 return Err("graph.set_seeds does not accept semanticIds".to_owned());
             }
             let db_node_ids = normalize_agent_db_node_ids(candidate.db_node_ids)?;
-            Ok(AgentUiAction::GraphSetSeeds { db_node_ids })
+            Ok(AgentUiAction::GraphSetSeeds {
+                db_node_ids,
+                resource: candidate.resource,
+            })
         }
         "properties.show_node" => {
             if !candidate.semantic_ids.is_empty() {
@@ -607,6 +655,7 @@ pub fn validate_agent_action_candidate(
             }
             Ok(AgentUiAction::PropertiesShowNode {
                 db_node_id: db_node_ids[0],
+                resource: candidate.resource,
             })
         }
         "elements.hide" => {
@@ -614,21 +663,30 @@ pub fn validate_agent_action_candidate(
                 return Err("elements.hide does not accept dbNodeIds".to_owned());
             }
             let semantic_ids = normalize_agent_semantic_ids(candidate.semantic_ids)?;
-            Ok(AgentUiAction::ElementsHide { semantic_ids })
+            Ok(AgentUiAction::ElementsHide {
+                semantic_ids,
+                resource: candidate.resource,
+            })
         }
         "elements.show" => {
             if !candidate.db_node_ids.is_empty() {
                 return Err("elements.show does not accept dbNodeIds".to_owned());
             }
             let semantic_ids = normalize_agent_semantic_ids(candidate.semantic_ids)?;
-            Ok(AgentUiAction::ElementsShow { semantic_ids })
+            Ok(AgentUiAction::ElementsShow {
+                semantic_ids,
+                resource: candidate.resource,
+            })
         }
         "elements.select" => {
             if !candidate.db_node_ids.is_empty() {
                 return Err("elements.select does not accept dbNodeIds".to_owned());
             }
             let semantic_ids = normalize_agent_semantic_ids(candidate.semantic_ids)?;
-            Ok(AgentUiAction::ElementsSelect { semantic_ids })
+            Ok(AgentUiAction::ElementsSelect {
+                semantic_ids,
+                resource: candidate.resource,
+            })
         }
         "viewer.frame_visible" => {
             if !candidate.semantic_ids.is_empty() || !candidate.db_node_ids.is_empty() {
@@ -641,15 +699,15 @@ pub fn validate_agent_action_candidate(
 }
 
 fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction> {
-    let mut merged_graph_seed_ids = Vec::new();
+    let mut merged_graph_seed_groups = Vec::<(Option<String>, Vec<i64>)>::new();
     let mut graph_seed_seen = HashSet::new();
-    let mut merged_hide_ids = Vec::new();
+    let mut merged_hide_groups = Vec::<(Option<String>, Vec<String>)>::new();
     let mut hide_seen = HashSet::new();
-    let mut merged_show_ids = Vec::new();
+    let mut merged_show_groups = Vec::<(Option<String>, Vec<String>)>::new();
     let mut show_seen = HashSet::new();
-    let mut merged_select_ids = Vec::new();
+    let mut merged_select_groups = Vec::<(Option<String>, Vec<String>)>::new();
     let mut select_seen = HashSet::new();
-    let mut latest_properties_node_id = None;
+    let mut latest_properties_node = None::<(i64, Option<String>)>;
     let mut graph_set_seeds_present = false;
     let mut properties_show_present = false;
     let mut elements_hide_present = false;
@@ -660,55 +718,86 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
 
     for action in actions {
         match action {
-            AgentUiAction::GraphSetSeeds { db_node_ids } => {
+            AgentUiAction::GraphSetSeeds {
+                db_node_ids,
+                resource,
+            } => {
                 if !graph_set_seeds_present {
                     order.push(0u8);
                     graph_set_seeds_present = true;
                 }
+                let group_index = merged_graph_seed_groups
+                    .iter()
+                    .position(|(existing_resource, _)| existing_resource == &resource)
+                    .unwrap_or_else(|| {
+                        merged_graph_seed_groups.push((resource.clone(), Vec::new()));
+                        merged_graph_seed_groups.len() - 1
+                    });
                 for db_node_id in db_node_ids {
-                    if graph_seed_seen.insert(db_node_id) {
-                        merged_graph_seed_ids.push(db_node_id);
+                    if graph_seed_seen.insert((resource.clone(), db_node_id)) {
+                        merged_graph_seed_groups[group_index].1.push(db_node_id);
                     }
                 }
             }
-            AgentUiAction::PropertiesShowNode { db_node_id } => {
+            AgentUiAction::PropertiesShowNode {
+                db_node_id,
+                resource,
+            } => {
                 if !properties_show_present {
                     order.push(1u8);
                     properties_show_present = true;
                 }
-                latest_properties_node_id = Some(db_node_id);
+                latest_properties_node = Some((db_node_id, resource));
             }
-            AgentUiAction::ElementsHide { semantic_ids } => {
+            AgentUiAction::ElementsHide {
+                semantic_ids,
+                resource,
+            } => {
                 if !elements_hide_present {
                     order.push(2u8);
                     elements_hide_present = true;
                 }
                 for semantic_id in semantic_ids {
-                    if hide_seen.insert(semantic_id.clone()) {
-                        merged_hide_ids.push(semantic_id);
-                    }
+                    push_semantic_action_group(
+                        &mut merged_hide_groups,
+                        &mut hide_seen,
+                        resource.clone(),
+                        semantic_id,
+                    );
                 }
             }
-            AgentUiAction::ElementsShow { semantic_ids } => {
+            AgentUiAction::ElementsShow {
+                semantic_ids,
+                resource,
+            } => {
                 if !elements_show_present {
                     order.push(3u8);
                     elements_show_present = true;
                 }
                 for semantic_id in semantic_ids {
-                    if show_seen.insert(semantic_id.clone()) {
-                        merged_show_ids.push(semantic_id);
-                    }
+                    push_semantic_action_group(
+                        &mut merged_show_groups,
+                        &mut show_seen,
+                        resource.clone(),
+                        semantic_id,
+                    );
                 }
             }
-            AgentUiAction::ElementsSelect { semantic_ids } => {
+            AgentUiAction::ElementsSelect {
+                semantic_ids,
+                resource,
+            } => {
                 if !elements_select_present {
                     order.push(4u8);
                     elements_select_present = true;
                 }
                 for semantic_id in semantic_ids {
-                    if select_seen.insert(semantic_id.clone()) {
-                        merged_select_ids.push(semantic_id);
-                    }
+                    push_semantic_action_group(
+                        &mut merged_select_groups,
+                        &mut select_seen,
+                        resource.clone(),
+                        semantic_id,
+                    );
                 }
             }
             AgentUiAction::ViewerFrameVisible => {
@@ -723,31 +812,81 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
     let mut normalized = Vec::new();
     for kind in order {
         match kind {
-            0 if !merged_graph_seed_ids.is_empty() => {
-                normalized.push(AgentUiAction::GraphSetSeeds {
-                    db_node_ids: merged_graph_seed_ids.clone(),
-                })
-            }
-            1 => {
-                if let Some(db_node_id) = latest_properties_node_id {
-                    normalized.push(AgentUiAction::PropertiesShowNode { db_node_id });
+            0 if merged_graph_seed_groups
+                .iter()
+                .any(|(_, ids)| !ids.is_empty()) =>
+            {
+                for (resource, db_node_ids) in &merged_graph_seed_groups {
+                    if !db_node_ids.is_empty() {
+                        normalized.push(AgentUiAction::GraphSetSeeds {
+                            db_node_ids: db_node_ids.clone(),
+                            resource: resource.clone(),
+                        });
+                    }
                 }
             }
-            2 if !merged_hide_ids.is_empty() => normalized.push(AgentUiAction::ElementsHide {
-                semantic_ids: merged_hide_ids.clone(),
-            }),
-            3 if !merged_show_ids.is_empty() => normalized.push(AgentUiAction::ElementsShow {
-                semantic_ids: merged_show_ids.clone(),
-            }),
-            4 if !merged_select_ids.is_empty() => normalized.push(AgentUiAction::ElementsSelect {
-                semantic_ids: merged_select_ids.clone(),
-            }),
+            1 => {
+                if let Some((db_node_id, resource)) = latest_properties_node.clone() {
+                    normalized.push(AgentUiAction::PropertiesShowNode {
+                        db_node_id,
+                        resource,
+                    });
+                }
+            }
+            2 if merged_hide_groups.iter().any(|(_, ids)| !ids.is_empty()) => {
+                for (resource, semantic_ids) in &merged_hide_groups {
+                    if !semantic_ids.is_empty() {
+                        normalized.push(AgentUiAction::ElementsHide {
+                            semantic_ids: semantic_ids.clone(),
+                            resource: resource.clone(),
+                        });
+                    }
+                }
+            }
+            3 if merged_show_groups.iter().any(|(_, ids)| !ids.is_empty()) => {
+                for (resource, semantic_ids) in &merged_show_groups {
+                    if !semantic_ids.is_empty() {
+                        normalized.push(AgentUiAction::ElementsShow {
+                            semantic_ids: semantic_ids.clone(),
+                            resource: resource.clone(),
+                        });
+                    }
+                }
+            }
+            4 if merged_select_groups.iter().any(|(_, ids)| !ids.is_empty()) => {
+                for (resource, semantic_ids) in &merged_select_groups {
+                    if !semantic_ids.is_empty() {
+                        normalized.push(AgentUiAction::ElementsSelect {
+                            semantic_ids: semantic_ids.clone(),
+                            resource: resource.clone(),
+                        });
+                    }
+                }
+            }
             5 => normalized.push(AgentUiAction::ViewerFrameVisible),
             _ => {}
         }
     }
 
     normalized
+}
+
+fn push_semantic_action_group(
+    groups: &mut Vec<(Option<String>, Vec<String>)>,
+    seen: &mut HashSet<(Option<String>, String)>,
+    resource: Option<String>,
+    semantic_id: String,
+) {
+    let group_index = groups
+        .iter()
+        .position(|(existing_resource, _)| existing_resource == &resource)
+        .unwrap_or_else(|| {
+            groups.push((resource.clone(), Vec::new()));
+            groups.len() - 1
+        });
+    if seen.insert((resource, semantic_id.clone())) {
+        groups[group_index].1.push(semantic_id);
+    }
 }
 
 pub fn normalize_agent_semantic_ids(ids: Vec<String>) -> Result<Vec<String>, String> {
@@ -935,6 +1074,7 @@ mod tests {
             kind: "viewer.run_js".to_owned(),
             semantic_ids: Vec::new(),
             db_node_ids: Vec::new(),
+            resource: None,
         }])
         .unwrap_err();
 
@@ -960,11 +1100,16 @@ mod tests {
             actions,
             vec![
                 AgentUiAction::GraphSetSeeds {
-                    db_node_ids: vec![395, 396]
+                    db_node_ids: vec![395, 396],
+                    resource: None,
                 },
-                AgentUiAction::PropertiesShowNode { db_node_id: 215 },
+                AgentUiAction::PropertiesShowNode {
+                    db_node_id: 215,
+                    resource: None,
+                },
                 AgentUiAction::ElementsHide {
-                    semantic_ids: vec!["A".to_owned(), "B".to_owned()]
+                    semantic_ids: vec!["A".to_owned(), "B".to_owned()],
+                    resource: None,
                 },
                 AgentUiAction::ViewerFrameVisible,
             ]
@@ -987,10 +1132,67 @@ mod tests {
             actions,
             vec![
                 AgentUiAction::ElementsSelect {
-                    semantic_ids: vec!["wall-a".to_owned(), "wall-b".to_owned()]
+                    semantic_ids: vec!["wall-a".to_owned(), "wall-b".to_owned()],
+                    resource: None,
                 },
                 AgentUiAction::ViewerFrameVisible,
-                AgentUiAction::PropertiesShowNode { db_node_id: 215 },
+                AgentUiAction::PropertiesShowNode {
+                    db_node_id: 215,
+                    resource: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_action_validation_keeps_graph_seed_resources_separate() {
+        let actions = validate_agent_action_candidates(vec![
+            AgentActionCandidate::graph_set_seeds(vec![12, 12, 13]).with_resource("ifc/infra-road"),
+            AgentActionCandidate::graph_set_seeds(vec![12]).with_resource("ifc/infra-bridge"),
+            AgentActionCandidate::properties_show_node(99).with_resource("ifc/infra-bridge"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            actions,
+            vec![
+                AgentUiAction::GraphSetSeeds {
+                    db_node_ids: vec![12, 13],
+                    resource: Some("ifc/infra-road".to_owned()),
+                },
+                AgentUiAction::GraphSetSeeds {
+                    db_node_ids: vec![12],
+                    resource: Some("ifc/infra-bridge".to_owned()),
+                },
+                AgentUiAction::PropertiesShowNode {
+                    db_node_id: 99,
+                    resource: Some("ifc/infra-bridge".to_owned()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_action_validation_keeps_element_action_resources_separate() {
+        let actions = validate_agent_action_candidates(vec![
+            AgentActionCandidate::elements_select(vec!["same-id".to_owned(), "same-id".to_owned()])
+                .with_resource("ifc/infra-road"),
+            AgentActionCandidate::elements_select(vec!["same-id".to_owned()])
+                .with_resource("ifc/infra-bridge"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            actions,
+            vec![
+                AgentUiAction::ElementsSelect {
+                    semantic_ids: vec!["same-id".to_owned()],
+                    resource: Some("ifc/infra-road".to_owned()),
+                },
+                AgentUiAction::ElementsSelect {
+                    semantic_ids: vec!["same-id".to_owned()],
+                    resource: Some("ifc/infra-bridge".to_owned()),
+                },
             ]
         );
     }
@@ -1026,7 +1228,8 @@ mod tests {
         assert_eq!(
             validate_agent_action_candidates(response.action_candidates).unwrap(),
             vec![AgentUiAction::ElementsHide {
-                semantic_ids: vec!["wall-a".to_owned(), "wall-b".to_owned()]
+                semantic_ids: vec!["wall-a".to_owned(), "wall-b".to_owned()],
+                resource: None,
             }]
         );
     }
@@ -1071,10 +1274,12 @@ mod tests {
             validate_agent_action_candidates(response.action_candidates).unwrap(),
             vec![
                 AgentUiAction::GraphSetSeeds {
-                    db_node_ids: vec![395, 396]
+                    db_node_ids: vec![395, 396],
+                    resource: None,
                 },
                 AgentUiAction::ElementsSelect {
-                    semantic_ids: vec!["wall-a".to_owned(), "wall-b".to_owned()]
+                    semantic_ids: vec!["wall-a".to_owned(), "wall-b".to_owned()],
+                    resource: None,
                 },
             ]
         );

@@ -3,7 +3,6 @@ use cc_w_render::NullRenderBackend;
 #[cfg(target_arch = "wasm32")]
 use cc_w_runtime::RuntimeSceneState;
 use cc_w_runtime::{DemoAsset, Engine, GeometryPackageSource, GeometryPackageSourceError};
-#[cfg(any(target_arch = "wasm32", test))]
 use cc_w_types::GeometryStartViewRequest;
 use cc_w_types::{
     Bounds3, DefaultRenderClass, DisplayColor, ExternalId, GeometryCatalog,
@@ -15,12 +14,320 @@ use cc_w_types::{
     SemanticElementId,
 };
 use serde::{Deserialize, Serialize};
+use std::{fmt, str::FromStr};
 
 #[cfg(target_arch = "wasm32")]
 const DEFAULT_WEB_RESOURCE: &str = "ifc/building-architecture";
 const DEFAULT_DEMO_RESOURCE: &str = "demo/revolved-solid";
 #[cfg(target_arch = "wasm32")]
 const WEB_GEOMETRY_BATCH_CHUNK_SIZE: usize = 5_000;
+const SOURCE_SCOPED_ID_SEPARATOR: &str = "::";
+#[cfg(target_arch = "wasm32")]
+const PROJECT_GEOMETRY_LOCAL_ID_BITS: u32 = 48;
+#[cfg(target_arch = "wasm32")]
+const PROJECT_GEOMETRY_LOCAL_ID_MASK: u64 = (1u64 << PROJECT_GEOMETRY_LOCAL_ID_BITS) - 1;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceScopedIdParseError {
+    MissingSeparator,
+    EmptyResource,
+    EmptyLocalId,
+    InvalidInstanceId(std::num::ParseIntError),
+    InvalidDefinitionId(std::num::ParseIntError),
+}
+
+impl fmt::Display for SourceScopedIdParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingSeparator => write!(
+                f,
+                "source-scoped id must be formatted as `resource::local_id`"
+            ),
+            Self::EmptyResource => write!(f, "source-scoped id resource must not be empty"),
+            Self::EmptyLocalId => write!(f, "source-scoped id local id must not be empty"),
+            Self::InvalidInstanceId(error) => {
+                write!(f, "invalid source-scoped instance id: {error}")
+            }
+            Self::InvalidDefinitionId(error) => {
+                write!(f, "invalid source-scoped definition id: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SourceScopedIdParseError {}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceScopedSemanticElementId {
+    pub resource: String,
+    pub local_id: String,
+}
+
+impl SourceScopedSemanticElementId {
+    pub fn new(resource: impl Into<String>, local_id: impl Into<String>) -> Self {
+        Self {
+            resource: resource.into(),
+            local_id: local_id.into(),
+        }
+    }
+
+    pub fn from_semantic_element_id(resource: impl Into<String>, id: &SemanticElementId) -> Self {
+        Self::new(resource, id.as_str())
+    }
+
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+
+    pub fn local_id(&self) -> &str {
+        &self.local_id
+    }
+
+    pub fn as_semantic_element_id(&self) -> SemanticElementId {
+        SemanticElementId::new(self.local_id.clone())
+    }
+
+    pub fn validate(&self) -> Result<(), SourceScopedIdParseError> {
+        validate_source_scoped_parts(&self.resource, &self.local_id)
+    }
+}
+
+impl fmt::Display for SourceScopedSemanticElementId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}{SOURCE_SCOPED_ID_SEPARATOR}{}",
+            self.resource, self.local_id
+        )
+    }
+}
+
+impl FromStr for SourceScopedSemanticElementId {
+    type Err = SourceScopedIdParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (resource, local_id) = parse_source_scoped_parts(value)?;
+        Ok(Self::new(resource, local_id))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceScopedGeometryInstanceId {
+    pub resource: String,
+    pub local_id: u64,
+}
+
+impl SourceScopedGeometryInstanceId {
+    pub fn new(resource: impl Into<String>, local_id: impl Into<u64>) -> Self {
+        Self {
+            resource: resource.into(),
+            local_id: local_id.into(),
+        }
+    }
+
+    pub fn from_geometry_instance_id(resource: impl Into<String>, id: GeometryInstanceId) -> Self {
+        Self::new(resource, id.0)
+    }
+
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+
+    pub fn local_id(&self) -> u64 {
+        self.local_id
+    }
+
+    pub fn as_geometry_instance_id(&self) -> GeometryInstanceId {
+        GeometryInstanceId(self.local_id)
+    }
+
+    pub fn validate(&self) -> Result<(), SourceScopedIdParseError> {
+        validate_source_scoped_parts(&self.resource, &self.local_id.to_string())
+    }
+}
+
+impl fmt::Display for SourceScopedGeometryInstanceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}{SOURCE_SCOPED_ID_SEPARATOR}{}",
+            self.resource, self.local_id
+        )
+    }
+}
+
+impl FromStr for SourceScopedGeometryInstanceId {
+    type Err = SourceScopedIdParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (resource, local_id) = parse_source_scoped_parts(value)?;
+        let local_id: u64 = local_id
+            .parse()
+            .map_err(SourceScopedIdParseError::InvalidInstanceId)?;
+        Ok(Self::new(resource, local_id))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceScopedGeometryDefinitionId {
+    pub resource: String,
+    pub local_id: u64,
+}
+
+impl SourceScopedGeometryDefinitionId {
+    pub fn new(resource: impl Into<String>, local_id: impl Into<u64>) -> Self {
+        Self {
+            resource: resource.into(),
+            local_id: local_id.into(),
+        }
+    }
+
+    pub fn from_geometry_definition_id(
+        resource: impl Into<String>,
+        id: GeometryDefinitionId,
+    ) -> Self {
+        Self::new(resource, id.0)
+    }
+
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+
+    pub fn local_id(&self) -> u64 {
+        self.local_id
+    }
+
+    pub fn as_geometry_definition_id(&self) -> GeometryDefinitionId {
+        GeometryDefinitionId(self.local_id)
+    }
+
+    pub fn validate(&self) -> Result<(), SourceScopedIdParseError> {
+        validate_source_scoped_parts(&self.resource, &self.local_id.to_string())
+    }
+}
+
+impl fmt::Display for SourceScopedGeometryDefinitionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}{SOURCE_SCOPED_ID_SEPARATOR}{}",
+            self.resource, self.local_id
+        )
+    }
+}
+
+impl FromStr for SourceScopedGeometryDefinitionId {
+    type Err = SourceScopedIdParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (resource, local_id) = parse_source_scoped_parts(value)?;
+        let local_id: u64 = local_id
+            .parse()
+            .map_err(SourceScopedIdParseError::InvalidDefinitionId)?;
+        Ok(Self::new(resource, local_id))
+    }
+}
+
+fn parse_source_scoped_parts(value: &str) -> Result<(&str, &str), SourceScopedIdParseError> {
+    let (resource, local_id) = value
+        .split_once(SOURCE_SCOPED_ID_SEPARATOR)
+        .ok_or(SourceScopedIdParseError::MissingSeparator)?;
+    validate_source_scoped_parts(resource, local_id)?;
+    Ok((resource, local_id))
+}
+
+fn validate_source_scoped_parts(
+    resource: &str,
+    local_id: &str,
+) -> Result<(), SourceScopedIdParseError> {
+    if resource.is_empty() {
+        return Err(SourceScopedIdParseError::EmptyResource);
+    }
+    if local_id.is_empty() {
+        return Err(SourceScopedIdParseError::EmptyLocalId);
+    }
+    Ok(())
+}
+
+fn validate_project_member_resource(resource: &str) -> Result<String, String> {
+    validate_source_scoped_parts(resource, "0").map_err(|error| error.to_string())?;
+    if resource.contains(SOURCE_SCOPED_ID_SEPARATOR) {
+        return Err(format!(
+            "project member resource `{resource}` must not contain `{SOURCE_SCOPED_ID_SEPARATOR}`"
+        ));
+    }
+    Ok(resource.to_string())
+}
+
+fn source_scoped_semantic_element_id_string(
+    resource: &str,
+    local_id: &str,
+) -> Result<String, String> {
+    validate_source_scoped_parts(resource, local_id).map_err(|error| error.to_string())?;
+    Ok(format!("{resource}{SOURCE_SCOPED_ID_SEPARATOR}{local_id}"))
+}
+
+fn source_scoped_geometry_instance_id_string(resource: &str, local_id: u64) -> String {
+    SourceScopedGeometryInstanceId::new(resource, local_id).to_string()
+}
+
+fn source_scoped_geometry_definition_id_string(resource: &str, local_id: u64) -> String {
+    SourceScopedGeometryDefinitionId::new(resource, local_id).to_string()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn source_resource_from_source_scoped_id(value: &str) -> Option<&str> {
+    let (resource, local_id) = value.split_once(SOURCE_SCOPED_ID_SEPARATOR)?;
+    (!resource.is_empty()
+        && resource.starts_with("ifc/")
+        && !local_id.is_empty()
+        && !local_id.contains(SOURCE_SCOPED_ID_SEPARATOR))
+    .then_some(resource)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn project_local_geometry_id(id: u64) -> u64 {
+    id & PROJECT_GEOMETRY_LOCAL_ID_MASK
+}
+
+fn push_project_instance_request(
+    requests: &mut Vec<WebGeometryInstanceBatchRequest>,
+    resource: String,
+    local_id: u64,
+) {
+    let index = requests
+        .iter()
+        .position(|request| request.resource == resource)
+        .unwrap_or_else(|| {
+            requests.push(WebGeometryInstanceBatchRequest {
+                resource: resource.clone(),
+                instance_ids: Vec::new(),
+            });
+            requests.len() - 1
+        });
+    requests[index].instance_ids.push(local_id);
+}
+
+fn push_project_definition_request(
+    requests: &mut Vec<WebGeometryDefinitionBatchRequest>,
+    resource: String,
+    local_id: u64,
+) {
+    let index = requests
+        .iter()
+        .position(|request| request.resource == resource)
+        .unwrap_or_else(|| {
+            requests.push(WebGeometryDefinitionBatchRequest {
+                resource: resource.clone(),
+                definition_ids: Vec::new(),
+            });
+            requests.len() - 1
+        });
+    requests[index].definition_ids.push(local_id);
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -132,8 +439,22 @@ pub struct WebPreparedGeometryPackage {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WebProjectPreparedGeometryPackage {
+    pub resources: Vec<String>,
+    pub definitions: Vec<WebProjectPreparedGeometryDefinition>,
+    pub elements: Vec<WebPreparedGeometryElement>,
+    pub instances: Vec<WebProjectPreparedGeometryInstance>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WebPreparedGeometryDefinition {
     pub id: u64,
+    pub mesh: WebPreparedMesh,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WebProjectPreparedGeometryDefinition {
+    pub id: String,
     pub mesh: WebPreparedMesh,
 }
 
@@ -158,6 +479,63 @@ pub struct WebPreparedGeometryInstance {
     pub external_id: String,
     pub label: String,
     pub display_color: Option<[f32; 3]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WebProjectPreparedGeometryInstance {
+    pub id: String,
+    pub element_id: String,
+    pub definition_id: String,
+    pub transform: [f64; 16],
+    pub bounds_min: [f64; 3],
+    pub bounds_max: [f64; 3],
+    pub external_id: String,
+    pub label: String,
+    pub display_color: Option<[f32; 3]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WebProjectGeometryCatalog {
+    pub resources: Vec<String>,
+    pub definitions: Vec<WebProjectGeometryDefinitionCatalogEntry>,
+    pub elements: Vec<WebPreparedGeometryElement>,
+    pub instances: Vec<WebProjectPreparedGeometryInstance>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WebProjectGeometryDefinitionCatalogEntry {
+    pub id: String,
+    pub bounds_min: [f64; 3],
+    pub bounds_max: [f64; 3],
+    pub vertex_count: usize,
+    pub triangle_count: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebProjectGeometryStreamPlan {
+    pub instance_ids: Vec<String>,
+    pub definition_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebProjectResolvedStartView {
+    pub visible_element_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WebProjectGeometryInstanceBatch {
+    pub instances: Vec<WebProjectPreparedGeometryInstance>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WebProjectGeometryDefinitionBatch {
+    pub definitions: Vec<WebProjectPreparedGeometryDefinition>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebProjectGeometryBatchRequests {
+    pub instance_requests: Vec<WebGeometryInstanceBatchRequest>,
+    pub definition_requests: Vec<WebGeometryDefinitionBatchRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -238,6 +616,346 @@ impl WebPreparedGeometryPackage {
                 .map(WebPreparedGeometryInstance::into_prepared_instance)
                 .collect(),
         })
+    }
+}
+
+impl WebProjectPreparedGeometryPackage {
+    pub fn from_prepared_packages<'a, I, R>(members: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = (R, &'a PreparedGeometryPackage)>,
+        R: AsRef<str>,
+    {
+        let web_members = members
+            .into_iter()
+            .map(|(resource, package)| {
+                (
+                    resource.as_ref().to_string(),
+                    WebPreparedGeometryPackage::from_prepared_package(package),
+                )
+            })
+            .collect::<Vec<_>>();
+        Self::from_web_prepared_packages(
+            web_members
+                .iter()
+                .map(|(resource, package)| (resource.as_str(), package)),
+        )
+    }
+
+    pub fn from_web_prepared_packages<'a, I, R>(members: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = (R, &'a WebPreparedGeometryPackage)>,
+        R: AsRef<str>,
+    {
+        let mut resources = Vec::new();
+        let mut definitions = Vec::new();
+        let mut elements = Vec::new();
+        let mut instances = Vec::new();
+        let mut seen_resources = std::collections::HashSet::new();
+
+        for (resource, package) in members {
+            let resource = validate_project_member_resource(resource.as_ref())?;
+            if !seen_resources.insert(resource.clone()) {
+                return Err(format!("duplicate project member resource `{resource}`"));
+            }
+            resources.push(resource.clone());
+
+            definitions.extend(package.definitions.iter().map(|definition| {
+                WebProjectPreparedGeometryDefinition {
+                    id: source_scoped_geometry_definition_id_string(&resource, definition.id),
+                    mesh: definition.mesh.clone(),
+                }
+            }));
+            for element in &package.elements {
+                let mut element = element.clone();
+                element.id = source_scoped_semantic_element_id_string(&resource, &element.id)?;
+                elements.push(element);
+            }
+            for instance in &package.instances {
+                instances.push(WebProjectPreparedGeometryInstance::from_web_instance(
+                    &resource, instance,
+                )?);
+            }
+        }
+
+        Ok(Self {
+            resources,
+            definitions,
+            elements,
+            instances,
+        })
+    }
+
+    pub fn catalog(&self) -> WebProjectGeometryCatalog {
+        WebProjectGeometryCatalog {
+            resources: self.resources.clone(),
+            definitions: self
+                .definitions
+                .iter()
+                .map(WebProjectGeometryDefinitionCatalogEntry::from_project_definition)
+                .collect(),
+            elements: self.elements.clone(),
+            instances: self.instances.clone(),
+        }
+    }
+}
+
+impl WebProjectGeometryCatalog {
+    pub fn from_geometry_catalogs<'a, I, R>(members: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = (R, &'a GeometryCatalog)>,
+        R: AsRef<str>,
+    {
+        let web_members = members
+            .into_iter()
+            .map(|(resource, catalog)| {
+                (
+                    resource.as_ref().to_string(),
+                    WebGeometryCatalog::from_geometry_catalog(catalog),
+                )
+            })
+            .collect::<Vec<_>>();
+        Self::from_web_geometry_catalogs(
+            web_members
+                .iter()
+                .map(|(resource, catalog)| (resource.as_str(), catalog)),
+        )
+    }
+
+    pub fn from_web_geometry_catalogs<'a, I, R>(members: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = (R, &'a WebGeometryCatalog)>,
+        R: AsRef<str>,
+    {
+        let mut resources = Vec::new();
+        let mut definitions = Vec::new();
+        let mut elements = Vec::new();
+        let mut instances = Vec::new();
+        let mut seen_resources = std::collections::HashSet::new();
+
+        for (resource, catalog) in members {
+            let resource = validate_project_member_resource(resource.as_ref())?;
+            if !seen_resources.insert(resource.clone()) {
+                return Err(format!("duplicate project member resource `{resource}`"));
+            }
+            resources.push(resource.clone());
+
+            definitions.extend(catalog.definitions.iter().map(|definition| {
+                WebProjectGeometryDefinitionCatalogEntry::from_web_catalog_entry(
+                    &resource, definition,
+                )
+            }));
+            for element in &catalog.elements {
+                let mut element = element.clone();
+                element.id = source_scoped_semantic_element_id_string(&resource, &element.id)?;
+                elements.push(element);
+            }
+            for instance in &catalog.instances {
+                instances.push(WebProjectPreparedGeometryInstance::from_web_instance(
+                    &resource, instance,
+                )?);
+            }
+        }
+
+        Ok(Self {
+            resources,
+            definitions,
+            elements,
+            instances,
+        })
+    }
+
+    pub fn default_start_view_element_ids(&self) -> Result<Vec<String>, String> {
+        let mut visible_element_ids = Vec::new();
+        for element in &self.elements {
+            if web_default_visibility_for_class_name(&element.default_render_class)? {
+                visible_element_ids.push(element.id.clone());
+            }
+        }
+        Ok(visible_element_ids)
+    }
+
+    pub fn all_element_ids(&self) -> Vec<String> {
+        self.elements
+            .iter()
+            .map(|element| element.id.clone())
+            .collect()
+    }
+
+    pub fn resolve_start_view(
+        &self,
+        request: &GeometryStartViewRequest,
+    ) -> Result<WebProjectResolvedStartView, String> {
+        let visible_element_ids = match request {
+            GeometryStartViewRequest::Default => self.default_start_view_element_ids()?,
+            GeometryStartViewRequest::Minimal(max_elements) => self
+                .default_start_view_element_ids()?
+                .into_iter()
+                .take(*max_elements)
+                .collect(),
+            GeometryStartViewRequest::All => self.all_element_ids(),
+            GeometryStartViewRequest::Elements(ids) => {
+                let known = self
+                    .elements
+                    .iter()
+                    .map(|element| element.id.as_str())
+                    .collect::<std::collections::HashSet<_>>();
+                let mut seen = std::collections::HashSet::new();
+                ids.iter()
+                    .map(SemanticElementId::as_str)
+                    .filter(|id| known.contains(id))
+                    .filter(|id| seen.insert((*id).to_string()))
+                    .map(str::to_string)
+                    .collect()
+            }
+        };
+
+        Ok(WebProjectResolvedStartView {
+            visible_element_ids,
+        })
+    }
+
+    pub fn stream_plan_for_element_ids(
+        &self,
+        element_ids: &[String],
+    ) -> WebProjectGeometryStreamPlan {
+        let mut instance_ids = Vec::new();
+        let mut definition_ids = Vec::new();
+        let mut seen_instances = std::collections::HashSet::new();
+        let mut seen_definitions = std::collections::HashSet::new();
+
+        for element_id in element_ids {
+            for instance in self
+                .instances
+                .iter()
+                .filter(|instance| instance.element_id == *element_id)
+            {
+                if seen_instances.insert(instance.id.clone()) {
+                    instance_ids.push(instance.id.clone());
+                }
+
+                if seen_definitions.insert(instance.definition_id.clone()) {
+                    definition_ids.push(instance.definition_id.clone());
+                }
+            }
+        }
+
+        WebProjectGeometryStreamPlan {
+            instance_ids,
+            definition_ids,
+        }
+    }
+
+    pub fn default_start_view_stream_plan(&self) -> Result<WebProjectGeometryStreamPlan, String> {
+        let visible_element_ids = self.default_start_view_element_ids()?;
+        Ok(self.stream_plan_for_element_ids(&visible_element_ids))
+    }
+
+    pub fn all_visible_stream_plan(&self) -> WebProjectGeometryStreamPlan {
+        self.stream_plan_for_element_ids(&self.all_element_ids())
+    }
+}
+
+impl WebProjectGeometryStreamPlan {
+    pub fn from_local_stream_plan(
+        resource: impl AsRef<str>,
+        plan: &GeometryStreamPlan,
+    ) -> Result<Self, String> {
+        let resource = validate_project_member_resource(resource.as_ref())?;
+        Ok(Self {
+            instance_ids: plan
+                .instance_ids
+                .iter()
+                .map(|id| source_scoped_geometry_instance_id_string(&resource, id.0))
+                .collect(),
+            definition_ids: plan
+                .definition_ids
+                .iter()
+                .map(|id| source_scoped_geometry_definition_id_string(&resource, id.0))
+                .collect(),
+        })
+    }
+
+    pub fn to_member_batch_requests(&self) -> Result<WebProjectGeometryBatchRequests, String> {
+        let mut instance_requests = Vec::<WebGeometryInstanceBatchRequest>::new();
+        let mut definition_requests = Vec::<WebGeometryDefinitionBatchRequest>::new();
+        let mut seen_instances = std::collections::HashSet::new();
+        let mut seen_definitions = std::collections::HashSet::new();
+
+        for id in &self.instance_ids {
+            if !seen_instances.insert(id.clone()) {
+                continue;
+            }
+            let scoped = id
+                .parse::<SourceScopedGeometryInstanceId>()
+                .map_err(|error| error.to_string())?;
+            push_project_instance_request(&mut instance_requests, scoped.resource, scoped.local_id);
+        }
+
+        for id in &self.definition_ids {
+            if !seen_definitions.insert(id.clone()) {
+                continue;
+            }
+            let scoped = id
+                .parse::<SourceScopedGeometryDefinitionId>()
+                .map_err(|error| error.to_string())?;
+            push_project_definition_request(
+                &mut definition_requests,
+                scoped.resource,
+                scoped.local_id,
+            );
+        }
+
+        Ok(WebProjectGeometryBatchRequests {
+            instance_requests,
+            definition_requests,
+        })
+    }
+}
+
+impl WebProjectGeometryInstanceBatch {
+    pub fn from_web_geometry_instance_batches<'a, I, R>(members: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = (R, &'a WebGeometryInstanceBatch)>,
+        R: AsRef<str>,
+    {
+        let mut instances = Vec::new();
+        let mut seen_resources = std::collections::HashSet::new();
+        for (resource, batch) in members {
+            let resource = validate_project_member_resource(resource.as_ref())?;
+            if !seen_resources.insert(resource.clone()) {
+                return Err(format!("duplicate project member resource `{resource}`"));
+            }
+            for instance in &batch.instances {
+                instances.push(WebProjectPreparedGeometryInstance::from_web_instance(
+                    &resource, instance,
+                )?);
+            }
+        }
+        Ok(Self { instances })
+    }
+}
+
+impl WebProjectGeometryDefinitionBatch {
+    pub fn from_web_geometry_definition_batches<'a, I, R>(members: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = (R, &'a WebGeometryDefinitionBatch)>,
+        R: AsRef<str>,
+    {
+        let mut definitions = Vec::new();
+        let mut seen_resources = std::collections::HashSet::new();
+        for (resource, batch) in members {
+            let resource = validate_project_member_resource(resource.as_ref())?;
+            if !seen_resources.insert(resource.clone()) {
+                return Err(format!("duplicate project member resource `{resource}`"));
+            }
+            definitions.extend(batch.definitions.iter().map(|definition| {
+                WebProjectPreparedGeometryDefinition {
+                    id: source_scoped_geometry_definition_id_string(&resource, definition.id),
+                    mesh: definition.mesh.clone(),
+                }
+            }));
+        }
+        Ok(Self { definitions })
     }
 }
 
@@ -439,6 +1157,31 @@ impl WebGeometryDefinitionCatalogEntry {
     }
 }
 
+impl WebProjectGeometryDefinitionCatalogEntry {
+    fn from_web_catalog_entry(
+        resource: &str,
+        definition: &WebGeometryDefinitionCatalogEntry,
+    ) -> Self {
+        Self {
+            id: source_scoped_geometry_definition_id_string(resource, definition.id),
+            bounds_min: definition.bounds_min,
+            bounds_max: definition.bounds_max,
+            vertex_count: definition.vertex_count,
+            triangle_count: definition.triangle_count,
+        }
+    }
+
+    fn from_project_definition(definition: &WebProjectPreparedGeometryDefinition) -> Self {
+        Self {
+            id: definition.id.clone(),
+            bounds_min: definition.mesh.bounds_min,
+            bounds_max: definition.mesh.bounds_max,
+            vertex_count: definition.mesh.vertices.len(),
+            triangle_count: definition.mesh.indices.len() / 3,
+        }
+    }
+}
+
 impl WebGeometryInstanceBatchRequest {
     pub fn to_geometry_instance_batch_request(&self) -> GeometryInstanceBatchRequest {
         GeometryInstanceBatchRequest::new(
@@ -460,6 +1203,28 @@ impl WebGeometryDefinitionBatchRequest {
                 .map(GeometryDefinitionId)
                 .collect(),
         )
+    }
+}
+
+impl WebProjectPreparedGeometryInstance {
+    fn from_web_instance(
+        resource: &str,
+        instance: &WebPreparedGeometryInstance,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            id: source_scoped_geometry_instance_id_string(resource, instance.id),
+            element_id: source_scoped_semantic_element_id_string(resource, &instance.element_id)?,
+            definition_id: source_scoped_geometry_definition_id_string(
+                resource,
+                instance.definition_id,
+            ),
+            transform: instance.transform,
+            bounds_min: instance.bounds_min,
+            bounds_max: instance.bounds_max,
+            external_id: instance.external_id.clone(),
+            label: instance.label.clone(),
+            display_color: instance.display_color,
+        })
     }
 }
 
@@ -796,8 +1561,18 @@ struct WebViewerViewState {
 #[serde(rename_all = "camelCase")]
 struct WebPickHit {
     instance_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_instance_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scoped_instance_id: Option<String>,
     element_id: String,
     definition_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_definition_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scoped_definition_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_resource: Option<String>,
     world_centroid: [f64; 3],
     world_anchor: [f64; 3],
 }
@@ -1636,16 +2411,36 @@ fn web_pick_response_json(region: PickRegion, hits: &[PickHit]) -> Result<String
         },
         hits: hits
             .iter()
-            .map(|hit| WebPickHit {
-                instance_id: hit.instance_id.0,
-                element_id: hit.element_id.as_str().to_string(),
-                definition_id: hit.definition_id.0,
-                world_centroid: [
-                    hit.world_centroid.x,
-                    hit.world_centroid.y,
-                    hit.world_centroid.z,
-                ],
-                world_anchor: [hit.world_anchor.x, hit.world_anchor.y, hit.world_anchor.z],
+            .map(|hit| {
+                let source_resource =
+                    source_resource_from_source_scoped_id(hit.element_id.as_str())
+                        .map(str::to_owned);
+                let local_instance_id = source_resource
+                    .as_ref()
+                    .map(|_| project_local_geometry_id(hit.instance_id.0));
+                let local_definition_id = source_resource
+                    .as_ref()
+                    .map(|_| project_local_geometry_id(hit.definition_id.0));
+                WebPickHit {
+                    instance_id: hit.instance_id.0,
+                    local_instance_id,
+                    scoped_instance_id: source_resource.as_deref().zip(local_instance_id).map(
+                        |(resource, id)| source_scoped_geometry_instance_id_string(resource, id),
+                    ),
+                    element_id: hit.element_id.as_str().to_string(),
+                    definition_id: hit.definition_id.0,
+                    local_definition_id,
+                    scoped_definition_id: source_resource.as_deref().zip(local_definition_id).map(
+                        |(resource, id)| source_scoped_geometry_definition_id_string(resource, id),
+                    ),
+                    source_resource,
+                    world_centroid: [
+                        hit.world_centroid.x,
+                        hit.world_centroid.y,
+                        hit.world_centroid.z,
+                    ],
+                    world_anchor: [hit.world_anchor.x, hit.world_anchor.y, hit.world_anchor.z],
+                }
             })
             .collect(),
     };
@@ -2569,11 +3364,7 @@ impl WebViewerState {
 
     fn draw_pick_drag_overlay(&self) -> Result<(), String> {
         let mode = self.interaction_mode();
-        if !mode.can_pick()
-            || mode.can_orbit()
-            || !self.drag.active
-            || !self.drag.is_box_select()
-        {
+        if !mode.can_pick() || mode.can_orbit() || !self.drag.active || !self.drag.is_box_select() {
             return Ok(());
         }
 
@@ -3128,6 +3919,287 @@ mod tests {
         assert_eq!(
             definition_request.definition_ids,
             vec![GeometryDefinitionId(2), GeometryDefinitionId(4)]
+        );
+    }
+
+    fn colliding_web_package(default_render_class: &str) -> WebPreparedGeometryPackage {
+        WebPreparedGeometryPackage {
+            definitions: vec![WebPreparedGeometryDefinition {
+                id: 7,
+                mesh: WebPreparedMesh {
+                    local_origin: [0.0; 3],
+                    bounds_min: [0.0; 3],
+                    bounds_max: [1.0; 3],
+                    vertices: vec![
+                        WebPreparedVertex {
+                            position: [0.0, 0.0, 0.0],
+                            normal: [0.0, 0.0, 1.0],
+                        },
+                        WebPreparedVertex {
+                            position: [1.0, 0.0, 0.0],
+                            normal: [0.0, 0.0, 1.0],
+                        },
+                        WebPreparedVertex {
+                            position: [0.0, 1.0, 0.0],
+                            normal: [0.0, 0.0, 1.0],
+                        },
+                    ],
+                    indices: vec![0, 1, 2],
+                },
+            }],
+            elements: vec![WebPreparedGeometryElement {
+                id: "shared-local-element".to_string(),
+                label: "Shared Local Element".to_string(),
+                declared_entity: "IfcWall".to_string(),
+                default_render_class: default_render_class.to_string(),
+                bounds_min: [0.0; 3],
+                bounds_max: [1.0; 3],
+            }],
+            instances: vec![WebPreparedGeometryInstance {
+                id: 1,
+                element_id: "shared-local-element".to_string(),
+                definition_id: 7,
+                transform: glam::DMat4::IDENTITY.to_cols_array(),
+                bounds_min: [0.0; 3],
+                bounds_max: [1.0; 3],
+                external_id: "external-shared".to_string(),
+                label: "Shared Local Instance".to_string(),
+                display_color: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn source_scoped_semantic_element_id_round_trips_as_string() {
+        let local_id = SemanticElementId::new("3MyeqU7Xn6heW9nCvA0vpL");
+        let scoped = SourceScopedSemanticElementId::from_semantic_element_id(
+            DEFAULT_DEMO_RESOURCE,
+            &local_id,
+        );
+
+        assert_eq!(scoped.resource(), DEFAULT_DEMO_RESOURCE);
+        assert_eq!(scoped.local_id(), local_id.as_str());
+        assert_eq!(
+            scoped.to_string(),
+            "demo/revolved-solid::3MyeqU7Xn6heW9nCvA0vpL"
+        );
+        assert_eq!(
+            scoped
+                .to_string()
+                .parse::<SourceScopedSemanticElementId>()
+                .expect("scoped semantic id should parse"),
+            scoped
+        );
+        assert_eq!(scoped.as_semantic_element_id(), local_id);
+    }
+
+    #[test]
+    fn source_scoped_geometry_instance_id_round_trips_as_string() {
+        let scoped = SourceScopedGeometryInstanceId::from_geometry_instance_id(
+            DEFAULT_DEMO_RESOURCE,
+            GeometryInstanceId(42),
+        );
+
+        assert_eq!(scoped.resource(), DEFAULT_DEMO_RESOURCE);
+        assert_eq!(scoped.local_id(), 42);
+        assert_eq!(scoped.to_string(), "demo/revolved-solid::42");
+        assert_eq!(
+            scoped
+                .to_string()
+                .parse::<SourceScopedGeometryInstanceId>()
+                .expect("scoped instance id should parse"),
+            scoped
+        );
+        assert_eq!(scoped.as_geometry_instance_id(), GeometryInstanceId(42));
+    }
+
+    #[test]
+    fn source_scoped_geometry_definition_id_round_trips_as_string() {
+        let scoped = SourceScopedGeometryDefinitionId::from_geometry_definition_id(
+            DEFAULT_DEMO_RESOURCE,
+            GeometryDefinitionId(77),
+        );
+
+        assert_eq!(scoped.resource(), DEFAULT_DEMO_RESOURCE);
+        assert_eq!(scoped.local_id(), 77);
+        assert_eq!(scoped.to_string(), "demo/revolved-solid::77");
+        assert_eq!(
+            scoped
+                .to_string()
+                .parse::<SourceScopedGeometryDefinitionId>()
+                .expect("scoped definition id should parse"),
+            scoped
+        );
+        assert_eq!(scoped.as_geometry_definition_id(), GeometryDefinitionId(77));
+    }
+
+    #[test]
+    fn source_scoped_ids_reject_ambiguous_strings() {
+        assert_eq!(
+            "wall-a"
+                .parse::<SourceScopedSemanticElementId>()
+                .expect_err("missing separator should fail"),
+            SourceScopedIdParseError::MissingSeparator
+        );
+        assert_eq!(
+            "::wall-a"
+                .parse::<SourceScopedSemanticElementId>()
+                .expect_err("empty resource should fail"),
+            SourceScopedIdParseError::EmptyResource
+        );
+        assert_eq!(
+            "ifc/building-architecture::"
+                .parse::<SourceScopedSemanticElementId>()
+                .expect_err("empty local id should fail"),
+            SourceScopedIdParseError::EmptyLocalId
+        );
+        assert!(matches!(
+            "ifc/building-architecture::wall-a"
+                .parse::<SourceScopedGeometryInstanceId>()
+                .expect_err("non-numeric instance id should fail"),
+            SourceScopedIdParseError::InvalidInstanceId(_)
+        ));
+        assert!(matches!(
+            "ifc/building-architecture::mesh-a"
+                .parse::<SourceScopedGeometryDefinitionId>()
+                .expect_err("non-numeric definition id should fail"),
+            SourceScopedIdParseError::InvalidDefinitionId(_)
+        ));
+    }
+
+    #[test]
+    fn project_prepared_package_scopes_colliding_local_ids_by_resource() {
+        let left = colliding_web_package("physical");
+        let right = colliding_web_package("physical");
+
+        let project = WebProjectPreparedGeometryPackage::from_web_prepared_packages([
+            ("ifc/left", &left),
+            ("ifc/right", &right),
+        ])
+        .expect("colliding local ids should compose when resources differ");
+
+        assert_eq!(
+            project
+                .definitions
+                .iter()
+                .map(|definition| definition.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ifc/left::7", "ifc/right::7"]
+        );
+        assert_eq!(
+            project
+                .elements
+                .iter()
+                .map(|element| element.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "ifc/left::shared-local-element",
+                "ifc/right::shared-local-element"
+            ]
+        );
+        assert_eq!(
+            project
+                .instances
+                .iter()
+                .map(|instance| {
+                    (
+                        instance.id.as_str(),
+                        instance.element_id.as_str(),
+                        instance.definition_id.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "ifc/left::1",
+                    "ifc/left::shared-local-element",
+                    "ifc/left::7"
+                ),
+                (
+                    "ifc/right::1",
+                    "ifc/right::shared-local-element",
+                    "ifc/right::7"
+                ),
+            ]
+        );
+
+        assert_eq!(left.definitions[0].id, 7);
+        assert_eq!(left.elements[0].id, "shared-local-element");
+        assert_eq!(left.instances[0].id, 1);
+    }
+
+    #[test]
+    fn project_catalog_resolves_default_and_all_visible_state_with_scoped_ids() {
+        let physical = colliding_web_package("physical");
+        let space = colliding_web_package("space");
+        let project = WebProjectPreparedGeometryPackage::from_web_prepared_packages([
+            ("ifc/physical", &physical),
+            ("ifc/space", &space),
+        ])
+        .expect("project package should compose");
+        let catalog = project.catalog();
+
+        let default_view = catalog
+            .resolve_start_view(&GeometryStartViewRequest::Default)
+            .expect("default start view should resolve");
+        assert_eq!(
+            default_view.visible_element_ids,
+            vec!["ifc/physical::shared-local-element"]
+        );
+        assert_eq!(
+            catalog
+                .default_start_view_stream_plan()
+                .expect("default stream plan should resolve"),
+            WebProjectGeometryStreamPlan {
+                instance_ids: vec!["ifc/physical::1".to_string()],
+                definition_ids: vec!["ifc/physical::7".to_string()],
+            }
+        );
+
+        let all_view = catalog
+            .resolve_start_view(&GeometryStartViewRequest::All)
+            .expect("all start view should resolve");
+        assert_eq!(
+            all_view.visible_element_ids,
+            vec![
+                "ifc/physical::shared-local-element",
+                "ifc/space::shared-local-element"
+            ]
+        );
+        let all_plan = catalog.stream_plan_for_element_ids(&all_view.visible_element_ids);
+        assert_eq!(
+            all_plan,
+            WebProjectGeometryStreamPlan {
+                instance_ids: vec!["ifc/physical::1".to_string(), "ifc/space::1".to_string()],
+                definition_ids: vec!["ifc/physical::7".to_string(), "ifc/space::7".to_string()],
+            }
+        );
+        assert_eq!(
+            all_plan
+                .to_member_batch_requests()
+                .expect("scoped stream plan should group back into member-local requests"),
+            WebProjectGeometryBatchRequests {
+                instance_requests: vec![
+                    WebGeometryInstanceBatchRequest {
+                        resource: "ifc/physical".to_string(),
+                        instance_ids: vec![1],
+                    },
+                    WebGeometryInstanceBatchRequest {
+                        resource: "ifc/space".to_string(),
+                        instance_ids: vec![1],
+                    },
+                ],
+                definition_requests: vec![
+                    WebGeometryDefinitionBatchRequest {
+                        resource: "ifc/physical".to_string(),
+                        definition_ids: vec![7],
+                    },
+                    WebGeometryDefinitionBatchRequest {
+                        resource: "ifc/space".to_string(),
+                        definition_ids: vec![7],
+                    },
+                ],
+            }
         );
     }
 

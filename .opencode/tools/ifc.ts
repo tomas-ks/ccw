@@ -127,6 +127,48 @@ async function runReadonlyCypher(
   return text.trim();
 }
 
+async function runProjectReadonlyCypher(
+  _context: ToolContext,
+  projectResource: string,
+  cypher: string,
+  why?: string,
+  resourceFilter?: string[],
+  apiBase?: string,
+): Promise<string> {
+  const resolvedApiBase = resolveViewerApiBase(apiBase);
+  const response = await fetch(new URL("/api/cypher", resolvedApiBase), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      resource: projectResource,
+      cypher,
+      why,
+      resourceFilter: resourceFilter ?? [],
+    }),
+  });
+
+  const text = await response.text();
+  if (!response.ok) {
+    return JSON.stringify(
+      {
+        ok: false,
+        resource: projectResource,
+        cypher,
+        why: why ?? null,
+        resourceFilter: resourceFilter ?? [],
+        status: response.status,
+        error: text,
+      },
+      null,
+      2,
+    );
+  }
+
+  return text.trim();
+}
+
 async function postViewerJson(
   apiBase: string | undefined,
   path: string,
@@ -236,6 +278,31 @@ export const readonly_cypher = tool({
   },
 });
 
+export const project_readonly_cypher = tool({
+  description:
+    "Run the same read-only Cypher query across every IFC model in the active project, returning source provenance for each row.",
+  args: {
+    resource: tool.schema.string().describe("Selected project resource, for example project/infra"),
+    cypher: tool.schema.string().describe("Single read-only Cypher statement"),
+    why: tool.schema.string().optional().describe("Short reason for the query"),
+    resource_filter: tool.schema
+      .array(tool.schema.string())
+      .default([])
+      .describe("Optional IFC resources within the project to query, for example ifc/infra-bridge"),
+    api_base: tool.schema.string().optional().describe("Viewer API base URL"),
+  },
+  async execute(args, context) {
+    return runProjectReadonlyCypher(
+      context,
+      args.resource,
+      args.cypher,
+      args.why,
+      args.resource_filter,
+      args.api_base,
+    );
+  },
+});
+
 export const node_relations = tool({
   description: "Inspect the properties and local relations for a graph node.",
   args: {
@@ -283,6 +350,10 @@ export const graph_set_seeds = tool({
       .array(tool.schema.number())
       .min(1)
       .describe("Database node ids to seed in the graph"),
+    resource: tool.schema
+      .string()
+      .optional()
+      .describe("IFC resource the DB node ids came from, for example ifc/infra-road"),
     why: tool.schema.string().optional().describe("Short reason for the viewer action"),
   },
   async execute(args) {
@@ -301,6 +372,10 @@ export const properties_show_node = tool({
   description: "Ask the host viewer to open the Properties panel for one DB node.",
   args: {
     db_node_id: tool.schema.number().describe("Database node id to inspect"),
+    resource: tool.schema
+      .string()
+      .optional()
+      .describe("IFC resource the DB node id came from, for example ifc/infra-road"),
     why: tool.schema.string().optional().describe("Short reason for the viewer action"),
   },
   async execute(args) {
@@ -320,7 +395,11 @@ export const elements_hide = tool({
     semantic_ids: tool.schema
       .array(tool.schema.string())
       .min(1)
-      .describe("Renderable semantic ids to hide"),
+      .describe("Renderable semantic ids to hide. In project mode these may be source-scoped as ifc/resource::GlobalId"),
+    resource: tool.schema
+      .string()
+      .optional()
+      .describe("IFC resource the semantic ids came from, for example ifc/infra-road"),
     why: tool.schema.string().optional().describe("Short reason for the viewer action"),
   },
   async execute(args) {
@@ -341,7 +420,11 @@ export const elements_show = tool({
     semantic_ids: tool.schema
       .array(tool.schema.string())
       .min(1)
-      .describe("Renderable semantic ids to show"),
+      .describe("Renderable semantic ids to show. In project mode these may be source-scoped as ifc/resource::GlobalId"),
+    resource: tool.schema
+      .string()
+      .optional()
+      .describe("IFC resource the semantic ids came from, for example ifc/infra-road"),
     why: tool.schema.string().optional().describe("Short reason for the viewer action"),
   },
   async execute(args) {
@@ -362,7 +445,11 @@ export const elements_select = tool({
     semantic_ids: tool.schema
       .array(tool.schema.string())
       .min(1)
-      .describe("Renderable semantic ids to select"),
+      .describe("Renderable semantic ids to select. In project mode these may be source-scoped as ifc/resource::GlobalId"),
+    resource: tool.schema
+      .string()
+      .optional()
+      .describe("IFC resource the semantic ids came from, for example ifc/infra-road"),
     why: tool.schema.string().optional().describe("Short reason for the viewer action"),
   },
   async execute(args) {

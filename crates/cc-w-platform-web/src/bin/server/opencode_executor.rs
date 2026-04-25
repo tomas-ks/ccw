@@ -210,6 +210,14 @@ pub enum OpencodeToolCall {
         #[serde(default)]
         why: Option<String>,
     },
+    #[serde(rename = "run_project_readonly_cypher")]
+    RunProjectReadonlyCypher {
+        cypher: String,
+        #[serde(default)]
+        why: Option<String>,
+        #[serde(default)]
+        resource_filter: Vec<String>,
+    },
     #[serde(rename = "get_schema_context")]
     GetSchemaContext,
     #[serde(rename = "get_model_details")]
@@ -244,15 +252,35 @@ pub enum OpencodeToolCall {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum PlannedUiAction {
     #[serde(rename = "graph.set_seeds")]
-    GraphSetSeeds { db_node_ids: Vec<i64> },
+    GraphSetSeeds {
+        db_node_ids: Vec<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "properties.show_node")]
-    PropertiesShowNode { db_node_id: i64 },
+    PropertiesShowNode {
+        db_node_id: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "elements.hide")]
-    ElementsHide { semantic_ids: Vec<String> },
+    ElementsHide {
+        semantic_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "elements.show")]
-    ElementsShow { semantic_ids: Vec<String> },
+    ElementsShow {
+        semantic_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "elements.select")]
-    ElementsSelect { semantic_ids: Vec<String> },
+    ElementsSelect {
+        semantic_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "viewer.frame_visible")]
     ViewerFrameVisible,
 }
@@ -1260,6 +1288,89 @@ impl AgentExecutor for OpencodeExecutor {
                                     content: serialize_tool_error("run_readonly_cypher", &cypher, &error)
                                         .map_err(|encode_error| {
                                             format!("could not encode Cypher tool error result: {encode_error}")
+                                        })?,
+                                });
+                                tool_results_by_signature.insert(
+                                    tool_call_signature,
+                                    tool_results
+                                        .last()
+                                        .cloned()
+                                        .expect("tool result just pushed"),
+                                );
+                            }
+                        }
+                    }
+                    OpencodeToolCall::RunProjectReadonlyCypher {
+                        cypher,
+                        why,
+                        resource_filter,
+                    } => {
+                        executed_tool = true;
+                        let started_event =
+                            AgentTranscriptEvent::tool(match why.as_deref().map(str::trim) {
+                                Some(why) if !why.is_empty() => {
+                                    format!("Project: {why}\nCypher:\n{}", cypher.trim())
+                                }
+                                _ => format!(
+                                    "Running project read-only Cypher for step {}.\nCypher:\n{}",
+                                    step_index + 1,
+                                    cypher.trim()
+                                ),
+                            });
+                        progress.emit(started_event.clone());
+                        transcript.push(started_event);
+                        match runtime.run_project_readonly_cypher(
+                            &cypher,
+                            why.as_deref(),
+                            &resource_filter,
+                        ) {
+                            Ok(result) => {
+                                queries_executed = queries_executed.saturating_add(1);
+                                let resource_count = project_resource_count_from_rows(&result);
+                                let finished_event = AgentTranscriptEvent::system(format!(
+                                    "Project read-only Cypher returned {} row{} across {} IFC resource{}.",
+                                    result.rows.len(),
+                                    if result.rows.len() == 1 { "" } else { "s" },
+                                    resource_count,
+                                    if resource_count == 1 { "" } else { "s" }
+                                ));
+                                progress.emit(finished_event.clone());
+                                transcript.push(finished_event);
+                                tool_results.push(OpencodeToolResult {
+                                    tool_name: "run_project_readonly_cypher".to_owned(),
+                                    call_id: format!(
+                                        "step-{}-tool-{}",
+                                        step_index + 1,
+                                        call_index + 1
+                                    ),
+                                    content: serialize_readonly_cypher_tool_result(&result)
+                                        .map_err(|error| {
+                                            format!(
+                                                "could not encode project Cypher tool result: {error}"
+                                            )
+                                        })?,
+                                });
+                                tool_results_by_signature.insert(
+                                    tool_call_signature,
+                                    tool_results
+                                        .last()
+                                        .cloned()
+                                        .expect("tool result just pushed"),
+                                );
+                            }
+                            Err(error) => {
+                                let failed_event = AgentTranscriptEvent::system(
+                                    "That project query shape did not work here. Trying a simpler angle."
+                                        .to_owned(),
+                                );
+                                progress.emit(failed_event.clone());
+                                transcript.push(failed_event);
+                                tool_results.push(OpencodeToolResult {
+                                    tool_name: "run_project_readonly_cypher".to_owned(),
+                                    call_id: format!("step-{}-tool-{}", step_index + 1, call_index + 1),
+                                    content: serialize_tool_error("run_project_readonly_cypher", &cypher, &error)
+                                        .map_err(|encode_error| {
+                                            format!("could not encode project Cypher tool error result: {encode_error}")
                                         })?,
                                 });
                                 tool_results_by_signature.insert(
@@ -2362,6 +2473,8 @@ fn display_native_tool_name(tool_name: &str) -> String {
         "relation_reference" => "ifc_relation_reference".to_owned(),
         "query_playbook" => "ifc_query_playbook".to_owned(),
         "readonly_cypher" => "ifc_readonly_cypher".to_owned(),
+        "project_readonly_cypher" => "ifc_project_readonly_cypher".to_owned(),
+        "run_project_readonly_cypher" => "ifc_project_readonly_cypher".to_owned(),
         "node_relations" => "ifc_node_relations".to_owned(),
         "renderable_descendants" => "ifc_renderable_descendants".to_owned(),
         other => other.to_owned(),
@@ -2371,7 +2484,10 @@ fn display_native_tool_name(tool_name: &str) -> String {
 fn is_native_readonly_cypher_tool_name(tool_name: &str) -> bool {
     matches!(
         canonical_native_tool_name(tool_name),
-        "readonly_cypher" | "run_readonly_cypher"
+        "readonly_cypher"
+            | "run_readonly_cypher"
+            | "project_readonly_cypher"
+            | "run_project_readonly_cypher"
     )
 }
 
@@ -2382,24 +2498,55 @@ fn native_action_candidate_from_tool_call(
     let state = state?;
     let input = state.get("input")?.as_object()?;
     match canonical_native_tool_name(tool_name) {
-        "graph_set_seeds" => {
-            native_db_node_ids_from_input(input).map(AgentActionCandidate::graph_set_seeds)
-        }
-        "properties_show_node" => {
-            native_db_node_id_from_input(input).map(AgentActionCandidate::properties_show_node)
-        }
-        "elements_hide" => {
-            native_semantic_ids_from_input(input).map(AgentActionCandidate::elements_hide)
-        }
-        "elements_show" => {
-            native_semantic_ids_from_input(input).map(AgentActionCandidate::elements_show)
-        }
-        "elements_select" => {
-            native_semantic_ids_from_input(input).map(AgentActionCandidate::elements_select)
-        }
+        "graph_set_seeds" => native_db_node_ids_from_input(input).map(|db_node_ids| {
+            let mut candidate = AgentActionCandidate::graph_set_seeds(db_node_ids);
+            if let Some(resource) = native_resource_from_input(input) {
+                candidate = candidate.with_resource(resource);
+            }
+            candidate
+        }),
+        "properties_show_node" => native_db_node_id_from_input(input).map(|db_node_id| {
+            let mut candidate = AgentActionCandidate::properties_show_node(db_node_id);
+            if let Some(resource) = native_resource_from_input(input) {
+                candidate = candidate.with_resource(resource);
+            }
+            candidate
+        }),
+        "elements_hide" => native_semantic_ids_from_input(input).map(|semantic_ids| {
+            let mut candidate = AgentActionCandidate::elements_hide(semantic_ids);
+            if let Some(resource) = native_resource_from_input(input) {
+                candidate = candidate.with_resource(resource);
+            }
+            candidate
+        }),
+        "elements_show" => native_semantic_ids_from_input(input).map(|semantic_ids| {
+            let mut candidate = AgentActionCandidate::elements_show(semantic_ids);
+            if let Some(resource) = native_resource_from_input(input) {
+                candidate = candidate.with_resource(resource);
+            }
+            candidate
+        }),
+        "elements_select" => native_semantic_ids_from_input(input).map(|semantic_ids| {
+            let mut candidate = AgentActionCandidate::elements_select(semantic_ids);
+            if let Some(resource) = native_resource_from_input(input) {
+                candidate = candidate.with_resource(resource);
+            }
+            candidate
+        }),
         "viewer_frame_visible" | "frame" => Some(AgentActionCandidate::viewer_frame_visible()),
         _ => None,
     }
+}
+
+fn native_resource_from_input(input: &serde_json::Map<String, Value>) -> Option<String> {
+    input
+        .get("resource")
+        .or_else(|| input.get("source_resource"))
+        .or_else(|| input.get("sourceResource"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn native_db_node_ids_from_input(input: &serde_json::Map<String, Value>) -> Option<Vec<i64>> {
@@ -2534,20 +2681,60 @@ fn spawn_native_event_reader(
 
 fn map_planned_ui_action(action: PlannedUiAction) -> AgentActionCandidate {
     match action {
-        PlannedUiAction::GraphSetSeeds { db_node_ids } => {
-            AgentActionCandidate::graph_set_seeds(db_node_ids)
+        PlannedUiAction::GraphSetSeeds {
+            db_node_ids,
+            resource,
+        } => {
+            let candidate = AgentActionCandidate::graph_set_seeds(db_node_ids);
+            if let Some(resource) = resource {
+                candidate.with_resource(resource)
+            } else {
+                candidate
+            }
         }
-        PlannedUiAction::PropertiesShowNode { db_node_id } => {
-            AgentActionCandidate::properties_show_node(db_node_id)
+        PlannedUiAction::PropertiesShowNode {
+            db_node_id,
+            resource,
+        } => {
+            let candidate = AgentActionCandidate::properties_show_node(db_node_id);
+            if let Some(resource) = resource {
+                candidate.with_resource(resource)
+            } else {
+                candidate
+            }
         }
-        PlannedUiAction::ElementsHide { semantic_ids } => {
-            AgentActionCandidate::elements_hide(semantic_ids)
+        PlannedUiAction::ElementsHide {
+            semantic_ids,
+            resource,
+        } => {
+            let candidate = AgentActionCandidate::elements_hide(semantic_ids);
+            if let Some(resource) = resource {
+                candidate.with_resource(resource)
+            } else {
+                candidate
+            }
         }
-        PlannedUiAction::ElementsShow { semantic_ids } => {
-            AgentActionCandidate::elements_show(semantic_ids)
+        PlannedUiAction::ElementsShow {
+            semantic_ids,
+            resource,
+        } => {
+            let candidate = AgentActionCandidate::elements_show(semantic_ids);
+            if let Some(resource) = resource {
+                candidate.with_resource(resource)
+            } else {
+                candidate
+            }
         }
-        PlannedUiAction::ElementsSelect { semantic_ids } => {
-            AgentActionCandidate::elements_select(semantic_ids)
+        PlannedUiAction::ElementsSelect {
+            semantic_ids,
+            resource,
+        } => {
+            let candidate = AgentActionCandidate::elements_select(semantic_ids);
+            if let Some(resource) = resource {
+                candidate.with_resource(resource)
+            } else {
+                candidate
+            }
         }
         PlannedUiAction::ViewerFrameVisible => AgentActionCandidate::viewer_frame_visible(),
     }
@@ -2584,6 +2771,26 @@ fn readonly_cypher_result_value(result: &AgentReadonlyCypherResult) -> serde_jso
         "firstDbNodeId": result.db_node_ids.first(),
         "firstSemanticElementId": result.semantic_element_ids.first(),
     })
+}
+
+fn project_resource_count_from_rows(result: &AgentReadonlyCypherResult) -> usize {
+    let source_index = result
+        .columns
+        .iter()
+        .position(|column| column.eq_ignore_ascii_case("source_resource"));
+    let Some(source_index) = source_index else {
+        return 1;
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for row in &result.rows {
+        if let Some(resource) = row.get(source_index).map(String::as_str) {
+            let resource = resource.trim();
+            if !resource.is_empty() {
+                seen.insert(resource.to_owned());
+            }
+        }
+    }
+    seen.len().max(1)
 }
 
 fn serialize_readonly_cypher_tool_result(
@@ -2714,7 +2921,14 @@ fn turn_context_block(resource: &str, schema_id: &str, schema_slug: Option<&str>
     let schema_id = schema_id.trim();
     let schema_slug = schema_slug.map(str::trim).filter(|value| !value.is_empty());
 
-    let mut lines = vec![format!("Bound IFC resource for this turn: {}.", resource)];
+    let mut lines = if resource.starts_with("project/") {
+        vec![format!(
+            "Bound IFC project resource for this turn: {}.",
+            resource
+        )]
+    } else {
+        vec![format!("Bound IFC resource for this turn: {}.", resource)]
+    };
     if let Some(slug) = schema_slug {
         lines.push(format!(
             "Bound IFC schema for this turn: {} ({}).",
@@ -2723,10 +2937,17 @@ fn turn_context_block(resource: &str, schema_id: &str, schema_slug: Option<&str>
     } else {
         lines.push(format!("Bound IFC schema for this turn: {}.", schema_id));
     }
-    lines.push(
-        "Use the exact resource string above in any `ifc_*` tool call. Do not swap in a placeholder or `/api`."
-            .to_owned(),
-    );
+    if resource.starts_with("project/") {
+        lines.push(
+            "For broad project questions, use the exact project resource above with `ifc_project_readonly_cypher`; for single-model follow-ups, use a concrete member `ifc/...` resource with `ifc_readonly_cypher`."
+                .to_owned(),
+        );
+    } else {
+        lines.push(
+            "Use the exact resource string above in any `ifc_*` tool call. Do not swap in a placeholder or `/api`."
+                .to_owned(),
+        );
+    }
     lines
 }
 
@@ -2780,15 +3001,21 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
                     "cypher": "MATCH (n) RETURN id(n) AS node_id LIMIT 1",
                     "why": "find one graph seed node before deciding on a viewer action"
                 },
+                {
+                    "kind": "run_project_readonly_cypher",
+                    "cypher": "MATCH (p:IfcProject) RETURN p.Name AS project_name LIMIT 1",
+                    "why": "sample every IFC resource in the active project",
+                    "resource_filter": []
+                },
                 { "kind": "describe_nodes", "db_node_ids": [123] },
                 { "kind": "get_node_properties", "db_node_id": 123 },
                 { "kind": "get_neighbors", "db_node_ids": [123], "hops": 1, "mode": "semantic" },
                 {
                     "kind": "emit_ui_actions",
                     "actions": [
-                        { "kind": "graph.set_seeds", "db_node_ids": [123] },
-                        { "kind": "properties.show_node", "db_node_id": 123 },
-                        { "kind": "elements.select", "semantic_ids": ["2iPwJwpPDCSgMheXwk9cBT"] },
+                        { "kind": "graph.set_seeds", "db_node_ids": [123], "resource": "ifc/building-architecture" },
+                        { "kind": "properties.show_node", "db_node_id": 123, "resource": "ifc/building-architecture" },
+                        { "kind": "elements.select", "semantic_ids": ["2iPwJwpPDCSgMheXwk9cBT"], "resource": "ifc/building-architecture" },
                         { "kind": "viewer.frame_visible" }
                     ]
                 }
@@ -2796,10 +3023,12 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
             "finalText": "optional short final note"
         }))
         .expect("schema example should serialize"),
-        "Allowed toolCalls kinds are only `get_schema_context`, `get_model_details`, `get_entity_reference`, `get_query_playbook`, `get_relation_reference`, `run_readonly_cypher`, `describe_nodes`, `get_node_properties`, `get_neighbors`, and `emit_ui_actions`.".to_owned(),
+        "Allowed toolCalls kinds are only `get_schema_context`, `get_model_details`, `get_entity_reference`, `get_query_playbook`, `get_relation_reference`, `run_readonly_cypher`, `run_project_readonly_cypher`, `describe_nodes`, `get_node_properties`, `get_neighbors`, and `emit_ui_actions`.".to_owned(),
         "Do not invent `request_tools`; use the concrete tools above directly.".to_owned(),
         "Allowed UI actions are only `graph.set_seeds`, `properties.show_node`, `elements.hide`, `elements.show`, `elements.select`, and `viewer.frame_visible`.".to_owned(),
         "Use exact action payload field names: `db_node_ids` for graph seeds, `db_node_id` for properties.show_node, and `semantic_ids` for element actions.".to_owned(),
+        "When a DB node id comes from a project-wide query result, include its `source_resource` as the UI action `resource`; DB node ids are only meaningful inside one IFC database.".to_owned(),
+        "When semantic ids come from project-wide query results, preserve source by either passing `resource` on the element action or using the source-scoped `source_resource::GlobalId` id returned by the tool.".to_owned(),
         "Project-specific repo guidance may be provided through AGENTS.md; follow it when choosing Cypher and UI actions.".to_owned(),
         "Your job is not just to plan; it is to investigate until you have enough information to answer well or perform the requested viewer action.".to_owned(),
         "Rules:".to_owned(),
@@ -2807,13 +3036,14 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
         "- When a Cypher tool result already includes `dbNodeIds`, `semanticElementIds`, `firstDbNodeId`, or `firstSemanticElementId`, use those extracted fields instead of re-deriving ids from raw rows.".to_owned(),
         "- Never default a missing id to `0`. If an id is missing, ask for another small query or use a different inspection tool.".to_owned(),
         "- Every `run_readonly_cypher` tool call must include a short `why` string explaining what you are trying to learn from that query.".to_owned(),
+        "- When the bound resource starts with `project/` and the user asks a broad project-level question, prefer `run_project_readonly_cypher`; use `run_readonly_cypher` for single-IFC focused follow-ups only.".to_owned(),
         "- The current model schema is already provided. Use it. If entity meaning, relation shape, or query strategy is unclear, ask for schema context, entity reference, relation reference, or a query playbook before guessing.".to_owned(),
         "- Use recent session history to resolve vague follow-up requests like `show me the relations`, `show them`, or `what about that one`.".to_owned(),
         "- Before issuing a new discovery query for a repeated factual question, check sessionHistory for an earlier answer. If the fact was already established, answer from that prior finding and only run a small verification query when freshness or certainty really matters.".to_owned(),
         "- If prior history already identified a concrete object with a GlobalId or DB node id, reuse that identifier directly instead of rediscovering the object from scratch.".to_owned(),
         "- Read-only applies to graph/database inspection only. You are allowed to carry out approved viewer actions by returning them in `emit_ui_actions`.".to_owned(),
         "- When the user asks to hide, show, select, seed the graph, reveal properties, or frame the scene, prefer returning the corresponding validated viewer action instead of refusing on the grounds that this is a planning phase.".to_owned(),
-        "- `elements.hide`, `elements.show`, and `elements.select` require renderable semantic ids, usually returned from `GlobalId` / `global_id` columns.".to_owned(),
+        "- `elements.hide`, `elements.show`, and `elements.select` require renderable semantic ids, usually returned from `GlobalId` / `global_id` columns. In project mode, carry the source IFC resource with those ids.".to_owned(),
         "- If the query only returns DB node ids, use `graph.set_seeds`; do not emit element actions from DB ids alone.".to_owned(),
         "- Learn the general difference between semantic/container nodes and visible/product nodes. Do not rely on one-off entity exceptions alone.".to_owned(),
         "- Treat facility roots, project/site/building/storey nodes, relation nodes, aggregate/group nodes, and many `*Part` subdivision nodes as likely semantic/container candidates until the live graph proves otherwise.".to_owned(),
@@ -3108,11 +3338,28 @@ fn normalize_tool_call(tool_call: Value) -> Value {
         normalized.insert("kind".to_owned(), Value::String(kind));
     }
     match normalized.get("kind").and_then(Value::as_str) {
-        Some("run_readonly_cypher") => {
+        Some("run_readonly_cypher") | Some("run_project_readonly_cypher") => {
             if let Some(value) = get_first_value(&normalized, &["why", "rationale", "reason"]) {
                 normalized.insert("why".to_owned(), value);
                 normalized.remove("rationale");
                 normalized.remove("reason");
+            }
+            if let Some(Value::Array(resources)) = get_first_value(
+                &normalized,
+                &[
+                    "resource_filter",
+                    "resourceFilter",
+                    "resources",
+                    "resource_ids",
+                ],
+            ) {
+                normalized.insert(
+                    "resource_filter".to_owned(),
+                    Value::Array(resources.clone()),
+                );
+                normalized.remove("resourceFilter");
+                normalized.remove("resources");
+                normalized.remove("resource_ids");
             }
         }
         Some("get_schema_context") => {
@@ -3332,6 +3579,10 @@ fn is_tool_call_wrapper_kind(value: &str) -> bool {
 fn normalize_tool_function_kind(function: &str) -> String {
     match function.trim() {
         "run_readonly_cypher" | "runReadonlyCypher" => "run_readonly_cypher".to_owned(),
+        "run_project_readonly_cypher"
+        | "runProjectReadonlyCypher"
+        | "project_readonly_cypher"
+        | "projectReadonlyCypher" => "run_project_readonly_cypher".to_owned(),
         "get_schema" | "getSchema" | "get_schema_context" | "getSchemaContext" => {
             "get_schema_context".to_owned()
         }
@@ -3373,6 +3624,20 @@ fn normalize_ui_action(action: Value) -> Value {
         if let Some(canonical_kind) = normalize_ui_action_kind(kind) {
             normalized.insert("kind".to_owned(), Value::String(canonical_kind));
         }
+    }
+    if let Some(resource) = get_first_value(
+        &normalized,
+        &[
+            "resource",
+            "source_resource",
+            "sourceResource",
+            "ifcResource",
+        ],
+    ) {
+        normalized.insert("resource".to_owned(), resource.clone());
+        normalized.remove("source_resource");
+        normalized.remove("sourceResource");
+        normalized.remove("ifcResource");
     }
 
     match normalized.get("kind").and_then(Value::as_str) {
@@ -3944,7 +4209,7 @@ fn opencode_tool_progress_call_events(
     input: Option<&Value>,
 ) -> Vec<AgentTranscriptEvent> {
     if is_cypher_tool_name(tool_name) {
-        return opencode_cypher_progress_call_events(title, status, input);
+        return opencode_cypher_progress_call_events(tool_name, title, status, input);
     }
     let tool_name = display_native_tool_name(tool_name);
 
@@ -3975,6 +4240,7 @@ fn opencode_tool_progress_call_events(
 }
 
 fn opencode_cypher_progress_call_events(
+    tool_name: &str,
     title: Option<&str>,
     _status: &str,
     input: Option<&Value>,
@@ -3994,7 +4260,12 @@ fn opencode_cypher_progress_call_events(
         .or_else(|| title.clone())
         .unwrap_or_else(|| "read-only Cypher".to_owned());
 
-    let mut lines = vec![format!("ifc_readonly_cypher : {why}")];
+    let display_name = if is_project_cypher_tool_name(tool_name) {
+        "ifc_project_readonly_cypher"
+    } else {
+        "ifc_readonly_cypher"
+    };
+    let mut lines = vec![format!("{display_name} : {why}")];
     if let Some(Value::Object(object)) = input {
         if let Some(cypher) = get_first_string(object, &["cypher", "query"]) {
             let trimmed = cypher.trim();
@@ -4323,8 +4594,18 @@ fn plural_suffix(count: usize) -> &'static str {
 
 fn is_cypher_tool_name(tool_name: &str) -> bool {
     matches!(
-        tool_name.trim(),
-        "ifc_readonly_cypher" | "run_readonly_cypher" | "readonly_cypher"
+        canonical_native_tool_name(tool_name),
+        "readonly_cypher"
+            | "run_readonly_cypher"
+            | "project_readonly_cypher"
+            | "run_project_readonly_cypher"
+    )
+}
+
+fn is_project_cypher_tool_name(tool_name: &str) -> bool {
+    matches!(
+        canonical_native_tool_name(tool_name),
+        "project_readonly_cypher" | "run_project_readonly_cypher"
     )
 }
 
@@ -4378,6 +4659,20 @@ fn opencode_progress_event_for_tool_call(tool_call: &OpencodeToolCall) -> AgentT
                 }
                 _ => format!(
                     "ifc_readonly_cypher : read-only Cypher\nCypher:\n{}",
+                    cypher.trim()
+                ),
+            })
+        }
+        OpencodeToolCall::RunProjectReadonlyCypher { cypher, why, .. } => {
+            AgentTranscriptEvent::tool(match why.as_deref().map(str::trim) {
+                Some(why) if !why.is_empty() => {
+                    format!(
+                        "ifc_project_readonly_cypher : {why}\nCypher:\n{}",
+                        cypher.trim()
+                    )
+                }
+                _ => format!(
+                    "ifc_project_readonly_cypher : project read-only Cypher\nCypher:\n{}",
                     cypher.trim()
                 ),
             })
@@ -4442,6 +4737,20 @@ fn opencode_tool_call_signature(tool_call: &OpencodeToolCall) -> String {
     match tool_call {
         OpencodeToolCall::RunReadonlyCypher { cypher, .. } => {
             format!("run_readonly_cypher|{}", cypher.trim())
+        }
+        OpencodeToolCall::RunProjectReadonlyCypher {
+            cypher,
+            resource_filter,
+            ..
+        } => {
+            let mut resource_filter = resource_filter.clone();
+            resource_filter.sort_unstable();
+            resource_filter.dedup();
+            format!(
+                "run_project_readonly_cypher|{}|{}",
+                cypher.trim(),
+                resource_filter.join("|")
+            )
         }
         OpencodeToolCall::GetSchemaContext => "get_schema_context".to_owned(),
         OpencodeToolCall::GetModelDetails => "get_model_details".to_owned(),
@@ -5226,7 +5535,10 @@ mod tests {
                     db_node_ids: vec![215, 216]
                 },
                 OpencodeToolCall::EmitUiActions {
-                    actions: vec![PlannedUiAction::PropertiesShowNode { db_node_id: 215 }]
+                    actions: vec![PlannedUiAction::PropertiesShowNode {
+                        db_node_id: 215,
+                        resource: None,
+                    }]
                 },
             ]
         );
@@ -5345,8 +5657,8 @@ mod tests {
                 {
                     "kind": "emit_ui_actions",
                     "actions": [
-                        { "kind": "graphSetSeeds", "dbNodeIds": [215, 216] },
-                        { "kind": "propertiesShowNode", "dbNodeId": 215 },
+                        { "kind": "graphSetSeeds", "dbNodeIds": [215, 216], "sourceResource": "ifc/infra-road" },
+                        { "kind": "propertiesShowNode", "dbNodeId": 215, "source_resource": "ifc/infra-road" },
                         { "kind": "elementsSelect", "semanticIds": ["wall-a"] },
                         { "kind": "frame" }
                     ]
@@ -5362,11 +5674,16 @@ mod tests {
             vec![OpencodeToolCall::EmitUiActions {
                 actions: vec![
                     PlannedUiAction::GraphSetSeeds {
-                        db_node_ids: vec![215, 216]
+                        db_node_ids: vec![215, 216],
+                        resource: Some("ifc/infra-road".to_owned()),
                     },
-                    PlannedUiAction::PropertiesShowNode { db_node_id: 215 },
+                    PlannedUiAction::PropertiesShowNode {
+                        db_node_id: 215,
+                        resource: Some("ifc/infra-road".to_owned()),
+                    },
                     PlannedUiAction::ElementsSelect {
-                        semantic_ids: vec!["wall-a".to_owned()]
+                        semantic_ids: vec!["wall-a".to_owned()],
+                        resource: None,
                     },
                     PlannedUiAction::ViewerFrameVisible,
                 ]

@@ -1256,6 +1256,8 @@
       function createViewerApi() {
         const parseViewState = (json) => JSON.parse(json);
         const parsePickResult = (json) => JSON.parse(json);
+        const currentViewerElementIds = (ids, options = {}) =>
+          semanticIdsForViewerResource(ids, viewer_current_resource(), options);
         const setViewModeAsync = async (mode) => parseViewState(await viewer_set_view_mode(mode));
         const pickAtAsync = async (x, y) => parsePickResult(await viewer_pick_at_json(x, y));
         const pickRectAsync = async (x0, y0, x1, y1) =>
@@ -1286,6 +1288,7 @@
         const api = {
           currentResource: () => viewer_current_resource(),
           viewState: () => parseViewState(viewer_view_state_json()),
+          state: () => api.viewState(),
           setViewMode: (mode) => setViewModeSoon(mode),
           defaultView: () => setViewModeSoon("default"),
           allView: () => setViewModeSoon("all"),
@@ -1300,14 +1303,14 @@
           visibleElementIds: () => Array.from(viewer_visible_element_ids()),
           selectedElementIds: () => Array.from(viewer_selected_element_ids()),
           selectedInstanceIds: () => api.viewState().selectedInstanceIds || [],
-          hide: (ids) => viewer_hide_elements(ids),
-          show: (ids) => {
-            const changed = viewer_show_elements(ids);
+          hide: (ids, options = {}) => viewer_hide_elements(currentViewerElementIds(ids, options)),
+          show: (ids, options = {}) => {
+            const changed = viewer_show_elements(currentViewerElementIds(ids, options));
             streamNewlyVisibleGeometrySoon();
             return changed;
           },
-          resetVisibility: (ids) => {
-            const changed = viewer_reset_element_visibility(ids);
+          resetVisibility: (ids, options = {}) => {
+            const changed = viewer_reset_element_visibility(currentViewerElementIds(ids, options));
             streamNewlyVisibleGeometrySoon();
             return changed;
           },
@@ -1316,7 +1319,7 @@
             streamNewlyVisibleGeometrySoon();
             return changed;
           },
-          select: (ids) => viewer_select_elements(ids),
+          select: (ids, options = {}) => viewer_select_elements(currentViewerElementIds(ids, options)),
           clearSelection: () => viewer_clear_selection(),
           pickAt: pickAtSoon,
           pickRect: pickRectSoon,
@@ -1403,6 +1406,123 @@
         return typeof resource === "string" && resource.startsWith("ifc/");
       }
 
+      function isProjectResource(resource) {
+        return typeof resource === "string" && resource.startsWith("project/");
+      }
+
+      function isKnownResource(resource) {
+        return isIfcResource(resource) || isProjectResource(resource);
+      }
+
+      function parseSourceScopedSemanticId(value) {
+        const text = String(value ?? "").trim();
+        const separator = text.indexOf("::");
+        if (separator <= 0) {
+          return null;
+        }
+        const sourceResource = text.slice(0, separator).trim();
+        const semanticId = text.slice(separator + 2).trim();
+        if (!semanticId || !isIfcResource(sourceResource)) {
+          return null;
+        }
+        return { sourceResource, semanticId };
+      }
+
+      function sourceScopedSemanticId(sourceResource, semanticId) {
+        return `${sourceResource}::${semanticId}`;
+      }
+
+      function actionSourceResource(options = {}) {
+        if (typeof options === "string") {
+          return options.trim();
+        }
+        const raw =
+          options?.sourceResource ??
+          options?.source_resource ??
+          options?.resource ??
+          options?.ifcResource ??
+          "";
+        return String(raw || "").trim();
+      }
+
+      function semanticIdsForViewerResource(ids, viewerResource, options = {}) {
+        const values = Array.isArray(ids) ? ids : [ids];
+        const actionResource = actionSourceResource(options);
+        const currentResource = isKnownResource(viewerResource) ? viewerResource : "";
+        const normalized = [];
+        const seen = new Set();
+        for (const value of values) {
+          const text = String(value ?? "").trim();
+          if (!text) {
+            continue;
+          }
+          const scoped = parseSourceScopedSemanticId(text);
+          let semanticId = text;
+          if (scoped) {
+            if (isProjectResource(currentResource)) {
+              if (isIfcResource(actionResource) && actionResource !== scoped.sourceResource) {
+                continue;
+              }
+              semanticId = sourceScopedSemanticId(scoped.sourceResource, scoped.semanticId);
+            } else if (isIfcResource(currentResource)) {
+              if (scoped.sourceResource !== currentResource) {
+                continue;
+              }
+              semanticId = scoped.semanticId;
+            } else {
+              continue;
+            }
+          } else if (isProjectResource(currentResource)) {
+            if (!isIfcResource(actionResource)) {
+              continue;
+            }
+            semanticId = sourceScopedSemanticId(actionResource, text);
+          } else if (isIfcResource(currentResource)) {
+            if (isIfcResource(actionResource) && actionResource !== currentResource) {
+              continue;
+            }
+            if (isProjectResource(actionResource)) {
+              continue;
+            }
+          } else {
+            continue;
+          }
+          if (!seen.has(semanticId)) {
+            seen.add(semanticId);
+            normalized.push(semanticId);
+          }
+        }
+        return normalized;
+      }
+
+      function scopedSemanticIdForViewer(semanticId, sourceResource, viewerResource) {
+        return (
+          semanticIdsForViewerResource([semanticId], viewerResource, { sourceResource })[0] ||
+          null
+        );
+      }
+
+      function projectResourceForIfc(resource) {
+        if (!isIfcResource(resource)) {
+          return null;
+        }
+        if (resource.startsWith("ifc/building-")) {
+          return "project/building";
+        }
+        if (resource.startsWith("ifc/infra-")) {
+          return "project/infra";
+        }
+        return null;
+      }
+
+      function resourcePickerHasOption(resource) {
+        if (!resource) {
+          return false;
+        }
+        const picker = document.getElementById("resource-picker");
+        return Array.from(picker?.options || []).some((option) => option.value === resource);
+      }
+
       function selectedIfcResource(viewer, explicitResource) {
         if (isIfcResource(explicitResource)) {
           return explicitResource;
@@ -1413,6 +1533,25 @@
         }
         const viewerResource = safeViewerCurrentResource(viewer);
         return isIfcResource(viewerResource) ? viewerResource : null;
+      }
+
+      function selectedAgentResource(viewer, explicitResource) {
+        if (isProjectResource(explicitResource)) {
+          return explicitResource;
+        }
+        const pickerValue = document.getElementById("resource-picker")?.value;
+        if (isProjectResource(pickerValue)) {
+          return pickerValue;
+        }
+        const viewerResource = safeViewerCurrentResource(viewer);
+        if (isProjectResource(viewerResource)) {
+          return viewerResource;
+        }
+        const ifcResource = selectedIfcResource(viewer, explicitResource);
+        const projectResource = projectResourceForIfc(ifcResource);
+        return projectResource && resourcePickerHasOption(projectResource)
+          ? projectResource
+          : ifcResource;
       }
 
       async function postJson(url, payload) {
@@ -1732,6 +1871,77 @@
         };
       }
 
+      function ensureResourcePickerOption(picker, resource) {
+        if (!picker || !resource || resourcePickerHasOption(resource)) {
+          return false;
+        }
+        const option = document.createElement("option");
+        option.value = resource;
+        option.textContent = resource;
+        picker.appendChild(option);
+        return true;
+      }
+
+      function requestedUrlResource() {
+        try {
+          const params = new URLSearchParams(window.location.search);
+          const resource = String(params.get("resource") || "").trim();
+          return isKnownResource(resource) ? resource : null;
+        } catch (_error) {
+          return null;
+        }
+      }
+
+      async function waitForViewerResourceReady(viewer, picker, attempts = 80) {
+        for (let attempt = 0; attempt < attempts; attempt += 1) {
+          if (!picker?.disabled && safeViewerCurrentResource(viewer)) {
+            return true;
+          }
+          await sleep(50);
+        }
+        return Boolean(safeViewerCurrentResource(viewer));
+      }
+
+      function installProjectResourcePickerSupport({ viewer, graph, agentShell }) {
+        const picker = document.getElementById("resource-picker");
+        if (!picker) {
+          return;
+        }
+        picker.addEventListener("change", (event) => {
+          const nextResource = String(event?.target?.value || "").trim();
+          if (!isProjectResource(nextResource)) {
+            return;
+          }
+          void agentShell?.handleResourceSwitch?.(nextResource);
+          graph?.clear?.({ silent: true });
+          graph?.setStatus?.(`Loading project resource ${nextResource} in the viewer.`);
+        });
+        const requestedResource = requestedUrlResource();
+        getJson("/api/resources")
+          .then(async (payload) => {
+            const resources = Array.isArray(payload?.resources) ? payload.resources : [];
+            await waitForViewerResourceReady(viewer, picker);
+            for (const resource of resources) {
+              const value = String(resource || "").trim();
+              if (isProjectResource(value)) {
+                ensureResourcePickerOption(picker, value);
+              }
+            }
+            if (!isProjectResource(requestedResource) || !resourcePickerHasOption(requestedResource)) {
+              return;
+            }
+            await waitForViewerResourceReady(viewer, picker);
+            if (safeViewerCurrentResource(viewer) === requestedResource) {
+              return;
+            }
+            picker.value = requestedResource;
+            picker.dispatchEvent(new Event("change", { bubbles: true }));
+          })
+          .catch((error) => {
+            console.warn("Project resource catalog unavailable", error);
+          });
+      }
+
       function formatResult(value) {
         if (value === undefined) {
           return "undefined";
@@ -1777,6 +1987,18 @@
       function graphNodeKey(node, index = 0) {
         const raw = tryGetFirst(node, ["dbNodeId", "nodeId", "id", "key", "globalId", "semanticElementId"]);
         return raw === null ? `node-${index}` : String(raw);
+      }
+
+      function graphNodeDbNodeId(node) {
+        const raw = tryGetFirst(node, ["dbNodeId", "db_node_id", "nodeId", "id"]);
+        const parsed = Number.parseInt(String(raw ?? "").trim(), 10);
+        return Number.isFinite(parsed) ? parsed : null;
+      }
+
+      function graphNodeSourceResource(node) {
+        const raw = tryGetFirst(node, ["sourceResource", "source_resource", "resource"]);
+        const resource = raw === null ? "" : String(raw).trim();
+        return isKnownResource(resource) ? resource : null;
       }
 
       function graphEdgeKey(edge, index = 0) {
@@ -2528,6 +2750,7 @@
           selectedNodeId: null,
           pickedSemanticId: null,
           pickedDbNodeId: null,
+          pickedResource: null,
           pickDetailsRequestId: 0,
           activePickHasHit: false,
           propertiesBalloonDismissed: false,
@@ -2781,6 +3004,11 @@
           return node ? graphNodeSemanticId(node) : state.pickedSemanticId;
         };
 
+        const selectedRenderableSourceResource = () => {
+          const node = currentSelectedNode();
+          return node ? graphNodeSourceResource(node) : state.pickedResource;
+        };
+
         const cypherStringLiteral = (value) => {
           return `'${String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
         };
@@ -2829,24 +3057,49 @@
           }
         };
 
-        const findPickedElementNode = async (semanticId) => {
+        const pickedElementLookupTarget = (semanticId) => {
+          const scoped = parseSourceScopedSemanticId(semanticId);
+          if (scoped) {
+            return {
+              resource: scoped.sourceResource,
+              semanticId: scoped.semanticId,
+            };
+          }
           const resource = safeViewerCurrentResource(viewer);
           if (!semanticId || !isIfcResource(resource)) {
             return null;
           }
-          const cypher = [
-            `MATCH (n) WHERE n.GlobalId = ${cypherStringLiteral(semanticId)}`,
-            "RETURN id(n) AS node_id LIMIT 1",
-          ].join(" ");
-          const payload = await viewer.queryCypher(cypher, resource);
-          const dbNodeIds = extractDbNodeIdsFromCypherPayload(payload);
-          return dbNodeIds[0] ?? null;
+          return {
+            resource,
+            semanticId: String(semanticId),
+          };
         };
 
-        const renderPickedElementDetails = (hit, details, dbNodeId) => {
+        const findPickedElementNode = async (semanticId) => {
+          const target = pickedElementLookupTarget(semanticId);
+          if (!target) {
+            return null;
+          }
+          const cypher = [
+            `MATCH (n) WHERE n.GlobalId = ${cypherStringLiteral(target.semanticId)}`,
+            "RETURN id(n) AS node_id LIMIT 1",
+          ].join(" ");
+          const payload = await viewer.queryCypher(cypher, target.resource);
+          const dbNodeIds = extractDbNodeIdsFromCypherPayload(payload);
+          if (dbNodeIds[0] === undefined || dbNodeIds[0] === null) {
+            return null;
+          }
+          return {
+            ...target,
+            dbNodeId: dbNodeIds[0],
+          };
+        };
+
+        const renderPickedElementDetails = (hit, details, lookup) => {
+          const resource = lookup?.resource || safeViewerCurrentResource(viewer);
           const node = details?.node || {};
           const entity = node.declaredEntity || "IFC element";
-          const ifcId = node.globalId || hit?.elementId || "";
+          const ifcId = node.globalId || lookup?.semanticId || hit?.elementId || "";
           const properties = details?.properties && typeof details.properties === "object"
             ? details.properties
             : {};
@@ -2867,9 +3120,12 @@
           ]);
 
           dom.propertiesTitle.textContent = entity;
-          dom.propertiesSubtitle.textContent = ifcId ? `id: ${ifcId}` : "id unavailable";
+          dom.propertiesSubtitle.textContent = ifcId
+            ? `id: ${ifcId}${resource ? ` in ${resource}` : ""}`
+            : "id unavailable";
           dom.propertiesEmptyState.hidden = true;
-          state.pickedDbNodeId = dbNodeId || node.dbNodeId || null;
+          state.pickedDbNodeId = lookup?.dbNodeId || node.dbNodeId || null;
+          state.pickedResource = resource;
           setPickedGraphButtonVisible(Boolean(state.pickedDbNodeId));
 
           const rows = [];
@@ -2893,29 +3149,30 @@
 
         const loadPickedElementDetails = async (hit, requestId) => {
           try {
-            const dbNodeId = await findPickedElementNode(hit.elementId);
+            const lookup = await findPickedElementNode(hit.elementId);
             if (requestId !== state.pickDetailsRequestId) {
               return;
             }
-            if (!dbNodeId) {
+            if (!lookup?.dbNodeId) {
               dom.propertiesTitle.textContent = "IFC element";
               dom.propertiesSubtitle.textContent = hit.elementId ? `id: ${hit.elementId}` : "id unavailable";
               resetPropertySections();
               dom.propertiesEmptyState.hidden = false;
               dom.propertiesEmptyState.textContent = "No semantic IFC node was found for this pick.";
               state.pickedDbNodeId = null;
+              state.pickedResource = null;
               setPickedGraphButtonVisible(false);
               return;
             }
             const details = await viewer.queryGraphNodeProperties(
-              dbNodeId,
+              lookup.dbNodeId,
               { maxRelations: 1 },
-              safeViewerCurrentResource(viewer)
+              lookup.resource
             );
             if (requestId !== state.pickDetailsRequestId) {
               return;
             }
-            renderPickedElementDetails(hit, details, dbNodeId);
+            renderPickedElementDetails(hit, details, lookup);
           } catch (error) {
             if (requestId !== state.pickDetailsRequestId) {
               return;
@@ -2926,6 +3183,7 @@
             dom.propertiesEmptyState.hidden = false;
             dom.propertiesEmptyState.textContent = `Could not load IFC properties: ${error.message || error}`;
             state.pickedDbNodeId = null;
+            state.pickedResource = null;
             setPickedGraphButtonVisible(false);
           }
         };
@@ -3013,9 +3271,27 @@
           }
         };
 
+        const graphNodeForKey = (nodeId) => state.nodesById.get(String(nodeId)) || null;
+
+        const graphResourceForKey = (nodeId, fallback = safeViewerCurrentResource(viewer)) => {
+          const resource = graphNodeSourceResource(graphNodeForKey(nodeId));
+          return resource || state.lastResource || fallback;
+        };
+
+        const graphDbNodeIdForKey = (nodeId) => {
+          const node = graphNodeForKey(nodeId);
+          const fromNode = graphNodeDbNodeId(node);
+          if (fromNode !== null) {
+            return fromNode;
+          }
+          const parsed = Number.parseInt(String(nodeId ?? "").trim(), 10);
+          return Number.isFinite(parsed) ? parsed : null;
+        };
+
         const renderProperties = () => {
           state.activePickHasHit = false;
           state.pickedDbNodeId = null;
+          state.pickedResource = null;
           setPickedGraphButtonVisible(false);
           const node = currentSelectedNode();
           if (!node) {
@@ -3031,9 +3307,11 @@
 
           state.pickedSemanticId = null;
           state.pickedDbNodeId = null;
+          state.pickedResource = null;
           setPickedGraphButtonVisible(false);
           dom.propertiesTitle.textContent = graphNodeText(node);
-          const currentResource = safeViewerCurrentResource(viewer);
+          const currentResource =
+            graphNodeSourceResource(node) || safeViewerCurrentResource(viewer);
           dom.propertiesSubtitle.textContent = currentResource
             ? `${graphNodeEntity(node)} in ${currentResource}`
             : `${graphNodeEntity(node)} while the viewer is still starting`;
@@ -3094,6 +3372,7 @@
           state.selectedNodeId = null;
           state.pickedSemanticId = hit?.elementId ? String(hit.elementId) : null;
           state.pickedDbNodeId = null;
+          state.pickedResource = null;
           setPickedGraphButtonVisible(false);
           applySelectionToSigma(null);
           renderFallbackList();
@@ -4096,6 +4375,9 @@
 
         const updateGraphData = (payload = {}, options = {}) => {
           const merge = Boolean(options.merge);
+          if (isIfcResource(payload.resource)) {
+            state.lastResource = payload.resource;
+          }
           if (merge) {
             const snapshot = snapshotGraphViewport();
             if (snapshot.positions.size) {
@@ -4202,7 +4484,11 @@
         };
 
         const performSelectedViewerAction = (action) => {
-          const semanticId = selectedRenderableId();
+          const semanticId = scopedSemanticIdForViewer(
+            selectedRenderableId(),
+            selectedRenderableSourceResource(),
+            safeViewerCurrentResource(viewer)
+          );
           if (!semanticId) {
             if (action === "select") {
               viewer.clearSelection();
@@ -4249,6 +4535,7 @@
               state.activePickHasHit = false;
               state.pickedSemanticId = null;
               state.pickedDbNodeId = null;
+              state.pickedResource = null;
               setPickedGraphButtonVisible(false);
               hidePickAnchorMarker();
             }
@@ -4325,6 +4612,7 @@
             state.selectedNodeId = null;
             state.pickedSemanticId = null;
             state.pickedDbNodeId = null;
+            state.pickedResource = null;
             setPickedGraphButtonVisible(false);
             state.expandedNodeIds = new Set();
             state.layoutPositions = new Map();
@@ -4427,10 +4715,16 @@
               };
             }
             let result;
+            const resource = graphResourceForKey(state.selectedNodeId);
+            const selectedDbNodeId = graphDbNodeIdForKey(state.selectedNodeId);
+            if (selectedDbNodeId === null || !isIfcResource(resource)) {
+              setStatus("Selected graph node is not tied to an IFC resource.", "warn");
+              return api.snapshot();
+            }
             try {
               result = await state.controller.expand({
-                nodeIds: [state.selectedNodeId],
-                resource: safeViewerCurrentResource(viewer),
+                nodeIds: [selectedDbNodeId],
+                resource,
                 mode: state.mode,
                 options,
                 graph: api,
@@ -4466,10 +4760,18 @@
               };
             }
             let result;
+            const resource = options.resource || graphResourceForKey(ids[0]);
+            const dbNodeIds = ids
+              .map((nodeId) => graphDbNodeIdForKey(nodeId))
+              .filter((value) => value !== null);
+            if (!dbNodeIds.length || !isIfcResource(resource)) {
+              setStatus("Graph expansion needs DB node ids tied to an IFC resource.", "warn");
+              return api.snapshot();
+            }
             try {
               result = await state.controller.expand({
-                nodeIds: ids,
-                resource: safeViewerCurrentResource(viewer),
+                nodeIds: dbNodeIds,
+                resource,
                 mode: state.mode,
                 options,
                 graph: api,
@@ -4489,7 +4791,7 @@
             return result ?? api.snapshot();
           },
           async seedFromNode(nodeId, options = {}) {
-            const numericNodeId = Number.parseInt(String(nodeId), 10);
+            const numericNodeId = graphDbNodeIdForKey(nodeId);
             if (!Number.isFinite(numericNodeId)) {
               setStatus("Graph needs a valid DB node id for the picked element.", "warn");
               return {
@@ -4497,11 +4799,20 @@
                 reason: "Invalid DB node id.",
               };
             }
+            const resource = options.resource || graphResourceForKey(nodeId);
+            if (!isIfcResource(resource)) {
+              setStatus("Graph needs an IFC resource for the picked element.", "warn");
+              return {
+                seeded: false,
+                reason: "Invalid IFC resource.",
+              };
+            }
             window.wHeader?.showGraph?.();
             await waitForAnimationFrames(2);
             requestGraphResize();
             await api.mode(options.mode || "semantic");
             const result = await api.expand([numericNodeId], {
+              resource,
               replace: true,
               hops: options.hops ?? 2,
               maxNodes: options.maxNodes ?? 80,
@@ -4574,11 +4885,16 @@
 
         dom.propertiesGraphButton?.addEventListener("click", () => {
           const nodeId = state.pickedDbNodeId || state.selectedNodeId;
+          const resource =
+            state.pickedResource ||
+            graphResourceForKey(state.selectedNodeId) ||
+            safeViewerCurrentResource(viewer);
           if (!nodeId) {
             setStatus("Pick an IFC element before opening its graph neighborhood.", "warn");
             return;
           }
           void api.seedFromNode(nodeId, {
+            resource,
             preserveProperties: Boolean(state.activePickHasHit),
             revealProperties: false,
           }).catch((error) => {
@@ -4756,6 +5072,8 @@
       }
 
       function mapGraphSubgraphResponse(payload, options = {}) {
+        const payloadResource = String(payload?.resource || "").trim();
+        const sourceResource = isKnownResource(payloadResource) ? payloadResource : null;
         const rawEdges = Array.isArray(payload?.edges) ? payload.edges : [];
         const relationBuckets = new Map();
         for (const edge of rawEdges) {
@@ -4841,22 +5159,32 @@
           registerRelationEndpoint(group, edge, "target", target);
         }
 
-        const nodes = (Array.isArray(payload?.nodes) ? payload.nodes : []).map((node) => ({
-          id: String(node.dbNodeId),
-          dbNodeId: node.dbNodeId,
-          label: node.declaredEntity || "IfcEntity",
-          name: node.name || null,
-          displayName: node.displayLabel || node.name || null,
-          entity: node.declaredEntity,
-          globalId: node.globalId || null,
-          semanticElementId: node.globalId || null,
-          degree: relationBuckets.get(String(node.dbNodeId))?.length || 0,
-          properties: {
-            hopDistance: node.hopDistance,
-            isSeed: Boolean(node.isSeed),
-          },
-          relations: relationBuckets.get(String(node.dbNodeId)) || [],
-        }));
+        const nodes = (Array.isArray(payload?.nodes) ? payload.nodes : []).map((node) => {
+          const rawNodeResource = String(
+            tryGetFirst(node, ["sourceResource", "source_resource", "resource"]) || ""
+          ).trim();
+          const nodeSourceResource = isKnownResource(rawNodeResource)
+            ? rawNodeResource
+            : sourceResource;
+          return {
+            id: String(node.dbNodeId),
+            dbNodeId: node.dbNodeId,
+            sourceResource: nodeSourceResource,
+            label: node.declaredEntity || "IfcEntity",
+            name: node.name || null,
+            displayName: node.displayLabel || node.name || null,
+            entity: node.declaredEntity,
+            globalId: node.globalId || null,
+            semanticElementId: node.globalId || null,
+            degree: relationBuckets.get(String(node.dbNodeId))?.length || 0,
+            properties: {
+              hopDistance: node.hopDistance,
+              isSeed: Boolean(node.isSeed),
+              sourceResource: nodeSourceResource,
+            },
+            relations: relationBuckets.get(String(node.dbNodeId)) || [],
+          };
+        });
         const nodesById = new Map(nodes.map((node) => [String(node.dbNodeId), node]));
 
         const labelsById = new Map(nodes.map((node) => [String(node.dbNodeId), graphNodeText(node)]));
@@ -4917,6 +5245,7 @@
             .filter(Number.isFinite);
           nodes.push({
             id: group.nodeId,
+            sourceResource,
             label: group.relationshipType,
             name: null,
             displayName: group.relationshipType,
@@ -4936,6 +5265,7 @@
               target: displayTarget,
               relationSiblingIndex,
               relationSiblingCount,
+              sourceResource,
             },
             relations: group.endpoints.map((endpoint) => ({
               type: group.relationshipType,
@@ -4970,6 +5300,7 @@
               relationshipTarget: group.endpoints.length === 2 ? primaryTarget : "",
               relationSiblingIndex,
               relationSiblingCount,
+              sourceResource,
             });
           }
         }
@@ -4983,12 +5314,14 @@
             edgeId: edge.edgeId,
             source,
             target,
+            sourceResource,
             type: relationshipType,
             label: relationshipType,
           });
         }
 
         return {
+          resource: sourceResource,
           nodes,
           edges,
           seedNodeIds: Array.isArray(payload?.seedNodeIds) ? payload.seedNodeIds : [],
@@ -5075,9 +5408,11 @@
       }
 
       function createReplApi(viewer, graph) {
-        const currentIfcResource = (resource = viewer.currentResource()) => {
-          if (!resource || !resource.startsWith("ifc/")) {
-            throw new Error(`Current resource \`${resource}\` is not an IFC model.`);
+        const currentQueryResource = (resource = viewer.currentResource()) => {
+          if (!isKnownResource(resource)) {
+            throw new Error(
+              `Current resource \`${resource}\` is not an IFC model or project.`
+            );
           }
           return resource;
         };
@@ -5087,6 +5422,7 @@
           graph,
           resource: () => viewer.currentResource(),
           viewState: () => viewer.viewState(),
+          state: () => viewer.state(),
           setViewMode: (mode) => viewer.setViewMode(mode),
           defaultView: () => viewer.defaultView(),
           allView: () => viewer.allView(),
@@ -5101,34 +5437,34 @@
           visibleIds: () => viewer.visibleElementIds(),
           selectedIds: () => viewer.selectedElementIds(),
           selectedInstanceIds: () => viewer.selectedInstanceIds(),
-          query: async (cypher, resource = currentIfcResource()) =>
+          query: async (cypher, resource = currentQueryResource()) =>
             viewer.queryCypher(cypher, resource),
-          queryIds: async (cypher, resource = currentIfcResource()) =>
+          queryIds: async (cypher, resource = currentQueryResource()) =>
             viewer.queryIds(cypher, resource),
-          ids: async (cypher, resource = currentIfcResource()) =>
+          ids: async (cypher, resource = currentQueryResource()) =>
             viewer.queryIds(cypher, resource),
-          hide: (ids) => viewer.hide(ids),
-          show: (ids) => viewer.show(ids),
-          select: (ids) => viewer.select(ids),
-          resetVisibility: (ids) =>
-            Array.isArray(ids) ? viewer.resetVisibility(ids) : viewer.resetAllVisibility(),
+          hide: (ids, options = {}) => viewer.hide(ids, options),
+          show: (ids, options = {}) => viewer.show(ids, options),
+          select: (ids, options = {}) => viewer.select(ids, options),
+          resetVisibility: (ids, options = {}) =>
+            Array.isArray(ids) ? viewer.resetVisibility(ids, options) : viewer.resetAllVisibility(),
           clearSelection: () => viewer.clearSelection(),
           frame: () => viewer.frameVisible(),
           frameVisible: () => viewer.frameVisible(),
           resizeViewport: () => viewer.resizeViewport(),
-          hideQuery: async (cypher, resource = currentIfcResource()) => {
+          hideQuery: async (cypher, resource = currentQueryResource()) => {
             const ids = await api.queryIds(cypher, resource);
-            viewer.hide(ids);
+            viewer.hide(ids, { sourceResource: resource });
             return ids;
           },
-          showQuery: async (cypher, resource = currentIfcResource()) => {
+          showQuery: async (cypher, resource = currentQueryResource()) => {
             const ids = await api.queryIds(cypher, resource);
-            viewer.show(ids);
+            viewer.show(ids, { sourceResource: resource });
             return ids;
           },
-          selectQuery: async (cypher, resource = currentIfcResource()) => {
+          selectQuery: async (cypher, resource = currentQueryResource()) => {
             const ids = await api.queryIds(cypher, resource);
-            viewer.select(ids);
+            viewer.select(ids, { sourceResource: resource });
             return ids;
           },
         };
@@ -5656,6 +5992,17 @@
         );
       }
 
+      function agentActionResource(action, viewer) {
+        const raw = tryGetFirst(action, [
+          "resource",
+          "sourceResource",
+          "source_resource",
+          "ifcResource",
+        ]);
+        const resource = raw === null ? "" : String(raw).trim();
+        return isKnownResource(resource) ? resource : safeViewerCurrentResource(viewer);
+      }
+
       async function revealGraphPanelForAgentAction() {
         window.wHeader?.showGraph?.();
         await new Promise((resolve) => {
@@ -5676,7 +6023,7 @@
 
         if (kind === "graph.set_seeds" || kind === "graph.setseeds") {
           const dbNodeIds = agentDbNodeIds(action);
-          const resource = safeViewerCurrentResource(viewer);
+          const resource = agentActionResource(action, viewer);
           if (!dbNodeIds.length || !isIfcResource(resource)) {
             return null;
           }
@@ -5704,7 +6051,7 @@
 
         if (kind === "graph.expand") {
           const dbNodeIds = agentDbNodeIds(action);
-          const resource = safeViewerCurrentResource(viewer);
+          const resource = agentActionResource(action, viewer);
           if (!dbNodeIds.length || !isIfcResource(resource)) {
             return null;
           }
@@ -5733,7 +6080,7 @@
 
         if (kind === "properties.show_node" || kind === "properties.shownode") {
           const dbNodeIds = agentDbNodeIds(action);
-          const resource = safeViewerCurrentResource(viewer);
+          const resource = agentActionResource(action, viewer);
           if (!dbNodeIds.length || !isIfcResource(resource)) {
             return null;
           }
@@ -5791,7 +6138,11 @@
         }
 
         if (kind === "elements.hide") {
-          const semanticIds = agentSemanticIds(action);
+          const semanticIds = semanticIdsForViewerResource(
+            agentSemanticIds(action),
+            safeViewerCurrentResource(viewer),
+            { sourceResource: agentActionResource(action, viewer) }
+          );
           if (!semanticIds.length) {
             return null;
           }
@@ -5800,7 +6151,11 @@
         }
 
         if (kind === "elements.show") {
-          const semanticIds = agentSemanticIds(action);
+          const semanticIds = semanticIdsForViewerResource(
+            agentSemanticIds(action),
+            safeViewerCurrentResource(viewer),
+            { sourceResource: agentActionResource(action, viewer) }
+          );
           if (!semanticIds.length) {
             return null;
           }
@@ -5809,7 +6164,11 @@
         }
 
         if (kind === "elements.select") {
-          const semanticIds = agentSemanticIds(action);
+          const semanticIds = semanticIdsForViewerResource(
+            agentSemanticIds(action),
+            safeViewerCurrentResource(viewer),
+            { sourceResource: agentActionResource(action, viewer) }
+          );
           if (!semanticIds.length) {
             return null;
           }
@@ -5843,8 +6202,8 @@
         const levelSelect = document.getElementById("agent-level-select");
         const levelControl = levelSelect?.closest("label");
 
-        const currentIfcResource = (resource = null) =>
-          selectedIfcResource(viewer, resource);
+        const currentAgentResource = (resource = null) =>
+          selectedAgentResource(viewer, resource);
 
         const selectedBackendCapability = () => {
           const backends = Array.isArray(state.capabilities?.backends)
@@ -5960,7 +6319,7 @@
           state.levelId = levelSelect.value || null;
         });
 
-        const bindSession = async ({ resource = currentIfcResource(), force = false } = {}) => {
+        const bindSession = async ({ resource = currentAgentResource(), force = false } = {}) => {
           if (!resource) {
             state.sessionId = null;
             state.resource = null;
@@ -6032,7 +6391,7 @@
             state.resource = null;
             state.schemaId = null;
             state.schemaSlug = null;
-            shell.writeLine("AI context cleared. Select an IFC model to use the agent terminal.");
+            shell.writeLine("AI context cleared. Select an IFC model or project to use the agent terminal.");
             return;
           }
           try {
@@ -6053,13 +6412,13 @@
           hostId: "agent-terminal",
           introLines: [
             "AI agent terminal.",
-            "The agent is bound to the currently selected IFC model and can only request read-only Cypher plus validated viewer actions.",
+            "The agent is bound to the active IFC project/model and can only request read-only Cypher plus validated viewer actions.",
             "Enter runs. Up/Down walks history. Ctrl+C clears the line.",
           ],
           execute: async (code, terminal) => {
-            const resource = currentIfcResource();
+            const resource = currentAgentResource();
             if (!resource) {
-              terminal.writeLine("AI agent is available only while an IFC model is selected.");
+              terminal.writeLine("AI agent is available only while an IFC model or project is selected.");
               return TERMINAL_NO_RESULT;
             }
 
@@ -6186,7 +6545,7 @@
             });
             if (!state.activated) {
               state.activated = true;
-              const resource = currentIfcResource();
+              const resource = currentAgentResource();
               if (resource) {
                 void bindSession({ resource })
                   .then((session) => {
@@ -6202,7 +6561,7 @@
             }
           },
           async handleResourceSwitch(resource = null) {
-            const nextResource = currentIfcResource(resource);
+            const nextResource = currentAgentResource(resource);
             await writeResourceNotice(nextResource, { forceRebind: true });
           },
         };
@@ -6643,7 +7002,7 @@
           screenId: "repl-screen",
           hostId: "repl-terminal",
           introLines: [
-            'resource(), allView(), defaultView(), viewState(), pickAt(x,y), pickRect(x0,y0,x1,y1), query(...), ids(...), hide([...]), show([...]), select([...]), graph.reset(...), frame()',
+            'resource(), allView(), defaultView(), viewState(), state(), pickAt(x,y), pickRect(x0,y0,x1,y1), query(...), ids(...), hide([...]), show([...]), select([...]), graph.reset(...), frame()',
             'Example: graph.reset("MATCH (p:IfcProject) RETURN id(p) AS node_id LIMIT 1");',
             'Example: var walls = ids("MATCH (w:IfcWall) RETURN w.GlobalId AS global_id LIMIT 8"); hide(walls);',
             "Enter runs. Up/Down walks history. Ctrl+C clears the line.",
@@ -6654,7 +7013,7 @@
               "api",
               "window",
               "document",
-              `"use strict"; const { viewer, graph, resource, viewState, setViewMode, defaultView, allView, setViewModeAsync, defaultViewAsync, allViewAsync, pickAt, pickRect, pickAtAsync, pickRectAsync, listIds, visibleIds, selectedIds, selectedInstanceIds, query, queryIds, ids, hide, show, select, resetVisibility, clearSelection, frame, frameVisible, hideQuery, showQuery, selectQuery } = api; return (async () => { ${rewritten} })();`
+              `"use strict"; const { viewer, graph, resource, viewState, state, setViewMode, defaultView, allView, setViewModeAsync, defaultViewAsync, allViewAsync, pickAt, pickRect, pickAtAsync, pickRectAsync, listIds, visibleIds, selectedIds, selectedInstanceIds, query, queryIds, ids, hide, show, select, resetVisibility, clearSelection, frame, frameVisible, hideQuery, showQuery, selectQuery } = api; return (async () => { ${rewritten} })();`
             );
             return fn(replApi, window, document);
           },
@@ -6725,6 +7084,7 @@
           window.queryIds = repl.queryIds;
           window.ids = repl.ids;
           window.viewState = repl.viewState;
+          window.state = repl.state;
           window.setViewMode = repl.setViewMode;
           window.defaultView = repl.defaultView;
           window.allView = repl.allView;
@@ -6751,6 +7111,11 @@
           window.frame = repl.frame;
           const replShell = installRepl(repl);
           const agentShell = installAgentTerminal(viewer, graphShell.api);
+          installProjectResourcePickerSupport({
+            viewer,
+            graph: graphShell.api,
+            agentShell,
+          });
           const terminalShell = installTerminalToolSelector([
             { id: "ai", shell: agentShell, defaultActive: true },
             { id: "js", shell: replShell },

@@ -33,10 +33,14 @@ use cc_w_platform_web::{
     WebGeometryDefinitionBatchRequest, WebGeometryInstanceBatch, WebGeometryInstanceBatchRequest,
     WebPreparedGeometryPackage, WebPreparedPackageResponse, WebResourceCatalog,
 };
-use cc_w_types::{GeometryDefinitionBatch, GeometryInstanceBatch, PreparedGeometryPackage};
+use cc_w_types::{
+    ExternalId, GeometryDefinitionBatch, GeometryDefinitionId, GeometryInstanceBatch,
+    GeometryInstanceId, PreparedGeometryDefinition, PreparedGeometryElement,
+    PreparedGeometryInstance, PreparedGeometryPackage, SemanticElementId,
+};
 use cc_w_velr::{
-    IfcArtifactLayout, IfcSchemaId, VelrIfcModel, available_ifc_body_resources,
-    default_ifc_artifacts_root, parse_ifc_body_resource,
+    CypherQueryResult, IfcArtifactLayout, IfcSchemaId, VelrIfcModel, available_ifc_body_resources,
+    default_ifc_artifacts_root, ifc_body_resource_name, parse_ifc_body_resource,
 };
 use serde::{Deserialize, Serialize};
 
@@ -118,6 +122,195 @@ const ANSI_MAGENTA_BOLD: &str = "\x1b[1;35m";
 
 static SHOULD_STOP: AtomicBool = AtomicBool::new(false);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DefaultProjectResourceSpec {
+    resource: &'static str,
+    label: &'static str,
+    members: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectResourceSpec {
+    resource: String,
+    label: String,
+    members: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectResourceRegistry {
+    projects: Vec<ProjectResourceSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectResourceConfigFile {
+    projects: Vec<ProjectResourceConfigProject>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectResourceConfigProject {
+    resource: String,
+    label: String,
+    members: Vec<String>,
+}
+
+const PROJECT_BUILDING_MEMBERS: &[&str] = &[
+    "ifc/building-architecture",
+    "ifc/building-hvac",
+    "ifc/building-landscaping",
+    "ifc/building-structural",
+];
+
+const PROJECT_INFRA_MEMBERS: &[&str] = &[
+    "ifc/infra-bridge",
+    "ifc/infra-landscaping",
+    "ifc/infra-plumbing",
+    "ifc/infra-rail",
+    "ifc/infra-road",
+];
+
+const DEFAULT_PROJECT_RESOURCE_CONFIG_NAME: &str = "project-resources.json";
+const PROJECT_GEOMETRY_LOCAL_ID_BITS: u32 = 48;
+const PROJECT_GEOMETRY_LOCAL_ID_MASK: u64 = (1u64 << PROJECT_GEOMETRY_LOCAL_ID_BITS) - 1;
+
+const DEFAULT_PROJECT_RESOURCE_REGISTRY: &[DefaultProjectResourceSpec] = &[
+    DefaultProjectResourceSpec {
+        resource: "project/building",
+        label: "Building",
+        members: PROJECT_BUILDING_MEMBERS,
+    },
+    DefaultProjectResourceSpec {
+        resource: "project/infra",
+        label: "Infrastructure",
+        members: PROJECT_INFRA_MEMBERS,
+    },
+];
+
+impl ProjectResourceRegistry {
+    fn defaults() -> Self {
+        Self {
+            projects: DEFAULT_PROJECT_RESOURCE_REGISTRY
+                .iter()
+                .map(|spec| ProjectResourceSpec {
+                    resource: spec.resource.to_owned(),
+                    label: spec.label.to_owned(),
+                    members: spec
+                        .members
+                        .iter()
+                        .map(|member| (*member).to_owned())
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    fn from_config(config: ProjectResourceConfigFile) -> Result<Self, String> {
+        let mut seen = HashSet::new();
+        let mut projects = Vec::new();
+        for project in config.projects {
+            let resource = project.resource.trim().to_owned();
+            if !is_project_resource_id(&resource) {
+                return Err(format!(
+                    "project resource `{}` must have shape `project/<id>`",
+                    project.resource
+                ));
+            }
+            if !seen.insert(resource.clone()) {
+                return Err(format!("duplicate project resource `{resource}`"));
+            }
+
+            let label = project.label.trim().to_owned();
+            if label.is_empty() {
+                return Err(format!(
+                    "project resource `{resource}` must have a non-empty label"
+                ));
+            }
+
+            let mut member_seen = HashSet::new();
+            let mut members = Vec::new();
+            for member in project.members {
+                let member = member.trim().to_owned();
+                if parse_ifc_body_resource(&member).is_none() {
+                    return Err(format!(
+                        "project resource `{resource}` member `{member}` must have shape `ifc/<model>`"
+                    ));
+                }
+                if member_seen.insert(member.clone()) {
+                    members.push(member);
+                }
+            }
+            if members.is_empty() {
+                return Err(format!(
+                    "project resource `{resource}` must include at least one IFC member"
+                ));
+            }
+
+            projects.push(ProjectResourceSpec {
+                resource,
+                label,
+                members,
+            });
+        }
+        if projects.is_empty() {
+            return Err("project resource config must include at least one project".to_owned());
+        }
+        Ok(Self { projects })
+    }
+}
+
+impl Default for ProjectResourceRegistry {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
+fn is_project_resource_id(resource: &str) -> bool {
+    resource
+        .strip_prefix("project/")
+        .is_some_and(|slug| !slug.is_empty() && !slug.contains('/'))
+}
+
+fn load_project_resource_registry(root: &Path) -> Result<ProjectResourceRegistry, String> {
+    let Some(path) = project_resource_config_path(root) else {
+        return Ok(ProjectResourceRegistry::default());
+    };
+    let contents = fs::read_to_string(&path)
+        .map_err(|error| format!("could not read project resource config {:?}: {error}", path))?;
+    let config = serde_json::from_str::<ProjectResourceConfigFile>(&contents).map_err(|error| {
+        format!(
+            "could not parse project resource config {:?}: {error}",
+            path
+        )
+    })?;
+    ProjectResourceRegistry::from_config(config)
+}
+
+fn project_resource_config_path(root: &Path) -> Option<PathBuf> {
+    let root_config = root.join(DEFAULT_PROJECT_RESOURCE_CONFIG_NAME);
+    if root_config.exists() {
+        return Some(root_config);
+    }
+    let crate_config = root.parent()?.join(DEFAULT_PROJECT_RESOURCE_CONFIG_NAME);
+    crate_config.exists().then_some(crate_config)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CypherResourceTarget {
+    resource: String,
+    model_slug: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CypherResourceScope {
+    Single(CypherResourceTarget),
+    Project {
+        resource: String,
+        label: String,
+        targets: Vec<CypherResourceTarget>,
+    },
+}
+
 #[derive(Clone, Copy)]
 enum ConsoleLogKind {
     Error,
@@ -185,6 +378,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let root = fs::canonicalize(&args.root)
         .map_err(|error| format!("w web server could not resolve {:?}: {error}", args.root))?;
     let mut agent_runtime = AgentRuntimeConfig::from_env()?;
+    let project_registry = Arc::new(load_project_resource_registry(&root)?);
     let (listener, bound_port) = bind_listener(&args.host, args.port)?;
     listener.set_nonblocking(true)?;
     let url = format!("http://{}:{}/", args.host, bound_port);
@@ -196,6 +390,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let server_state = Arc::new(ServerState {
         root,
         ifc_artifacts_root: args.ifc_artifacts_root,
+        project_registry,
         ifc_model_cache: Mutex::new(HashMap::new()),
         agent_sessions: Arc::new(Mutex::new(AgentSessionStore::default())),
         agent_turns: Arc::new(Mutex::new(AgentTurnStore::default())),
@@ -288,6 +483,7 @@ struct Args {
 struct ServerState {
     root: PathBuf,
     ifc_artifacts_root: PathBuf,
+    project_registry: Arc<ProjectResourceRegistry>,
     ifc_model_cache: Mutex<HashMap<String, CachedIfcModel>>,
     agent_sessions: Arc<Mutex<AgentSessionStore>>,
     agent_turns: Arc<Mutex<AgentTurnStore>>,
@@ -297,6 +493,7 @@ struct ServerState {
 #[derive(Clone)]
 struct AgentWorkerState {
     ifc_artifacts_root: PathBuf,
+    project_registry: Arc<ProjectResourceRegistry>,
     agent_sessions: Arc<Mutex<AgentSessionStore>>,
     agent_turns: Arc<Mutex<AgentTurnStore>>,
     agent_runtime: AgentRuntimeConfig,
@@ -861,6 +1058,8 @@ struct HttpRequest {
 struct CypherApiRequest {
     resource: String,
     cypher: String,
+    #[serde(default)]
+    resource_filter: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -967,6 +1166,15 @@ struct CypherApiResponse {
     columns: Vec<String>,
     rows: Vec<Vec<String>>,
     semantic_element_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    resource_errors: Vec<CypherResourceError>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CypherResourceError {
+    resource: String,
+    error: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1057,15 +1265,35 @@ enum AgentTranscriptEventKind {
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum AgentUiAction {
     #[serde(rename = "graph.set_seeds")]
-    GraphSetSeeds { db_node_ids: Vec<i64> },
+    GraphSetSeeds {
+        db_node_ids: Vec<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "properties.show_node")]
-    PropertiesShowNode { db_node_id: i64 },
+    PropertiesShowNode {
+        db_node_id: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "elements.hide")]
-    ElementsHide { semantic_ids: Vec<String> },
+    ElementsHide {
+        semantic_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "elements.show")]
-    ElementsShow { semantic_ids: Vec<String> },
+    ElementsShow {
+        semantic_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "elements.select")]
-    ElementsSelect { semantic_ids: Vec<String> },
+    ElementsSelect {
+        semantic_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "viewer.frame_visible")]
     ViewerFrameVisible,
 }
@@ -1075,6 +1303,7 @@ struct AgentActionCandidate {
     kind: String,
     semantic_ids: Vec<String>,
     db_node_ids: Vec<i64>,
+    resource: Option<String>,
 }
 
 impl AgentActionCandidate {
@@ -1083,6 +1312,7 @@ impl AgentActionCandidate {
             kind: "graph.set_seeds".to_owned(),
             semantic_ids: Vec::new(),
             db_node_ids,
+            resource: None,
         }
     }
 
@@ -1091,6 +1321,7 @@ impl AgentActionCandidate {
             kind: "elements.hide".to_owned(),
             semantic_ids,
             db_node_ids: Vec::new(),
+            resource: None,
         }
     }
 
@@ -1099,6 +1330,7 @@ impl AgentActionCandidate {
             kind: "elements.show".to_owned(),
             semantic_ids,
             db_node_ids: Vec::new(),
+            resource: None,
         }
     }
 
@@ -1107,6 +1339,7 @@ impl AgentActionCandidate {
             kind: "elements.select".to_owned(),
             semantic_ids,
             db_node_ids: Vec::new(),
+            resource: None,
         }
     }
 
@@ -1115,6 +1348,7 @@ impl AgentActionCandidate {
             kind: "properties.show_node".to_owned(),
             semantic_ids: Vec::new(),
             db_node_ids: vec![db_node_id],
+            resource: None,
         }
     }
 
@@ -1123,7 +1357,16 @@ impl AgentActionCandidate {
             kind: "viewer.frame_visible".to_owned(),
             semantic_ids: Vec::new(),
             db_node_ids: Vec::new(),
+            resource: None,
         }
+    }
+
+    fn with_resource(mut self, resource: impl Into<String>) -> Self {
+        let resource = resource.into();
+        if !resource.trim().is_empty() {
+            self.resource = Some(resource);
+        }
+        self
     }
 }
 
@@ -1714,7 +1957,7 @@ fn serve_resources_api(
     state: &ServerState,
 ) -> Result<(), String> {
     let payload = WebResourceCatalog {
-        resources: available_server_resources(&state.ifc_artifacts_root),
+        resources: available_server_resources(&state.project_registry, &state.ifc_artifacts_root),
     };
     if head_only {
         return write_response(
@@ -1740,7 +1983,11 @@ fn serve_package_api(
     let parse_ms = parse_started.elapsed().as_millis();
 
     let load_started = Instant::now();
-    match load_package_response(&api_request.resource, &state.ifc_artifacts_root) {
+    match load_package_response(
+        &api_request.resource,
+        &state.project_registry,
+        &state.ifc_artifacts_root,
+    ) {
         Ok((response, metrics)) => {
             let load_ms = load_started.elapsed().as_millis();
             let write_started = Instant::now();
@@ -1795,7 +2042,11 @@ fn serve_geometry_catalog_api(
     let parse_ms = parse_started.elapsed().as_millis();
 
     let load_started = Instant::now();
-    match load_prepared_package_with_metrics(&api_request.resource, &state.ifc_artifacts_root) {
+    match load_prepared_package_with_metrics(
+        &state.project_registry,
+        &api_request.resource,
+        &state.ifc_artifacts_root,
+    ) {
         Ok((package, metrics)) => {
             let catalog = package.catalog();
             let response =
@@ -1893,7 +2144,11 @@ fn serve_geometry_instances_api(
     }
 
     let load_started = Instant::now();
-    match load_prepared_package_with_metrics(&api_request.resource, &state.ifc_artifacts_root) {
+    match load_prepared_package_with_metrics(
+        &state.project_registry,
+        &api_request.resource,
+        &state.ifc_artifacts_root,
+    ) {
         Ok((package, metrics)) => {
             let request = api_request.to_geometry_instance_batch_request();
             let batch = package.catalog().instance_batch(&request);
@@ -2000,7 +2255,11 @@ fn serve_geometry_definitions_api(
     }
 
     let load_started = Instant::now();
-    match load_prepared_package_with_metrics(&api_request.resource, &state.ifc_artifacts_root) {
+    match load_prepared_package_with_metrics(
+        &state.project_registry,
+        &api_request.resource,
+        &state.ifc_artifacts_root,
+    ) {
         Ok((package, metrics)) => {
             let request = api_request.to_geometry_definition_batch_request();
             let batch = package.definition_batch(&request);
@@ -2457,9 +2716,11 @@ fn serve_agent_turn_poll_api(
 
 fn load_package_response(
     resource: &str,
+    registry: &ProjectResourceRegistry,
     ifc_artifacts_root: &Path,
 ) -> Result<(WebPreparedPackageResponse, PackageApiMetrics), String> {
-    let (package, metrics) = load_prepared_package_with_metrics(resource, ifc_artifacts_root)?;
+    let (package, metrics) =
+        load_prepared_package_with_metrics(registry, resource, ifc_artifacts_root)?;
 
     Ok((
         WebPreparedPackageResponse {
@@ -2471,9 +2732,14 @@ fn load_package_response(
 }
 
 fn load_prepared_package_with_metrics(
+    registry: &ProjectResourceRegistry,
     resource: &str,
     ifc_artifacts_root: &Path,
 ) -> Result<(PreparedGeometryPackage, PackageApiMetrics), String> {
+    if let Some(spec) = project_resource_spec(registry, resource) {
+        return load_project_prepared_package_with_metrics(spec, ifc_artifacts_root);
+    }
+
     if let Some(model_slug) = parse_ifc_body_resource(resource) {
         let load = VelrIfcModel::load_body_package_with_cache_status_from_artifacts_root(
             ifc_artifacts_root,
@@ -2506,10 +2772,290 @@ fn load_prepared_package_with_metrics(
     }
 }
 
-fn available_server_resources(ifc_artifacts_root: &Path) -> Vec<String> {
+fn load_project_prepared_package_with_metrics(
+    spec: &ProjectResourceSpec,
+    ifc_artifacts_root: &Path,
+) -> Result<(PreparedGeometryPackage, PackageApiMetrics), String> {
+    let targets = available_project_member_targets(spec, ifc_artifacts_root);
+    if targets.is_empty() {
+        return Err(format!(
+            "project resource `{}` has no available IFC geometry artifacts",
+            spec.resource
+        ));
+    }
+
+    let mut definitions = Vec::new();
+    let mut elements = Vec::new();
+    let mut instances = Vec::new();
+    let mut cache_statuses = BTreeMap::<&'static str, usize>::new();
+
+    for (source_index, target) in targets.iter().enumerate() {
+        let load = VelrIfcModel::load_body_package_with_cache_status_from_artifacts_root(
+            ifc_artifacts_root,
+            &target.model_slug,
+        )
+        .map_err(|error| {
+            format!(
+                "failed to load IFC package `{}` for project `{}`: {error}",
+                target.resource, spec.resource
+            )
+        })?;
+        *cache_statuses
+            .entry(load.cache_status.as_str())
+            .or_insert(0) += 1;
+        let scoped = source_scope_prepared_package(&target.resource, source_index, load.package)?;
+        definitions.extend(scoped.definitions);
+        elements.extend(scoped.elements);
+        instances.extend(scoped.instances);
+    }
+
+    let cache_status = if cache_statuses.is_empty() {
+        None
+    } else if cache_statuses.len() == 1 {
+        cache_statuses.keys().next().copied()
+    } else {
+        Some("mixed")
+    };
+    let package = PreparedGeometryPackage {
+        definitions,
+        elements,
+        instances,
+    };
+    let metrics = PackageApiMetrics {
+        kind: "project",
+        cache_status,
+        definitions: package.definitions.len(),
+        elements: package.elements.len(),
+        instances: package.instances.len(),
+    };
+    Ok((package, metrics))
+}
+
+fn source_scope_prepared_package(
+    resource: &str,
+    source_index: usize,
+    package: PreparedGeometryPackage,
+) -> Result<PreparedGeometryPackage, String> {
+    let definitions = package
+        .definitions
+        .into_iter()
+        .map(|definition| {
+            let id = pack_project_geometry_id(resource, source_index, definition.id.0)?;
+            Ok(PreparedGeometryDefinition {
+                id: GeometryDefinitionId(id),
+                mesh: definition.mesh,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let elements = package
+        .elements
+        .into_iter()
+        .map(|element| PreparedGeometryElement {
+            id: source_scoped_semantic_element_id(resource, &element.id),
+            label: element.label,
+            declared_entity: element.declared_entity,
+            default_render_class: element.default_render_class,
+            bounds: element.bounds,
+        })
+        .collect();
+    let instances = package
+        .instances
+        .into_iter()
+        .map(|instance| {
+            let id = pack_project_geometry_id(resource, source_index, instance.id.0)?;
+            let definition_id =
+                pack_project_geometry_id(resource, source_index, instance.definition_id.0)?;
+            Ok(PreparedGeometryInstance {
+                id: GeometryInstanceId(id),
+                element_id: source_scoped_semantic_element_id(resource, &instance.element_id),
+                definition_id: GeometryDefinitionId(definition_id),
+                transform: instance.transform,
+                bounds: instance.bounds,
+                external_id: source_scoped_external_id(resource, &instance.external_id),
+                label: instance.label,
+                display_color: instance.display_color,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(PreparedGeometryPackage {
+        definitions,
+        elements,
+        instances,
+    })
+}
+
+fn source_scoped_semantic_element_id(resource: &str, id: &SemanticElementId) -> SemanticElementId {
+    SemanticElementId::new(format!("{resource}::{}", id.as_str()))
+}
+
+fn source_scoped_external_id(resource: &str, id: &ExternalId) -> ExternalId {
+    ExternalId::new(format!("{resource}::{}", id.as_str()))
+}
+
+fn pack_project_geometry_id(
+    resource: &str,
+    source_index: usize,
+    local_id: u64,
+) -> Result<u64, String> {
+    if local_id > PROJECT_GEOMETRY_LOCAL_ID_MASK {
+        return Err(format!(
+            "geometry id {local_id} from `{resource}` is too large for project-scoped rendering"
+        ));
+    }
+    let source_tag = u64::try_from(source_index)
+        .ok()
+        .and_then(|index| index.checked_add(1))
+        .ok_or_else(|| {
+            format!("project member index {source_index} for `{resource}` overflowed")
+        })?;
+    if source_tag > (u64::MAX >> PROJECT_GEOMETRY_LOCAL_ID_BITS) {
+        return Err(format!(
+            "project has too many IFC members to encode geometry ids near `{resource}`"
+        ));
+    }
+    Ok((source_tag << PROJECT_GEOMETRY_LOCAL_ID_BITS) | local_id)
+}
+
+fn available_server_resources(
+    registry: &ProjectResourceRegistry,
+    ifc_artifacts_root: &Path,
+) -> Vec<String> {
     let mut resources = available_ifc_body_resources(ifc_artifacts_root).unwrap_or_default();
+    let available_ifc = resources.iter().cloned().collect::<HashSet<_>>();
+    for spec in &registry.projects {
+        if spec
+            .members
+            .iter()
+            .any(|member| available_ifc.contains(member))
+        {
+            resources.push(spec.resource.clone());
+        }
+    }
     resources.sort();
     resources
+}
+
+fn project_resource_spec<'a>(
+    registry: &'a ProjectResourceRegistry,
+    resource: &str,
+) -> Option<&'a ProjectResourceSpec> {
+    registry
+        .projects
+        .iter()
+        .find(|spec| spec.resource == resource)
+}
+
+fn cypher_target_from_ifc_resource(resource: &str) -> Result<CypherResourceTarget, String> {
+    let model_slug = parse_ifc_body_resource(resource).ok_or_else(|| {
+        format!("expected an IFC resource like `ifc/building-architecture`; got `{resource}`")
+    })?;
+    Ok(CypherResourceTarget {
+        resource: ifc_body_resource_name(model_slug),
+        model_slug: model_slug.to_owned(),
+    })
+}
+
+fn validate_project_member_resource(
+    registry: &ProjectResourceRegistry,
+    project_resource: &str,
+    member_resource: &str,
+) -> Result<CypherResourceTarget, String> {
+    let spec = project_resource_spec(registry, project_resource).ok_or_else(|| {
+        format!(
+            "unknown project resource `{project_resource}`; available projects are {}",
+            project_resource_ids(registry).join(", ")
+        )
+    })?;
+    if !spec.members.iter().any(|member| member == member_resource) {
+        return Err(format!(
+            "IFC resource `{member_resource}` is not a member of `{project_resource}`"
+        ));
+    }
+    cypher_target_from_ifc_resource(member_resource)
+}
+
+fn project_resource_ids(registry: &ProjectResourceRegistry) -> Vec<String> {
+    registry
+        .projects
+        .iter()
+        .map(|spec| spec.resource.clone())
+        .collect()
+}
+
+fn available_project_member_targets(
+    spec: &ProjectResourceSpec,
+    ifc_artifacts_root: &Path,
+) -> Vec<CypherResourceTarget> {
+    spec.members
+        .iter()
+        .filter_map(|member_resource| {
+            let model_slug = parse_ifc_body_resource(member_resource)?;
+            let layout = IfcArtifactLayout::new(ifc_artifacts_root, model_slug);
+            layout.database.exists().then(|| CypherResourceTarget {
+                resource: member_resource.clone(),
+                model_slug: model_slug.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn resolve_cypher_resource_scope(
+    registry: &ProjectResourceRegistry,
+    resource: &str,
+    resource_filter: &[String],
+    ifc_artifacts_root: &Path,
+) -> Result<CypherResourceScope, String> {
+    if parse_ifc_body_resource(resource).is_some() {
+        if !resource_filter.is_empty() {
+            return Err("resourceFilter is only valid for project resources".to_owned());
+        }
+        return cypher_target_from_ifc_resource(resource).map(CypherResourceScope::Single);
+    }
+
+    let spec = project_resource_spec(registry, resource).ok_or_else(|| {
+        format!(
+            "cypher queries require an IFC resource like `ifc/building-architecture` or a project resource like `project/infra`; got `{resource}`"
+        )
+    })?;
+    let mut targets = if resource_filter.is_empty() {
+        available_project_member_targets(spec, ifc_artifacts_root)
+    } else {
+        let mut targets = Vec::new();
+        let mut seen = HashSet::new();
+        for member_resource in resource_filter {
+            let member_resource = member_resource.trim();
+            if member_resource.is_empty() {
+                continue;
+            }
+            if !seen.insert(member_resource.to_owned()) {
+                continue;
+            }
+            let target = validate_project_member_resource(registry, resource, member_resource)?;
+            let layout = IfcArtifactLayout::new(ifc_artifacts_root, &target.model_slug);
+            if layout.database.exists() {
+                targets.push(target);
+            } else {
+                return Err(format!(
+                    "IFC resource `{member_resource}` belongs to `{resource}` but has no available database artifact"
+                ));
+            }
+        }
+        targets
+    };
+    targets.sort_by(|left, right| left.resource.cmp(&right.resource));
+    if targets.is_empty() {
+        return Err(format!(
+            "project resource `{}` has no available IFC database artifacts",
+            spec.resource
+        ));
+    }
+
+    Ok(CypherResourceScope::Project {
+        resource: spec.resource.to_owned(),
+        label: spec.label.clone(),
+        targets,
+    })
 }
 
 fn execute_cypher_api(
@@ -2519,27 +3065,49 @@ fn execute_cypher_api(
     if request.cypher.trim().is_empty() {
         return Err("cypher query must not be empty".to_owned());
     }
+    let cypher = validate_agent_readonly_cypher(&request.cypher)?;
 
-    let model_slug = parse_ifc_body_resource(&request.resource).ok_or_else(|| {
-        format!(
-            "cypher queries require an IFC resource like `ifc/building-architecture`; got `{}`",
-            request.resource
-        )
-    })?;
+    let scope = resolve_cypher_resource_scope(
+        &state.project_registry,
+        &request.resource,
+        &request.resource_filter,
+        &state.ifc_artifacts_root,
+    )?;
+    match scope {
+        CypherResourceScope::Single(target) => {
+            execute_single_cypher_api(&request.resource, &target, &cypher, state)
+        }
+        CypherResourceScope::Project {
+            resource,
+            label,
+            targets,
+        } => execute_project_cypher_api(&resource, &label, &targets, &cypher, state),
+    }
+}
+
+fn execute_single_cypher_api(
+    resource: &str,
+    target: &CypherResourceTarget,
+    cypher: &str,
+    state: &ServerState,
+) -> Result<(CypherApiResponse, CypherApiMetrics), String> {
     let open_started = Instant::now();
-    let (model, cache_status) = cached_ifc_model(state, model_slug)?;
+    let (model, cache_status) = cached_ifc_model(state, &target.model_slug)?;
     let open_ms = open_started.elapsed().as_millis();
     let query_started = Instant::now();
-    let query_result = model
-        .execute_cypher_rows(&request.cypher)
-        .map_err(|error| format!("cypher execution failed for `{model_slug}`: {error}"))?;
+    let query_result = model.execute_cypher_rows(cypher).map_err(|error| {
+        format!(
+            "cypher execution failed for `{}`: {error}",
+            target.model_slug
+        )
+    })?;
     let query_ms = query_started.elapsed().as_millis();
     let extract_started = Instant::now();
     let semantic_element_ids =
         extract_semantic_element_ids(&query_result.columns, &query_result.rows);
     let extract_ids_ms = extract_started.elapsed().as_millis();
     let metrics = CypherApiMetrics {
-        model_slug: model_slug.to_owned(),
+        model_slug: target.model_slug.clone(),
         model_cache_status: cache_status.as_str(),
         open_ms,
         query_ms,
@@ -2551,13 +3119,143 @@ fn execute_cypher_api(
 
     Ok((
         CypherApiResponse {
-            resource: request.resource.clone(),
+            resource: resource.to_owned(),
             columns: query_result.columns,
             rows: query_result.rows,
             semantic_element_ids,
+            resource_errors: Vec::new(),
         },
         metrics,
     ))
+}
+
+fn execute_project_cypher_api(
+    project_resource: &str,
+    project_label: &str,
+    targets: &[CypherResourceTarget],
+    cypher: &str,
+    state: &ServerState,
+) -> Result<(CypherApiResponse, CypherApiMetrics), String> {
+    let mut columns = Vec::<String>::new();
+    let mut rows = Vec::<Vec<String>>::new();
+    let mut resource_errors = Vec::new();
+    let mut open_ms = 0;
+    let mut query_ms = 0;
+    let mut cache_statuses = BTreeMap::<&'static str, usize>::new();
+
+    for target in targets {
+        let open_started = Instant::now();
+        let model = match cached_ifc_model(state, &target.model_slug) {
+            Ok((model, cache_status)) => {
+                *cache_statuses.entry(cache_status.as_str()).or_insert(0) += 1;
+                open_ms += open_started.elapsed().as_millis();
+                model
+            }
+            Err(error) => {
+                open_ms += open_started.elapsed().as_millis();
+                resource_errors.push(CypherResourceError {
+                    resource: target.resource.clone(),
+                    error,
+                });
+                continue;
+            }
+        };
+        let query_started = Instant::now();
+        let query_result = match model.execute_cypher_rows(cypher) {
+            Ok(result) => result,
+            Err(error) => {
+                query_ms += query_started.elapsed().as_millis();
+                resource_errors.push(CypherResourceError {
+                    resource: target.resource.clone(),
+                    error: format!(
+                        "cypher execution failed for `{}`: {error}",
+                        target.model_slug
+                    ),
+                });
+                continue;
+            }
+        };
+        query_ms += query_started.elapsed().as_millis();
+
+        if columns.is_empty() {
+            columns.push("source_resource".to_owned());
+            columns.push("source_model_slug".to_owned());
+            columns.extend(query_result.columns.iter().cloned());
+        } else if columns[2..] != query_result.columns {
+            resource_errors.push(CypherResourceError {
+                resource: target.resource.clone(),
+                error: "cypher returned a different column shape for this resource".to_owned(),
+            });
+            continue;
+        }
+        rows.extend(add_cypher_source_provenance(query_result, target).rows);
+    }
+
+    if columns.is_empty() {
+        let details = resource_errors
+            .iter()
+            .map(|error| format!("{}: {}", error.resource, error.error))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "project query failed for every IFC resource in `{project_resource}`{}",
+            if details.is_empty() {
+                String::new()
+            } else {
+                format!(": {details}")
+            }
+        ));
+    }
+
+    let extract_started = Instant::now();
+    let semantic_element_ids = extract_project_semantic_element_ids(&columns, &rows);
+    let extract_ids_ms = extract_started.elapsed().as_millis();
+    let model_cache_status = if cache_statuses.is_empty() {
+        "project"
+    } else if cache_statuses.len() == 1 {
+        cache_statuses.keys().next().copied().unwrap_or("project")
+    } else {
+        "mixed"
+    };
+
+    Ok((
+        CypherApiResponse {
+            resource: project_resource.to_owned(),
+            columns,
+            rows,
+            semantic_element_ids,
+            resource_errors,
+        },
+        CypherApiMetrics {
+            model_slug: format!("{project_resource} ({project_label})"),
+            model_cache_status,
+            open_ms,
+            query_ms,
+            extract_ids_ms,
+            columns: 0,
+            rows: 0,
+            semantic_element_ids: 0,
+        },
+    ))
+    .map(|(response, mut metrics)| {
+        metrics.columns = response.columns.len();
+        metrics.rows = response.rows.len();
+        metrics.semantic_element_ids = response.semantic_element_ids.len();
+        (response, metrics)
+    })
+}
+
+fn add_cypher_source_provenance(
+    mut result: CypherQueryResult,
+    target: &CypherResourceTarget,
+) -> CypherQueryResult {
+    result.columns.insert(0, "source_model_slug".to_owned());
+    result.columns.insert(0, "source_resource".to_owned());
+    for row in &mut result.rows {
+        row.insert(0, target.model_slug.clone());
+        row.insert(0, target.resource.clone());
+    }
+    result
 }
 
 fn execute_graph_subgraph_api(
@@ -2620,14 +3318,15 @@ fn create_agent_session_api(
     request: &AgentSessionApiRequest,
     state: &ServerState,
 ) -> Result<AgentSessionApiResponse, String> {
-    validate_agent_resource(&request.resource)?;
-    let schema = resolve_agent_resource_schema(&request.resource, &state.ifc_artifacts_root)?;
-    let schema_id = schema.canonical_name().to_owned();
-    let schema_slug = schema.generated_artifact_stem().map(ToOwned::to_owned);
+    let binding = resolve_agent_binding(
+        &request.resource,
+        &state.project_registry,
+        &state.ifc_artifacts_root,
+    )?;
     let opencode_session_id = match &state.agent_runtime.native_server {
         Some(native_server) => Some(
             native_server
-                .create_session(&format!("ccw {}", request.resource))
+                .create_session(&format!("ccw {}", binding.resource))
                 .map_err(|error| format!("could not create opencode session: {error}"))?,
         ),
         None => None,
@@ -2638,17 +3337,16 @@ fn create_agent_session_api(
         .map_err(|_| "agent session store lock poisoned".to_owned())?;
     store.next_session_number = store.next_session_number.saturating_add(1);
     let session_id = format!("agent-session-{}", store.next_session_number);
-    let transcript = vec![AgentTranscriptEvent::system(format!(
-        "AI session bound to {} ({}).",
-        request.resource, schema_id
-    ))];
+    let transcript = vec![AgentTranscriptEvent::system(
+        binding.transcript_line.clone(),
+    )];
     store.sessions.insert(
         session_id.clone(),
         AgentSession {
             session_id: session_id.clone(),
-            resource: request.resource.clone(),
-            schema_id: schema_id.clone(),
-            schema_slug: schema_slug.clone(),
+            resource: binding.resource.clone(),
+            schema_id: binding.schema_id.clone(),
+            schema_slug: binding.schema_slug.clone(),
             opencode_session_id,
             turn_count: 0,
             transcript: transcript.clone(),
@@ -2656,9 +3354,9 @@ fn create_agent_session_api(
     );
     Ok(AgentSessionApiResponse {
         session_id,
-        resource: request.resource.clone(),
-        schema_id,
-        schema_slug,
+        resource: binding.resource,
+        schema_id: binding.schema_id,
+        schema_slug: binding.schema_slug,
         transcript,
     })
 }
@@ -2855,6 +3553,7 @@ fn start_agent_turn_api(
     let level_id_for_thread = selected_level_id.clone();
     let worker_state = AgentWorkerState {
         ifc_artifacts_root: state.ifc_artifacts_root.clone(),
+        project_registry: Arc::clone(&state.project_registry),
         agent_sessions: Arc::clone(&state.agent_sessions),
         agent_turns: Arc::clone(&state.agent_turns),
         agent_runtime: state.agent_runtime.clone(),
@@ -3069,6 +3768,80 @@ impl BackendAgentProgressSink for AgentTurnProgressSinkImpl {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentBinding {
+    resource: String,
+    schema_id: String,
+    schema_slug: Option<String>,
+    transcript_line: String,
+}
+
+fn resolve_agent_binding(
+    resource: &str,
+    registry: &ProjectResourceRegistry,
+    ifc_artifacts_root: &Path,
+) -> Result<AgentBinding, String> {
+    match resolve_cypher_resource_scope(registry, resource, &[], ifc_artifacts_root)? {
+        CypherResourceScope::Single(target) => {
+            let schema = resolve_ifc_target_schema(&target, ifc_artifacts_root)?;
+            let schema_id = schema.canonical_name().to_owned();
+            Ok(AgentBinding {
+                resource: target.resource,
+                schema_slug: schema.generated_artifact_stem().map(ToOwned::to_owned),
+                transcript_line: format!("AI session bound to {resource} ({schema_id})."),
+                schema_id,
+            })
+        }
+        CypherResourceScope::Project {
+            resource,
+            label,
+            targets,
+        } => {
+            let mut schema_ids = Vec::new();
+            let mut schema_slugs = Vec::new();
+            for target in &targets {
+                let schema = resolve_ifc_target_schema(target, ifc_artifacts_root)?;
+                schema_ids.push(schema.canonical_name().to_owned());
+                if let Some(slug) = schema.generated_artifact_stem() {
+                    schema_slugs.push(slug.to_owned());
+                }
+            }
+            schema_ids.sort();
+            schema_ids.dedup();
+            schema_slugs.sort();
+            schema_slugs.dedup();
+            let schema_id = if schema_ids.len() == 1 {
+                schema_ids[0].clone()
+            } else {
+                format!("MIXED({})", schema_ids.join(","))
+            };
+            let schema_slug = (schema_slugs.len() == 1).then(|| schema_slugs[0].clone());
+            let resource_count = targets.len();
+            Ok(AgentBinding {
+                resource: resource.clone(),
+                schema_id: schema_id.clone(),
+                schema_slug,
+                transcript_line: format!(
+                    "AI session bound to {resource} ({resource_count} IFC resources, {schema_id}; {label} project)."
+                ),
+            })
+        }
+    }
+}
+
+fn resolve_ifc_target_schema(
+    target: &CypherResourceTarget,
+    ifc_artifacts_root: &Path,
+) -> Result<IfcSchemaId, String> {
+    let layout = IfcArtifactLayout::new(ifc_artifacts_root, &target.model_slug);
+    layout.authoritative_schema().map_err(|error| {
+        format!(
+            "could not determine IFC schema for `{}`: {error}",
+            target.resource
+        )
+    })
 }
 
 fn validate_agent_resource(resource: &str) -> Result<&str, String> {
@@ -3782,6 +4555,92 @@ impl BackendAgentReadonlyCypherRuntime for BoundedReadonlyCypherRuntime<'_> {
         })
     }
 
+    fn run_project_readonly_cypher(
+        &mut self,
+        query: &str,
+        why: Option<&str>,
+        resource_filter: &[String],
+    ) -> Result<BackendAgentReadonlyCypherResult, String> {
+        let query_index = self.queries_executed + 1;
+        if let Err(error) = enforce_agent_runtime_budget(
+            self.queries_executed,
+            self.state.agent_runtime.max_queries_per_turn,
+        ) {
+            append_agent_query_log_entry(
+                self.state.agent_runtime.query_logger.as_ref(),
+                AgentQueryLogEntry::failure(
+                    self.state.agent_runtime.backend.label(),
+                    self.resource,
+                    self.schema_id,
+                    self.question,
+                    why,
+                    query,
+                    query_index,
+                    None,
+                    &error,
+                ),
+            );
+            return Err(error);
+        }
+        let query = validate_backend_agent_readonly_cypher(query)?;
+        let result = execute_agent_project_readonly_cypher(
+            self.resource,
+            &query,
+            resource_filter,
+            &self.state.project_registry,
+            &self.state.ifc_artifacts_root,
+            self.state.agent_runtime.max_rows_per_query,
+            |target, query| {
+                let (model, _) = cached_ifc_model(self.state, &target.model_slug)?;
+                model.execute_cypher_rows(query).map_err(|error| {
+                    format!(
+                        "agent project cypher execution failed for `{}`: {error}",
+                        target.model_slug
+                    )
+                })
+            },
+        );
+
+        match result {
+            Ok(result) => {
+                self.queries_executed = self.queries_executed.saturating_add(1);
+                append_agent_query_log_entry(
+                    self.state.agent_runtime.query_logger.as_ref(),
+                    AgentQueryLogEntry::success(
+                        self.state.agent_runtime.backend.label(),
+                        self.resource,
+                        self.schema_id,
+                        self.question,
+                        why,
+                        &query,
+                        query_index,
+                        result.rows.len(),
+                        result.db_node_ids.len(),
+                        result.semantic_element_ids.len(),
+                    ),
+                );
+                Ok(result)
+            }
+            Err(error) => {
+                append_agent_query_log_entry(
+                    self.state.agent_runtime.query_logger.as_ref(),
+                    AgentQueryLogEntry::failure(
+                        self.state.agent_runtime.backend.label(),
+                        self.resource,
+                        self.schema_id,
+                        self.question,
+                        why,
+                        &query,
+                        query_index,
+                        None,
+                        &error,
+                    ),
+                );
+                Err(error)
+            }
+        }
+    }
+
     fn get_schema_context(&mut self) -> Result<BackendAgentSchemaContext, String> {
         enforce_agent_runtime_budget(
             self.queries_executed,
@@ -4056,6 +4915,96 @@ impl BackendAgentReadonlyCypherRuntime for UncachedReadonlyCypherRuntime<'_> {
         })
     }
 
+    fn run_project_readonly_cypher(
+        &mut self,
+        query: &str,
+        why: Option<&str>,
+        resource_filter: &[String],
+    ) -> Result<BackendAgentReadonlyCypherResult, String> {
+        let query_index = self.queries_executed + 1;
+        if let Err(error) = enforce_agent_runtime_budget(
+            self.queries_executed,
+            self.state.agent_runtime.max_queries_per_turn,
+        ) {
+            append_agent_query_log_entry(
+                self.state.agent_runtime.query_logger.as_ref(),
+                AgentQueryLogEntry::failure(
+                    self.state.agent_runtime.backend.label(),
+                    self.resource,
+                    self.schema_id,
+                    self.question,
+                    why,
+                    query,
+                    query_index,
+                    None,
+                    &error,
+                ),
+            );
+            return Err(error);
+        }
+        let query = validate_backend_agent_readonly_cypher(query)?;
+        let result = execute_agent_project_readonly_cypher(
+            self.resource,
+            &query,
+            resource_filter,
+            &self.state.project_registry,
+            &self.state.ifc_artifacts_root,
+            self.state.agent_runtime.max_rows_per_query,
+            |target, query| {
+                let layout =
+                    IfcArtifactLayout::new(&self.state.ifc_artifacts_root, &target.model_slug);
+                let model = VelrIfcModel::open(layout).map_err(|error| {
+                    format!("failed to open IFC model `{}`: {error}", target.model_slug)
+                })?;
+                model.execute_cypher_rows(query).map_err(|error| {
+                    format!(
+                        "agent project cypher execution failed for `{}`: {error}",
+                        target.model_slug
+                    )
+                })
+            },
+        );
+
+        match result {
+            Ok(result) => {
+                self.queries_executed = self.queries_executed.saturating_add(1);
+                append_agent_query_log_entry(
+                    self.state.agent_runtime.query_logger.as_ref(),
+                    AgentQueryLogEntry::success(
+                        self.state.agent_runtime.backend.label(),
+                        self.resource,
+                        self.schema_id,
+                        self.question,
+                        why,
+                        &query,
+                        query_index,
+                        result.rows.len(),
+                        result.db_node_ids.len(),
+                        result.semantic_element_ids.len(),
+                    ),
+                );
+                Ok(result)
+            }
+            Err(error) => {
+                append_agent_query_log_entry(
+                    self.state.agent_runtime.query_logger.as_ref(),
+                    AgentQueryLogEntry::failure(
+                        self.state.agent_runtime.backend.label(),
+                        self.resource,
+                        self.schema_id,
+                        self.question,
+                        why,
+                        &query,
+                        query_index,
+                        None,
+                        &error,
+                    ),
+                );
+                Err(error)
+            }
+        }
+    }
+
     fn get_schema_context(&mut self) -> Result<BackendAgentSchemaContext, String> {
         enforce_agent_runtime_budget(
             self.queries_executed,
@@ -4197,21 +5146,41 @@ fn agent_transcript_event_to_backend(event: AgentTranscriptEvent) -> BackendAgen
 
 fn agent_ui_action_from_backend(action: BackendAgentUiAction) -> AgentUiAction {
     match action {
-        BackendAgentUiAction::GraphSetSeeds { db_node_ids } => {
-            AgentUiAction::GraphSetSeeds { db_node_ids }
-        }
-        BackendAgentUiAction::PropertiesShowNode { db_node_id } => {
-            AgentUiAction::PropertiesShowNode { db_node_id }
-        }
-        BackendAgentUiAction::ElementsHide { semantic_ids } => {
-            AgentUiAction::ElementsHide { semantic_ids }
-        }
-        BackendAgentUiAction::ElementsShow { semantic_ids } => {
-            AgentUiAction::ElementsShow { semantic_ids }
-        }
-        BackendAgentUiAction::ElementsSelect { semantic_ids } => {
-            AgentUiAction::ElementsSelect { semantic_ids }
-        }
+        BackendAgentUiAction::GraphSetSeeds {
+            db_node_ids,
+            resource,
+        } => AgentUiAction::GraphSetSeeds {
+            db_node_ids,
+            resource,
+        },
+        BackendAgentUiAction::PropertiesShowNode {
+            db_node_id,
+            resource,
+        } => AgentUiAction::PropertiesShowNode {
+            db_node_id,
+            resource,
+        },
+        BackendAgentUiAction::ElementsHide {
+            semantic_ids,
+            resource,
+        } => AgentUiAction::ElementsHide {
+            semantic_ids,
+            resource,
+        },
+        BackendAgentUiAction::ElementsShow {
+            semantic_ids,
+            resource,
+        } => AgentUiAction::ElementsShow {
+            semantic_ids,
+            resource,
+        },
+        BackendAgentUiAction::ElementsSelect {
+            semantic_ids,
+            resource,
+        } => AgentUiAction::ElementsSelect {
+            semantic_ids,
+            resource,
+        },
         BackendAgentUiAction::ViewerFrameVisible => AgentUiAction::ViewerFrameVisible,
     }
 }
@@ -4392,6 +5361,79 @@ fn execute_agent_readonly_cypher(
     })
 }
 
+fn execute_agent_project_readonly_cypher<F>(
+    resource: &str,
+    query: &str,
+    resource_filter: &[String],
+    registry: &ProjectResourceRegistry,
+    ifc_artifacts_root: &Path,
+    max_rows: usize,
+    mut execute: F,
+) -> Result<BackendAgentReadonlyCypherResult, String>
+where
+    F: FnMut(&CypherResourceTarget, &str) -> Result<CypherQueryResult, String>,
+{
+    let scope =
+        resolve_cypher_resource_scope(registry, resource, resource_filter, ifc_artifacts_root)?;
+    let CypherResourceScope::Project { targets, .. } = scope else {
+        return Err(format!(
+            "project read-only Cypher requires a project resource like `project/infra`; got `{resource}`"
+        ));
+    };
+
+    let mut columns = Vec::<String>::new();
+    let mut rows = Vec::<Vec<String>>::new();
+    let mut errors = Vec::new();
+    for target in &targets {
+        let result = match execute(target, query) {
+            Ok(result) => result,
+            Err(error) => {
+                errors.push(format!("{}: {error}", target.resource));
+                continue;
+            }
+        };
+        if columns.is_empty() {
+            columns.push("source_resource".to_owned());
+            columns.push("source_model_slug".to_owned());
+            columns.extend(result.columns.iter().cloned());
+        } else if columns[2..] != result.columns {
+            errors.push(format!(
+                "{}: cypher returned a different column shape for this resource",
+                target.resource
+            ));
+            continue;
+        }
+        rows.extend(add_cypher_source_provenance(result, target).rows);
+        if rows.len() > max_rows {
+            return Err(format!(
+                "agent project cypher returned {} rows, over the per-query cap of {}; refine the query",
+                rows.len(),
+                max_rows
+            ));
+        }
+    }
+
+    if columns.is_empty() {
+        return Err(format!(
+            "project query failed for every IFC resource{}",
+            if errors.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", errors.join("; "))
+            }
+        ));
+    }
+
+    let db_node_ids = extract_db_node_ids(&columns, &rows);
+    let semantic_element_ids = extract_project_semantic_element_ids(&columns, &rows);
+    Ok(BackendAgentReadonlyCypherResult {
+        columns,
+        rows,
+        db_node_ids,
+        semantic_element_ids,
+    })
+}
+
 fn validate_agent_readonly_cypher(query: &str) -> Result<String, String> {
     let statements = query
         .split(';')
@@ -4454,7 +5496,10 @@ fn validate_agent_action_candidate(
                 return Err("graph.set_seeds does not accept semanticIds".to_owned());
             }
             let db_node_ids = normalize_agent_db_node_ids(candidate.db_node_ids)?;
-            Ok(AgentUiAction::GraphSetSeeds { db_node_ids })
+            Ok(AgentUiAction::GraphSetSeeds {
+                db_node_ids,
+                resource: candidate.resource,
+            })
         }
         "properties.show_node" => {
             if !candidate.semantic_ids.is_empty() {
@@ -4466,6 +5511,7 @@ fn validate_agent_action_candidate(
             }
             Ok(AgentUiAction::PropertiesShowNode {
                 db_node_id: db_node_ids[0],
+                resource: candidate.resource,
             })
         }
         "elements.hide" => {
@@ -4473,21 +5519,30 @@ fn validate_agent_action_candidate(
                 return Err("elements.hide does not accept dbNodeIds".to_owned());
             }
             let semantic_ids = normalize_agent_semantic_ids(candidate.semantic_ids)?;
-            Ok(AgentUiAction::ElementsHide { semantic_ids })
+            Ok(AgentUiAction::ElementsHide {
+                semantic_ids,
+                resource: candidate.resource,
+            })
         }
         "elements.show" => {
             if !candidate.db_node_ids.is_empty() {
                 return Err("elements.show does not accept dbNodeIds".to_owned());
             }
             let semantic_ids = normalize_agent_semantic_ids(candidate.semantic_ids)?;
-            Ok(AgentUiAction::ElementsShow { semantic_ids })
+            Ok(AgentUiAction::ElementsShow {
+                semantic_ids,
+                resource: candidate.resource,
+            })
         }
         "elements.select" => {
             if !candidate.db_node_ids.is_empty() {
                 return Err("elements.select does not accept dbNodeIds".to_owned());
             }
             let semantic_ids = normalize_agent_semantic_ids(candidate.semantic_ids)?;
-            Ok(AgentUiAction::ElementsSelect { semantic_ids })
+            Ok(AgentUiAction::ElementsSelect {
+                semantic_ids,
+                resource: candidate.resource,
+            })
         }
         "viewer.frame_visible" => {
             if !candidate.semantic_ids.is_empty() || !candidate.db_node_ids.is_empty() {
@@ -4500,15 +5555,15 @@ fn validate_agent_action_candidate(
 }
 
 fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction> {
-    let mut merged_graph_seed_ids = Vec::new();
+    let mut merged_graph_seed_groups = Vec::<(Option<String>, Vec<i64>)>::new();
     let mut graph_seed_seen = HashSet::new();
-    let mut merged_hide_ids = Vec::new();
+    let mut merged_hide_groups = Vec::<(Option<String>, Vec<String>)>::new();
     let mut hide_seen = HashSet::new();
-    let mut merged_show_ids = Vec::new();
+    let mut merged_show_groups = Vec::<(Option<String>, Vec<String>)>::new();
     let mut show_seen = HashSet::new();
-    let mut merged_select_ids = Vec::new();
+    let mut merged_select_groups = Vec::<(Option<String>, Vec<String>)>::new();
     let mut select_seen = HashSet::new();
-    let mut latest_properties_node_id = None;
+    let mut latest_properties_node = None::<(i64, Option<String>)>;
     let mut graph_set_seeds_present = false;
     let mut properties_show_present = false;
     let mut elements_hide_present = false;
@@ -4519,55 +5574,86 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
 
     for action in actions {
         match action {
-            AgentUiAction::GraphSetSeeds { db_node_ids } => {
+            AgentUiAction::GraphSetSeeds {
+                db_node_ids,
+                resource,
+            } => {
                 if !graph_set_seeds_present {
                     order.push(0u8);
                     graph_set_seeds_present = true;
                 }
+                let group_index = merged_graph_seed_groups
+                    .iter()
+                    .position(|(existing_resource, _)| existing_resource == &resource)
+                    .unwrap_or_else(|| {
+                        merged_graph_seed_groups.push((resource.clone(), Vec::new()));
+                        merged_graph_seed_groups.len() - 1
+                    });
                 for db_node_id in db_node_ids {
-                    if graph_seed_seen.insert(db_node_id) {
-                        merged_graph_seed_ids.push(db_node_id);
+                    if graph_seed_seen.insert((resource.clone(), db_node_id)) {
+                        merged_graph_seed_groups[group_index].1.push(db_node_id);
                     }
                 }
             }
-            AgentUiAction::PropertiesShowNode { db_node_id } => {
+            AgentUiAction::PropertiesShowNode {
+                db_node_id,
+                resource,
+            } => {
                 if !properties_show_present {
                     order.push(1u8);
                     properties_show_present = true;
                 }
-                latest_properties_node_id = Some(db_node_id);
+                latest_properties_node = Some((db_node_id, resource));
             }
-            AgentUiAction::ElementsHide { semantic_ids } => {
+            AgentUiAction::ElementsHide {
+                semantic_ids,
+                resource,
+            } => {
                 if !elements_hide_present {
                     order.push(2u8);
                     elements_hide_present = true;
                 }
                 for semantic_id in semantic_ids {
-                    if hide_seen.insert(semantic_id.clone()) {
-                        merged_hide_ids.push(semantic_id);
-                    }
+                    push_semantic_action_group(
+                        &mut merged_hide_groups,
+                        &mut hide_seen,
+                        resource.clone(),
+                        semantic_id,
+                    );
                 }
             }
-            AgentUiAction::ElementsShow { semantic_ids } => {
+            AgentUiAction::ElementsShow {
+                semantic_ids,
+                resource,
+            } => {
                 if !elements_show_present {
                     order.push(3u8);
                     elements_show_present = true;
                 }
                 for semantic_id in semantic_ids {
-                    if show_seen.insert(semantic_id.clone()) {
-                        merged_show_ids.push(semantic_id);
-                    }
+                    push_semantic_action_group(
+                        &mut merged_show_groups,
+                        &mut show_seen,
+                        resource.clone(),
+                        semantic_id,
+                    );
                 }
             }
-            AgentUiAction::ElementsSelect { semantic_ids } => {
+            AgentUiAction::ElementsSelect {
+                semantic_ids,
+                resource,
+            } => {
                 if !elements_select_present {
                     order.push(4u8);
                     elements_select_present = true;
                 }
                 for semantic_id in semantic_ids {
-                    if select_seen.insert(semantic_id.clone()) {
-                        merged_select_ids.push(semantic_id);
-                    }
+                    push_semantic_action_group(
+                        &mut merged_select_groups,
+                        &mut select_seen,
+                        resource.clone(),
+                        semantic_id,
+                    );
                 }
             }
             AgentUiAction::ViewerFrameVisible => {
@@ -4582,31 +5668,81 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
     let mut normalized = Vec::new();
     for kind in order {
         match kind {
-            0 if !merged_graph_seed_ids.is_empty() => {
-                normalized.push(AgentUiAction::GraphSetSeeds {
-                    db_node_ids: merged_graph_seed_ids.clone(),
-                })
-            }
-            1 => {
-                if let Some(db_node_id) = latest_properties_node_id {
-                    normalized.push(AgentUiAction::PropertiesShowNode { db_node_id });
+            0 if merged_graph_seed_groups
+                .iter()
+                .any(|(_, ids)| !ids.is_empty()) =>
+            {
+                for (resource, db_node_ids) in &merged_graph_seed_groups {
+                    if !db_node_ids.is_empty() {
+                        normalized.push(AgentUiAction::GraphSetSeeds {
+                            db_node_ids: db_node_ids.clone(),
+                            resource: resource.clone(),
+                        });
+                    }
                 }
             }
-            2 if !merged_hide_ids.is_empty() => normalized.push(AgentUiAction::ElementsHide {
-                semantic_ids: merged_hide_ids.clone(),
-            }),
-            3 if !merged_show_ids.is_empty() => normalized.push(AgentUiAction::ElementsShow {
-                semantic_ids: merged_show_ids.clone(),
-            }),
-            4 if !merged_select_ids.is_empty() => normalized.push(AgentUiAction::ElementsSelect {
-                semantic_ids: merged_select_ids.clone(),
-            }),
+            1 => {
+                if let Some((db_node_id, resource)) = latest_properties_node.clone() {
+                    normalized.push(AgentUiAction::PropertiesShowNode {
+                        db_node_id,
+                        resource,
+                    });
+                }
+            }
+            2 if merged_hide_groups.iter().any(|(_, ids)| !ids.is_empty()) => {
+                for (resource, semantic_ids) in &merged_hide_groups {
+                    if !semantic_ids.is_empty() {
+                        normalized.push(AgentUiAction::ElementsHide {
+                            semantic_ids: semantic_ids.clone(),
+                            resource: resource.clone(),
+                        });
+                    }
+                }
+            }
+            3 if merged_show_groups.iter().any(|(_, ids)| !ids.is_empty()) => {
+                for (resource, semantic_ids) in &merged_show_groups {
+                    if !semantic_ids.is_empty() {
+                        normalized.push(AgentUiAction::ElementsShow {
+                            semantic_ids: semantic_ids.clone(),
+                            resource: resource.clone(),
+                        });
+                    }
+                }
+            }
+            4 if merged_select_groups.iter().any(|(_, ids)| !ids.is_empty()) => {
+                for (resource, semantic_ids) in &merged_select_groups {
+                    if !semantic_ids.is_empty() {
+                        normalized.push(AgentUiAction::ElementsSelect {
+                            semantic_ids: semantic_ids.clone(),
+                            resource: resource.clone(),
+                        });
+                    }
+                }
+            }
             5 => normalized.push(AgentUiAction::ViewerFrameVisible),
             _ => {}
         }
     }
 
     normalized
+}
+
+fn push_semantic_action_group(
+    groups: &mut Vec<(Option<String>, Vec<String>)>,
+    seen: &mut HashSet<(Option<String>, String)>,
+    resource: Option<String>,
+    semantic_id: String,
+) {
+    let group_index = groups
+        .iter()
+        .position(|(existing_resource, _)| existing_resource == &resource)
+        .unwrap_or_else(|| {
+            groups.push((resource.clone(), Vec::new()));
+            groups.len() - 1
+        });
+    if seen.insert((resource, semantic_id.clone())) {
+        groups[group_index].1.push(semantic_id);
+    }
 }
 
 fn normalize_agent_semantic_ids(ids: Vec<String>) -> Result<Vec<String>, String> {
@@ -5021,16 +6157,12 @@ fn parse_graph_edge_query_result(
         required_column_index(&result.columns, &["targetdbnodeid"], "target_db_node_id")?;
     let relationship_type_index =
         required_column_index(&result.columns, &["relationshiptype"], "relationship_type")?;
-    let relation_node_index = find_column_index(
-        &result.columns,
-        &["relationnodedbnodeid", "relationnodeid"],
-    );
+    let relation_node_index =
+        find_column_index(&result.columns, &["relationnodedbnodeid", "relationnodeid"]);
     let source_role_index = find_column_index(&result.columns, &["sourcerole"]);
-    let source_role_direction_index =
-        find_column_index(&result.columns, &["sourceroledirection"]);
+    let source_role_direction_index = find_column_index(&result.columns, &["sourceroledirection"]);
     let target_role_index = find_column_index(&result.columns, &["targetrole"]);
-    let target_role_direction_index =
-        find_column_index(&result.columns, &["targetroledirection"]);
+    let target_role_direction_index = find_column_index(&result.columns, &["targetroledirection"]);
 
     let mut edges = Vec::with_capacity(result.rows.len());
     for row in &result.rows {
@@ -5044,10 +6176,12 @@ fn parse_graph_edge_query_result(
             .to_owned(),
             relation_node_db_node_id: relation_node_index
                 .and_then(|index| parse_optional_i64_cell(row.get(index))),
-            source_role: source_role_index.and_then(|index| parse_optional_string_cell(row.get(index))),
+            source_role: source_role_index
+                .and_then(|index| parse_optional_string_cell(row.get(index))),
             source_role_direction: source_role_direction_index
                 .and_then(|index| parse_optional_string_cell(row.get(index))),
-            target_role: target_role_index.and_then(|index| parse_optional_string_cell(row.get(index))),
+            target_role: target_role_index
+                .and_then(|index| parse_optional_string_cell(row.get(index))),
             target_role_direction: target_role_direction_index
                 .and_then(|index| parse_optional_string_cell(row.get(index))),
         });
@@ -5586,6 +6720,53 @@ fn extract_semantic_element_ids(columns: &[String], rows: &[Vec<String>]) -> Vec
     ids
 }
 
+fn extract_project_semantic_element_ids(columns: &[String], rows: &[Vec<String>]) -> Vec<String> {
+    let source_index = find_column_index(columns, &["sourceresource"]);
+    let explicit_index = find_column_index(columns, &["semanticelementid", "elementid"]);
+    let global_id_index = find_column_index(columns, &["globalid"]);
+    let product_id_index = find_column_index(columns, &["productid"]);
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+
+    for row in rows {
+        let Some(source_index) = source_index else {
+            return extract_semantic_element_ids(columns, rows);
+        };
+        let Some(source_resource) = row.get(source_index).map(String::as_str) else {
+            continue;
+        };
+        let source_resource = source_resource.trim();
+        if source_resource.is_empty() {
+            continue;
+        }
+        let candidate = explicit_index
+            .and_then(|index| row.get(index))
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .or_else(|| {
+                global_id_index
+                    .and_then(|index| row.get(index))
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+            })
+            .or_else(|| {
+                product_id_index
+                    .and_then(|index| row.get(index))
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+            });
+
+        if let Some(id) = candidate {
+            let scoped_id = format!("{source_resource}::{}", id.trim());
+            if seen.insert(scoped_id.clone()) {
+                ids.push(scoped_id);
+            }
+        }
+    }
+
+    ids
+}
+
 fn extract_db_node_ids(columns: &[String], rows: &[Vec<String>]) -> Vec<i64> {
     let node_id_index = find_column_index(columns, &["dbnodeid", "nodeid"]);
     let mut ids = Vec::new();
@@ -5716,17 +6897,23 @@ mod tests {
     use super::{
         AgentActionCandidate, AgentBackendErrorCategory, AgentReadonlyCypherResult, AgentSession,
         AgentSessionApiRequest, AgentTranscriptEvent, AgentTranscriptEventKind,
-        AgentTurnApiRequest, AgentUiAction, GraphSubgraphMode, ServerState,
-        agent_capabilities_response, agent_model_provider, agent_turn_selection_summary,
-        candidate_ports, content_type_for_path, create_agent_session_api, dedup_sorted_ids,
-        default_level_for_model, discovered_levels_by_model, execute_agent_turn_api,
-        extract_db_node_ids, extract_semantic_element_ids, format_user_facing_agent_error,
-        geometry_definition_batch_api_response, geometry_instance_batch_api_response,
-        graph_edge_id, graph_mode_keeps_node, opencode_model_discovery_providers,
-        recent_agent_session_history, request_path_only, resolve_agent_backend_for_turn,
+        AgentTurnApiRequest, AgentUiAction, CypherResourceScope, CypherResourceTarget,
+        GraphSubgraphMode, PROJECT_BUILDING_MEMBERS, PROJECT_GEOMETRY_LOCAL_ID_MASK,
+        PROJECT_INFRA_MEMBERS, ProjectResourceConfigFile, ProjectResourceRegistry, ServerState,
+        add_cypher_source_provenance, agent_capabilities_response, agent_model_provider,
+        agent_turn_selection_summary, available_server_resources, candidate_ports,
+        content_type_for_path, create_agent_session_api, dedup_sorted_ids, default_level_for_model,
+        discovered_levels_by_model, execute_agent_turn_api, extract_db_node_ids,
+        extract_project_semantic_element_ids, extract_semantic_element_ids,
+        format_user_facing_agent_error, geometry_definition_batch_api_response,
+        geometry_instance_batch_api_response, graph_edge_id, graph_mode_keeps_node,
+        load_project_resource_registry, opencode_model_discovery_providers,
+        pack_project_geometry_id, project_resource_spec, recent_agent_session_history,
+        request_path_only, resolve_agent_backend_for_turn, resolve_cypher_resource_scope,
         run_stub_agent_turn, sanitize_request_path, skipped_geometry_batch_ids,
-        summarize_agent_turn_response_transcript, validate_agent_action_candidates,
-        validate_agent_readonly_cypher, validate_geometry_batch_id_count, validate_graph_limit,
+        source_scope_prepared_package, summarize_agent_turn_response_transcript,
+        validate_agent_action_candidates, validate_agent_readonly_cypher,
+        validate_geometry_batch_id_count, validate_graph_limit, validate_project_member_resource,
     };
     use std::{
         collections::{BTreeMap, HashMap},
@@ -5744,9 +6931,11 @@ mod tests {
     };
     use cc_w_types::{
         Bounds3, ExternalId, GeometryDefinitionBatch, GeometryDefinitionId, GeometryInstanceBatch,
-        GeometryInstanceCatalogEntry, GeometryInstanceId, PreparedGeometryDefinition, PreparedMesh,
+        GeometryInstanceCatalogEntry, GeometryInstanceId, PreparedGeometryDefinition,
+        PreparedGeometryElement, PreparedGeometryInstance, PreparedGeometryPackage, PreparedMesh,
         SemanticElementId,
     };
+    use cc_w_velr::CypherQueryResult;
 
     fn test_server_state() -> ServerState {
         let nonce = SystemTime::now()
@@ -5771,6 +6960,7 @@ mod tests {
         ServerState {
             root: PathBuf::from("."),
             ifc_artifacts_root: ifc_artifacts_root.clone(),
+            project_registry: Arc::new(ProjectResourceRegistry::default()),
             ifc_model_cache: Mutex::new(HashMap::new()),
             agent_sessions: Arc::new(Mutex::new(AgentSessionStore::default())),
             agent_turns: Arc::new(Mutex::new(crate::AgentTurnStore::default())),
@@ -5800,6 +6990,30 @@ mod tests {
         }
     }
 
+    fn test_artifacts_root(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("ccw-{name}-{}-{nonce}", std::process::id()))
+    }
+
+    fn default_project_registry() -> ProjectResourceRegistry {
+        ProjectResourceRegistry::default()
+    }
+
+    fn create_test_ifc_artifact(root: &Path, slug: &str) {
+        let model_root = root.join(slug);
+        let import_dir = model_root.join("import");
+        fs::create_dir_all(&import_dir).expect("test import dir should be created");
+        fs::write(model_root.join("model.velr.db"), b"").expect("test db marker should be written");
+        fs::write(
+            import_dir.join("import-log.txt"),
+            "# stdout\nschema: IFC4X3_ADD2\n\n# stderr\n",
+        )
+        .expect("test import log should be written");
+    }
+
     fn test_geometry_instance(id: u64) -> GeometryInstanceCatalogEntry {
         GeometryInstanceCatalogEntry {
             id: GeometryInstanceId(id),
@@ -5822,6 +7036,29 @@ mod tests {
                 vertices: Vec::new(),
                 indices: Vec::new(),
             },
+        }
+    }
+
+    fn test_prepared_package_with_colliding_ids(label: &str) -> PreparedGeometryPackage {
+        PreparedGeometryPackage {
+            definitions: vec![test_geometry_definition(1)],
+            elements: vec![PreparedGeometryElement {
+                id: SemanticElementId::new("same-element"),
+                label: label.to_owned(),
+                declared_entity: "IfcWall".to_owned(),
+                default_render_class: cc_w_types::DefaultRenderClass::Physical,
+                bounds: Bounds3::zero(),
+            }],
+            instances: vec![PreparedGeometryInstance {
+                id: GeometryInstanceId(1),
+                element_id: SemanticElementId::new("same-element"),
+                definition_id: GeometryDefinitionId(1),
+                transform: glam::DMat4::IDENTITY,
+                bounds: Bounds3::zero(),
+                external_id: ExternalId::new("same-external"),
+                label: label.to_owned(),
+                display_color: None,
+            }],
         }
     }
 
@@ -6074,6 +7311,290 @@ mod tests {
     }
 
     #[test]
+    fn project_registry_contains_expected_building_and_infra_members() {
+        let registry = default_project_registry();
+        assert_eq!(
+            project_resource_spec(&registry, "project/building")
+                .expect("building project should exist")
+                .members,
+            PROJECT_BUILDING_MEMBERS
+                .iter()
+                .map(|member| (*member).to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            project_resource_spec(&registry, "project/infra")
+                .expect("infra project should exist")
+                .members,
+            PROJECT_INFRA_MEMBERS
+                .iter()
+                .map(|member| (*member).to_owned())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn project_member_validation_rejects_cross_project_member() {
+        let registry = default_project_registry();
+        let error =
+            validate_project_member_resource(&registry, "project/building", "ifc/infra-bridge")
+                .unwrap_err();
+
+        assert!(error.contains("is not a member of `project/building`"));
+    }
+
+    #[test]
+    fn project_registry_loads_default_fallback_when_no_config_exists() {
+        let root = test_artifacts_root("project-config-missing");
+        fs::create_dir_all(&root).expect("test root should be created");
+
+        let registry = load_project_resource_registry(&root).unwrap();
+
+        assert_eq!(registry, ProjectResourceRegistry::default());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_registry_loads_json_config() {
+        let config = serde_json::from_str::<ProjectResourceConfigFile>(
+            r#"{
+                "projects": [
+                    {
+                        "resource": "project/custom",
+                        "label": "Custom",
+                        "members": ["ifc/custom-a", "ifc/custom-b"]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let registry = ProjectResourceRegistry::from_config(config).unwrap();
+
+        assert_eq!(
+            project_resource_spec(&registry, "project/custom")
+                .expect("custom project should exist")
+                .members,
+            vec!["ifc/custom-a".to_owned(), "ifc/custom-b".to_owned()]
+        );
+        assert!(project_resource_spec(&registry, "project/infra").is_none());
+    }
+
+    #[test]
+    fn project_registry_rejects_duplicate_project_ids() {
+        let config = serde_json::from_str::<ProjectResourceConfigFile>(
+            r#"{
+                "projects": [
+                    {"resource": "project/custom", "label": "Custom A", "members": ["ifc/a"]},
+                    {"resource": "project/custom", "label": "Custom B", "members": ["ifc/b"]}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let error = ProjectResourceRegistry::from_config(config).unwrap_err();
+
+        assert!(error.contains("duplicate project resource `project/custom`"));
+    }
+
+    #[test]
+    fn project_registry_rejects_invalid_resource_shapes() {
+        let bad_project = serde_json::from_str::<ProjectResourceConfigFile>(
+            r#"{
+                "projects": [
+                    {"resource": "ifc/not-project", "label": "Bad", "members": ["ifc/a"]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let bad_member = serde_json::from_str::<ProjectResourceConfigFile>(
+            r#"{
+                "projects": [
+                    {"resource": "project/custom", "label": "Bad", "members": ["demo/a"]}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(
+            ProjectResourceRegistry::from_config(bad_project)
+                .unwrap_err()
+                .contains("must have shape `project/<id>`")
+        );
+        assert!(
+            ProjectResourceRegistry::from_config(bad_member)
+                .unwrap_err()
+                .contains("must have shape `ifc/<model>`")
+        );
+    }
+
+    #[test]
+    fn available_resources_include_project_when_member_database_exists() {
+        let root = test_artifacts_root("project-resources");
+        create_test_ifc_artifact(&root, "infra-bridge");
+        let registry = default_project_registry();
+
+        let resources = available_server_resources(&registry, &root);
+
+        assert!(resources.contains(&"ifc/infra-bridge".to_owned()));
+        assert!(resources.contains(&"project/infra".to_owned()));
+        assert!(!resources.contains(&"project/building".to_owned()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cypher_resource_scope_resolves_single_ifc_resource() {
+        let root = test_artifacts_root("single-scope");
+        let registry = default_project_registry();
+        let scope =
+            resolve_cypher_resource_scope(&registry, "ifc/building-architecture", &[], &root)
+                .unwrap();
+
+        assert_eq!(
+            scope,
+            CypherResourceScope::Single(CypherResourceTarget {
+                resource: "ifc/building-architecture".to_owned(),
+                model_slug: "building-architecture".to_owned(),
+            })
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cypher_resource_scope_resolves_project_to_available_registered_members() {
+        let root = test_artifacts_root("project-scope");
+        create_test_ifc_artifact(&root, "infra-bridge");
+        create_test_ifc_artifact(&root, "infra-road");
+        let registry = default_project_registry();
+
+        let scope = resolve_cypher_resource_scope(&registry, "project/infra", &[], &root).unwrap();
+
+        assert_eq!(
+            scope,
+            CypherResourceScope::Project {
+                resource: "project/infra".to_owned(),
+                label: "Infrastructure".to_owned(),
+                targets: vec![
+                    CypherResourceTarget {
+                        resource: "ifc/infra-bridge".to_owned(),
+                        model_slug: "infra-bridge".to_owned(),
+                    },
+                    CypherResourceTarget {
+                        resource: "ifc/infra-road".to_owned(),
+                        model_slug: "infra-road".to_owned(),
+                    },
+                ],
+            }
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cypher_resource_scope_rejects_unknown_or_empty_project_resource() {
+        let root = test_artifacts_root("bad-project-scope");
+        let registry = default_project_registry();
+
+        assert!(resolve_cypher_resource_scope(&registry, "project/missing", &[], &root).is_err());
+        let error =
+            resolve_cypher_resource_scope(&registry, "project/infra", &[], &root).unwrap_err();
+        assert!(error.contains("has no available IFC database artifacts"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cypher_resource_scope_applies_project_resource_filter() {
+        let root = test_artifacts_root("filtered-project-scope");
+        create_test_ifc_artifact(&root, "infra-bridge");
+        create_test_ifc_artifact(&root, "infra-road");
+        let registry = default_project_registry();
+
+        let scope = resolve_cypher_resource_scope(
+            &registry,
+            "project/infra",
+            &["ifc/infra-road".to_owned()],
+            &root,
+        )
+        .unwrap();
+
+        assert_eq!(
+            scope,
+            CypherResourceScope::Project {
+                resource: "project/infra".to_owned(),
+                label: "Infrastructure".to_owned(),
+                targets: vec![CypherResourceTarget {
+                    resource: "ifc/infra-road".to_owned(),
+                    model_slug: "infra-road".to_owned(),
+                }],
+            }
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cross_ifc_provenance_prepends_source_columns_to_rows() {
+        let result = add_cypher_source_provenance(
+            CypherQueryResult {
+                columns: vec!["GlobalId".to_owned(), "Name".to_owned()],
+                rows: vec![vec!["gid-a".to_owned(), "Wall A".to_owned()]],
+            },
+            &CypherResourceTarget {
+                resource: "ifc/building-architecture".to_owned(),
+                model_slug: "building-architecture".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            result.columns,
+            vec![
+                "source_resource".to_owned(),
+                "source_model_slug".to_owned(),
+                "GlobalId".to_owned(),
+                "Name".to_owned(),
+            ]
+        );
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                "ifc/building-architecture".to_owned(),
+                "building-architecture".to_owned(),
+                "gid-a".to_owned(),
+                "Wall A".to_owned(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn project_semantic_id_extraction_scopes_global_ids_by_source_resource() {
+        let ids = extract_project_semantic_element_ids(
+            &[
+                "source_resource".to_owned(),
+                "source_model_slug".to_owned(),
+                "GlobalId".to_owned(),
+            ],
+            &[
+                vec![
+                    "ifc/infra-bridge".to_owned(),
+                    "infra-bridge".to_owned(),
+                    "same-global-id".to_owned(),
+                ],
+                vec![
+                    "ifc/infra-road".to_owned(),
+                    "infra-road".to_owned(),
+                    "same-global-id".to_owned(),
+                ],
+            ],
+        );
+
+        assert_eq!(
+            ids,
+            vec![
+                "ifc/infra-bridge::same-global-id".to_owned(),
+                "ifc/infra-road::same-global-id".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
     fn semantic_id_extraction_prefers_explicit_column() {
         let ids = extract_semantic_element_ids(
             &[String::from("semantic_element_id"), String::from("label")],
@@ -6215,6 +7736,48 @@ mod tests {
             value["batch"]["definitions"][0]["id"],
             serde_json::json!(20)
         );
+    }
+
+    #[test]
+    fn project_geometry_scopes_colliding_member_ids() {
+        let left = source_scope_prepared_package(
+            "ifc/left",
+            0,
+            test_prepared_package_with_colliding_ids("left"),
+        )
+        .unwrap();
+        let right = source_scope_prepared_package(
+            "ifc/right",
+            1,
+            test_prepared_package_with_colliding_ids("right"),
+        )
+        .unwrap();
+
+        assert_eq!(left.definitions[0].id, GeometryDefinitionId(1u64 << 48 | 1));
+        assert_eq!(
+            right.definitions[0].id,
+            GeometryDefinitionId(2u64 << 48 | 1)
+        );
+        assert_eq!(left.instances[0].id, GeometryInstanceId(1u64 << 48 | 1));
+        assert_eq!(right.instances[0].id, GeometryInstanceId(2u64 << 48 | 1));
+        assert_eq!(left.elements[0].id.as_str(), "ifc/left::same-element");
+        assert_eq!(right.elements[0].id.as_str(), "ifc/right::same-element");
+        assert_eq!(
+            left.instances[0].element_id.as_str(),
+            "ifc/left::same-element"
+        );
+        assert_eq!(
+            right.instances[0].external_id.as_str(),
+            "ifc/right::same-external"
+        );
+    }
+
+    #[test]
+    fn project_geometry_rejects_unencodable_local_ids() {
+        let error = pack_project_geometry_id("ifc/large", 0, PROJECT_GEOMETRY_LOCAL_ID_MASK + 1)
+            .unwrap_err();
+
+        assert!(error.contains("too large for project-scoped rendering"));
     }
 
     #[test]
@@ -6370,6 +7933,7 @@ mod tests {
             kind: "viewer.run_js".to_owned(),
             semantic_ids: Vec::new(),
             db_node_ids: Vec::new(),
+            resource: None,
         }])
         .unwrap_err();
 
@@ -6384,6 +7948,7 @@ mod tests {
                 kind: "properties.show_node".to_owned(),
                 semantic_ids: Vec::new(),
                 db_node_ids: vec![215],
+                resource: None,
             },
             AgentActionCandidate::elements_hide(vec![
                 "A".to_owned(),
@@ -6399,11 +7964,16 @@ mod tests {
             actions,
             vec![
                 AgentUiAction::GraphSetSeeds {
-                    db_node_ids: vec![395, 396]
+                    db_node_ids: vec![395, 396],
+                    resource: None,
                 },
-                AgentUiAction::PropertiesShowNode { db_node_id: 215 },
+                AgentUiAction::PropertiesShowNode {
+                    db_node_id: 215,
+                    resource: None,
+                },
                 AgentUiAction::ElementsHide {
-                    semantic_ids: vec!["A".to_owned(), "B".to_owned()]
+                    semantic_ids: vec!["A".to_owned(), "B".to_owned()],
+                    resource: None,
                 },
                 AgentUiAction::ViewerFrameVisible,
             ]
@@ -6426,16 +7996,20 @@ mod tests {
             actions,
             vec![
                 AgentUiAction::ElementsSelect {
-                    semantic_ids: vec!["wall-a".to_owned(), "wall-b".to_owned()]
+                    semantic_ids: vec!["wall-a".to_owned(), "wall-b".to_owned()],
+                    resource: None,
                 },
                 AgentUiAction::ViewerFrameVisible,
-                AgentUiAction::PropertiesShowNode { db_node_id: 215 },
+                AgentUiAction::PropertiesShowNode {
+                    db_node_id: 215,
+                    resource: None,
+                },
             ]
         );
     }
 
     #[test]
-    fn agent_session_creation_requires_ifc_resource() {
+    fn agent_session_creation_requires_ifc_or_project_resource() {
         let state = test_server_state();
         let error = create_agent_session_api(
             &AgentSessionApiRequest {
@@ -6445,7 +8019,8 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.contains("agent sessions require an IFC resource"));
+        assert!(error.contains("require an IFC resource"));
+        assert!(error.contains("or a project resource"));
     }
 
     #[test]
@@ -6481,7 +8056,8 @@ mod tests {
         assert_eq!(
             response.actions,
             vec![AgentUiAction::ElementsHide {
-                semantic_ids: vec!["wall-a".to_owned(), "wall-b".to_owned()]
+                semantic_ids: vec!["wall-a".to_owned(), "wall-b".to_owned()],
+                resource: None,
             }]
         );
     }
@@ -6529,10 +8105,12 @@ mod tests {
             actions,
             vec![
                 AgentUiAction::GraphSetSeeds {
-                    db_node_ids: vec![395, 396]
+                    db_node_ids: vec![395, 396],
+                    resource: None,
                 },
                 AgentUiAction::ElementsSelect {
-                    semantic_ids: vec!["wall-a".to_owned(), "wall-b".to_owned()]
+                    semantic_ids: vec!["wall-a".to_owned(), "wall-b".to_owned()],
+                    resource: None,
                 },
             ]
         );
