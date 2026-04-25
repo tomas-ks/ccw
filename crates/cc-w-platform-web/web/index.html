@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="light">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -9,6 +9,12 @@
         const stored = window.localStorage?.getItem("w-viewer-theme");
         if (stored === "light" || stored === "dark") {
           document.documentElement.dataset.theme = stored;
+        }
+        const electronShell = window.ccwElectron;
+        if (electronShell?.isElectron) {
+          document.documentElement.classList.add("electron-shell");
+          document.documentElement.dataset.electronPlatform =
+            electronShell.platform || "unknown";
         }
       })();
     </script>
@@ -171,11 +177,18 @@
         min-height: 34px;
         display: flex;
         align-items: center;
-        justify-content: space-between;
+        justify-content: flex-start;
         gap: 12px;
         padding: 5px 12px;
         background: var(--surface-header);
         border-bottom: 1px solid var(--border-subtle);
+      }
+
+      .header-left {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-width: 0;
       }
 
       .header-tools,
@@ -183,6 +196,72 @@
         display: flex;
         align-items: center;
         gap: 8px;
+      }
+
+      .header-actions {
+        margin-left: auto;
+      }
+
+      :root.electron-shell .viewer-header {
+        min-height: 42px;
+        padding-top: 8px;
+        padding-bottom: 8px;
+        -webkit-app-region: drag;
+      }
+
+      :root.electron-shell[data-electron-platform="darwin"] .viewer-header {
+        padding-left: 116px;
+      }
+
+      :root.electron-shell button,
+      :root.electron-shell select,
+      :root.electron-shell .settings-menu {
+        -webkit-app-region: no-drag;
+      }
+
+      .electron-window-controls {
+        display: none;
+        align-items: center;
+        gap: 2px;
+        margin-left: 4px;
+        padding-left: 8px;
+        border-left: 1px solid var(--border-subtle);
+      }
+
+      :root.electron-shell:not([data-electron-platform="darwin"]) .electron-window-controls {
+        display: flex;
+      }
+
+      .electron-window-button {
+        width: 34px;
+        height: 24px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        border: 0;
+        border-radius: var(--radius-control);
+        background: transparent;
+        color: var(--text-secondary);
+        cursor: pointer;
+      }
+
+      .electron-window-button:hover {
+        background: var(--surface-control-hover);
+        color: var(--text-primary);
+      }
+
+      .electron-window-button.close:hover {
+        background: #d94841;
+        color: #fff;
+      }
+
+      .electron-window-button svg {
+        width: 13px;
+        height: 13px;
+        stroke: currentColor;
+        stroke-width: 1.8;
+        fill: none;
       }
 
       .icon-button {
@@ -1144,59 +1223,61 @@
   </head>
   <body class="graph-hidden terminal-hidden">
     <header class="viewer-header" aria-label="Viewer tools">
-      <div class="header-tools" role="toolbar" aria-label="3D tools">
-        <select id="tool-picker" class="visually-hidden" aria-label="Active 3D tools">
-          <option value="none">No tools</option>
-          <option value="orbit">Rotate</option>
-          <option value="pick">Pick</option>
-          <option value="orbit-pick" selected>Rotate and pick</option>
-        </select>
-        <button
-          class="icon-button tool-button active"
-          data-tool-button="orbit"
-          type="button"
-          aria-label="Rotate model"
-          aria-pressed="true"
-          title="Rotate"
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M20 11a8 8 0 1 0-2.3 5.7" />
-            <path d="M20 5v6h-6" />
-          </svg>
-        </button>
-        <button
-          class="icon-button tool-button active"
-          data-tool-button="pick"
-          type="button"
-          aria-label="Pick model elements"
-          aria-pressed="true"
-          title="Pick"
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M12 4v5" />
-            <path d="M12 15v5" />
-            <path d="M4 12h5" />
-            <path d="M15 12h5" />
-            <circle cx="12" cy="12" r="2.8" />
-          </svg>
-        </button>
-        <button
-          class="icon-button reference-grid-toggle-button"
-          id="reference-grid-toggle-button"
-          type="button"
-          aria-label="Toggle reference grid"
-          aria-pressed="false"
-          title="Reference grid"
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M4 7h16" />
-            <path d="M4 12h16" />
-            <path d="M4 17h16" />
-            <path d="M7 4v16" />
-            <path d="M12 4v16" />
-            <path d="M17 4v16" />
-          </svg>
-        </button>
+      <div class="header-left">
+        <div class="header-tools" role="toolbar" aria-label="3D tools">
+          <select id="tool-picker" class="visually-hidden" aria-label="Active 3D tools">
+            <option value="none">No tools</option>
+            <option value="orbit">Rotate</option>
+            <option value="pick">Pick</option>
+            <option value="orbit-pick" selected>Rotate and pick</option>
+          </select>
+          <button
+            class="icon-button tool-button active"
+            data-tool-button="orbit"
+            type="button"
+            aria-label="Rotate model"
+            aria-pressed="true"
+            title="Rotate"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M20 11a8 8 0 1 0-2.3 5.7" />
+              <path d="M20 5v6h-6" />
+            </svg>
+          </button>
+          <button
+            class="icon-button tool-button active"
+            data-tool-button="pick"
+            type="button"
+            aria-label="Pick model elements"
+            aria-pressed="true"
+            title="Pick"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 4v5" />
+              <path d="M12 15v5" />
+              <path d="M4 12h5" />
+              <path d="M15 12h5" />
+              <circle cx="12" cy="12" r="2.8" />
+            </svg>
+          </button>
+          <button
+            class="icon-button reference-grid-toggle-button"
+            id="reference-grid-toggle-button"
+            type="button"
+            aria-label="Toggle reference grid"
+            aria-pressed="false"
+            title="Reference grid"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 7h16" />
+              <path d="M4 12h16" />
+              <path d="M4 17h16" />
+              <path d="M7 4v16" />
+              <path d="M12 4v16" />
+              <path d="M17 4v16" />
+            </svg>
+          </button>
+        </div>
       </div>
       <div class="header-actions" aria-label="Viewer panels">
         <button
@@ -1278,6 +1359,42 @@
               <option value="light">Light</option>
             </select>
           </div>
+        </div>
+        <div class="electron-window-controls" aria-label="Window controls">
+          <button
+            class="electron-window-button"
+            id="electron-minimize-button"
+            type="button"
+            aria-label="Minimize window"
+            title="Minimize"
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M3 8h10" />
+            </svg>
+          </button>
+          <button
+            class="electron-window-button"
+            id="electron-maximize-button"
+            type="button"
+            aria-label="Maximize window"
+            title="Maximize"
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <rect x="4" y="4" width="8" height="8" rx="1" />
+            </svg>
+          </button>
+          <button
+            class="electron-window-button close"
+            id="electron-close-button"
+            type="button"
+            aria-label="Close window"
+            title="Close"
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M4 4l8 8" />
+              <path d="M12 4l-8 8" />
+            </svg>
+          </button>
         </div>
       </div>
     </header>
@@ -1614,19 +1731,19 @@
 
       function normalizeViewerTheme(theme) {
         const normalized = String(theme || "").trim().toLowerCase();
-        return VIEWER_THEMES.has(normalized) ? normalized : "dark";
+        return VIEWER_THEMES.has(normalized) ? normalized : "light";
       }
 
       function readStoredViewerTheme() {
         return normalizeViewerTheme(
           window.localStorage?.getItem(VIEWER_THEME_STORAGE_KEY) ||
             document.documentElement.dataset.theme ||
-            "dark"
+            "light"
         );
       }
 
       function currentViewerTheme() {
-        return normalizeViewerTheme(document.documentElement.dataset.theme || "dark");
+        return normalizeViewerTheme(document.documentElement.dataset.theme || "light");
       }
 
       function cssVariable(name) {
@@ -2633,6 +2750,37 @@
         applyTerminalHeight(constrainTerminalHeight(terminal.getBoundingClientRect().height));
         syncResizerAria();
         schedulePaneRefresh({ immediate: true });
+      }
+
+      function installElectronShellControls() {
+        const shell = window.ccwElectron;
+        if (!shell?.isElectron) {
+          return null;
+        }
+
+        const maximizeButton = document.getElementById("electron-maximize-button");
+        document
+          .getElementById("electron-minimize-button")
+          ?.addEventListener("click", () => shell.minimize?.());
+        maximizeButton?.addEventListener("click", () => shell.toggleMaximize?.());
+        document
+          .getElementById("electron-close-button")
+          ?.addEventListener("click", () => shell.close?.());
+
+        shell.onWindowState?.((state) => {
+          const maximized = Boolean(state?.maximized);
+          maximizeButton?.classList.toggle("active", maximized);
+          maximizeButton?.setAttribute(
+            "aria-label",
+            maximized ? "Restore window" : "Maximize window"
+          );
+          maximizeButton?.setAttribute("title", maximized ? "Restore" : "Maximize");
+        });
+        shell.setTheme?.(currentViewerTheme());
+        window.addEventListener("w-theme-change", (event) => {
+          shell.setTheme?.(event.detail?.theme);
+        });
+        return shell;
       }
 
       function installHeaderControls(viewer, graphShell, appStateStore) {
@@ -8246,6 +8394,7 @@
           updateResourceCatalogState(initialViewer.catalog);
           const graphShell = createGraphShell(viewer, appState);
           graphShell.api.installController(createGraphController(viewer));
+          const electronShell = installElectronShellControls();
           const headerControls = installHeaderControls(viewer, graphShell, appState);
           const outliner = installProjectOutliner(viewer, appState);
           const repl = createReplApi(viewer, graphShell.api);
@@ -8253,6 +8402,7 @@
           window.wViewer = viewer;
           window.viewer = viewer;
           window.wHeader = headerControls;
+          window.wElectronShell = electronShell;
           window.wOutliner = outliner;
           window.wGraph = graphShell.api;
           window.graph = graphShell.api;

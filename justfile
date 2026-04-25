@@ -127,6 +127,15 @@ web-viewer:
     just web-viewer-build
     cargo run -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server -- --root crates/cc-w-platform-web/artifacts/viewer --port 8001
 
+web-viewer-electron-build:
+    just web-viewer-build
+    if [[ ! -d crates/cc-w-platform-web/web/node_modules/electron ]]; then npm ci --prefix crates/cc-w-platform-web/web; fi
+    cargo build -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server
+
+web-viewer-electron:
+    just web-viewer-electron-build
+    npm run electron --prefix crates/cc-w-platform-web/web
+
 native-viewer resource="demo/pentagon":
     resource_value="{{resource}}"; \
     resource_value="${resource_value#resource=}"; \
@@ -193,6 +202,35 @@ web-viewer-opencode:
         CC_W_OPENCODE_DISCOVER_MODELS="${CC_W_OPENCODE_DISCOVER_MODELS:-1}" \
         CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-45000}" \
         cargo run -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server -- --root crates/cc-w-platform-web/artifacts/viewer --port 8001
+
+web-viewer-opencode-electron:
+    just web-viewer-electron-build
+    test -x .tools/opencode/bin/opencode
+    mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
+    # Electron shell around the same web viewer and OpenCode-backed server.
+    real_home="$HOME"; \
+    model_default="${CC_W_OPENCODE_MODEL:-openai/gpt-5.4}"; \
+    case "$model_default" in \
+        ollama/gemma4:*) agent_default="${CC_W_OPENCODE_AGENT:-ifc-playbook-cypher-only}" ;; \
+        *) agent_default="${CC_W_OPENCODE_AGENT:-ifc-explorer}" ;; \
+    esac; \
+    env HOME="$PWD/.tools/opencode/home" \
+        CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}" \
+        RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}" \
+        XDG_CACHE_HOME="$PWD/.tools/opencode/cache" \
+        XDG_DATA_HOME="$PWD/.tools/opencode/data" \
+        XDG_CONFIG_HOME="$PWD/.tools/opencode/config" \
+        XDG_STATE_HOME="$PWD/.tools/opencode/state" \
+        OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
+        CC_W_AGENT_BACKEND=opencode \
+        CC_W_OPENCODE_EXECUTABLE="$PWD/.tools/opencode/bin/opencode" \
+        CC_W_OPENCODE_WORKDIR="$PWD" \
+        CC_W_OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
+        CC_W_OPENCODE_AGENT="$agent_default" \
+        CC_W_OPENCODE_MODEL="$model_default" \
+        CC_W_OPENCODE_DISCOVER_MODELS="${CC_W_OPENCODE_DISCOVER_MODELS:-1}" \
+        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-45000}" \
+        npm run electron --prefix crates/cc-w-platform-web/web
 
 web-viewer-opencode-strict:
     just web-viewer-build

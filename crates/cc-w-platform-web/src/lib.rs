@@ -2764,6 +2764,8 @@ impl WebViewerApp {
             camera,
             defaults,
         );
+        renderer.set_profile(RenderProfileId::ArchitecturalV3);
+        renderer.set_reference_grid_visible(true);
         renderer.upload_prepared_scene(&device, &queue, &render_scene);
         populate_render_profile_picker(&profile_picker, renderer.available_profiles());
         profile_picker.set_value(renderer.profile().as_str());
