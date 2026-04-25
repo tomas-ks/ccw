@@ -46,6 +46,14 @@ Responsibilities:
 - render with `wgpu`
 - support interaction, selection, and highlighting against streamed data
 
+The frontend has two state layers that must not be blurred:
+
+- app state: user/product intent owned by the platform shell
+- renderer state: committed scene truth owned by `cc-w-runtime`
+
+The detailed state ownership and event contract is documented in
+[state-management.md](./state-management.md).
+
 Primary crates:
 
 - `cc-w-scene`

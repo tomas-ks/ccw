@@ -333,6 +333,16 @@ fn push_project_definition_request(
 #[serde(rename_all = "camelCase")]
 pub struct WebResourceCatalog {
     pub resources: Vec<String>,
+    #[serde(default)]
+    pub projects: Vec<WebProjectResourceCatalogEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebProjectResourceCatalogEntry {
+    pub resource: String,
+    pub label: String,
+    pub members: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1541,6 +1551,7 @@ struct WebViewerViewState {
     total_elements: usize,
     total_instances: usize,
     total_definitions: usize,
+    default_element_ids: Vec<String>,
     base_visible_element_ids: Vec<String>,
     visible_element_ids: Vec<String>,
     selected_element_ids: Vec<String>,
@@ -1548,6 +1559,7 @@ struct WebViewerViewState {
     picked_instance_ids: Vec<u64>,
     hidden_element_ids: Vec<String>,
     shown_element_ids: Vec<String>,
+    suppressed_element_ids: Vec<String>,
     resident_instances: usize,
     resident_definitions: usize,
     missing_instance_ids: Vec<u64>,
@@ -1611,8 +1623,16 @@ struct WebPickAnchorEvent {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn fallback_web_resources() -> Vec<String> {
+fn local_web_resources() -> Vec<String> {
     vec![DEFAULT_WEB_RESOURCE.to_string()]
+}
+
+#[cfg(target_arch = "wasm32")]
+fn local_web_resource_catalog() -> WebResourceCatalog {
+    WebResourceCatalog {
+        resources: local_web_resources(),
+        projects: Vec::new(),
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1628,23 +1648,42 @@ fn is_file_protocol(window: &Window) -> bool {
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn fetch_available_resources(window: &Window) -> Result<Vec<String>, String> {
+async fn fetch_available_resource_catalog(window: &Window) -> Result<WebResourceCatalog, String> {
     if is_file_protocol(window) {
-        return Ok(fallback_web_resources());
+        return Ok(local_web_resource_catalog());
     }
 
     let text = fetch_server_text(window, "/api/resources", "GET", None).await?;
-    let catalog: WebResourceCatalog = serde_json::from_str(&text)
+    let mut catalog: WebResourceCatalog = serde_json::from_str(&text)
         .map_err(|error| format!("invalid /api/resources JSON: {error}"))?;
-    let resources = catalog
+    catalog.resources = catalog
         .resources
         .into_iter()
-        .filter(|resource| resource.starts_with("ifc/"))
+        .filter(|resource| resource.starts_with("ifc/") || resource.starts_with("project/"))
         .collect::<Vec<_>>();
-    if resources.is_empty() {
+    if catalog.resources.is_empty() {
         return Err("server returned an empty resource catalog".to_string());
     }
-    Ok(resources)
+    Ok(catalog)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn resource_catalog_resources(catalog: &WebResourceCatalog) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut resources = Vec::new();
+    for resource in &catalog.resources {
+        if (resource.starts_with("ifc/") || resource.starts_with("project/"))
+            && seen.insert(resource.clone())
+        {
+            resources.push(resource.clone());
+        }
+    }
+    for project in &catalog.projects {
+        if project.resource.starts_with("project/") && seen.insert(project.resource.clone()) {
+            resources.push(project.resource.clone());
+        }
+    }
+    resources
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1951,8 +1990,11 @@ async fn load_resource_into_state(
             return Err(error);
         }
     };
-    let mut state = state.borrow_mut();
-    state.apply_runtime_scene(resource, runtime_scene);
+    let events = {
+        let mut state = state.borrow_mut();
+        state.apply_runtime_scene(resource, runtime_scene)?
+    };
+    dispatch_web_events(events)?;
     Ok(())
 }
 
@@ -1975,6 +2017,15 @@ pub fn viewer_current_resource() -> Result<String, JsValue> {
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
+pub fn viewer_resource_catalog_json() -> Result<String, JsValue> {
+    with_web_viewer_state(|state| {
+        serde_json::to_string(&state.resource_catalog)
+            .map_err(|error| format!("failed to encode viewer resource catalog JSON: {error}"))
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
 pub fn viewer_view_state_json() -> Result<String, JsValue> {
     with_web_viewer_state(|state| state.view_state_json())
 }
@@ -1983,11 +2034,11 @@ pub fn viewer_view_state_json() -> Result<String, JsValue> {
 #[wasm_bindgen]
 pub async fn viewer_set_view_mode(mode: String) -> Result<String, JsValue> {
     let request = parse_web_view_mode(&mode).map_err(|error| JsValue::from_str(&error))?;
-    with_web_viewer_state_mut(|state| {
+    let events = with_web_viewer_state_mut(|state| {
         state.runtime_scene.apply_start_view(request);
-        state.upload_runtime_scene(false);
-        Ok(())
+        state.commit_runtime_scene_change(false, "viewMode")
     })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
     stream_current_visible_view_to_json().await
 }
 
@@ -2014,6 +2065,17 @@ pub fn viewer_list_element_ids() -> Result<Array, JsValue> {
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
+pub fn viewer_default_element_ids() -> Result<Array, JsValue> {
+    with_web_viewer_state(|state| {
+        let resolved = state
+            .runtime_scene
+            .resolve_start_view(&GeometryStartViewRequest::Default);
+        Ok(semantic_ids_to_array(resolved.visible_element_ids.iter()))
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
 pub fn viewer_visible_element_ids() -> Result<Array, JsValue> {
     with_web_viewer_state(|state| {
         let ids = state.runtime_scene.visible_element_ids();
@@ -2033,40 +2095,55 @@ pub fn viewer_selected_element_ids() -> Result<Array, JsValue> {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn viewer_hide_elements(ids: Array) -> Result<u32, JsValue> {
-    with_web_viewer_state_mut(|state| {
+    let (changed, events) = with_web_viewer_state_mut(|state| {
         let ids = semantic_ids_from_array(&ids)?;
         let changed = state.runtime_scene.hide_elements(ids.iter()) as u32;
-        state.upload_runtime_scene(false);
-        Ok(changed)
-    })
+        let mut events = vec![state.upload_runtime_scene(false)?];
+        if changed > 0 {
+            events.push(state.viewer_state_change_event("visibility")?);
+        }
+        Ok((changed, events))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(changed)
 }
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn viewer_show_elements(ids: Array) -> Result<u32, JsValue> {
-    with_web_viewer_state_mut(|state| {
+    let (changed, events) = with_web_viewer_state_mut(|state| {
         let ids = semantic_ids_from_array(&ids)?;
         let changed = state.runtime_scene.show_elements(ids.iter()) as u32;
-        state.upload_runtime_scene(false);
-        Ok(changed)
-    })
+        let mut events = vec![state.upload_runtime_scene(false)?];
+        if changed > 0 {
+            events.push(state.viewer_state_change_event("visibility")?);
+        }
+        Ok((changed, events))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(changed)
 }
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn viewer_reset_element_visibility(ids: Array) -> Result<u32, JsValue> {
-    with_web_viewer_state_mut(|state| {
+    let (changed, events) = with_web_viewer_state_mut(|state| {
         let ids = semantic_ids_from_array(&ids)?;
         let changed = state.runtime_scene.reset_visibility(ids.iter()) as u32;
-        state.upload_runtime_scene(false);
-        Ok(changed)
-    })
+        let mut events = vec![state.upload_runtime_scene(false)?];
+        if changed > 0 {
+            events.push(state.viewer_state_change_event("visibility")?);
+        }
+        Ok((changed, events))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(changed)
 }
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn viewer_reset_all_visibility() -> Result<u32, JsValue> {
-    with_web_viewer_state_mut(|state| {
+    let (changed, events) = with_web_viewer_state_mut(|state| {
         let ids = state
             .runtime_scene
             .package()
@@ -2075,30 +2152,77 @@ pub fn viewer_reset_all_visibility() -> Result<u32, JsValue> {
             .map(|element| element.id.clone())
             .collect::<Vec<_>>();
         let changed = state.runtime_scene.reset_visibility(ids.iter()) as u32;
-        state.upload_runtime_scene(false);
-        Ok(changed)
-    })
+        let mut events = vec![state.upload_runtime_scene(false)?];
+        if changed > 0 {
+            events.push(state.viewer_state_change_event("visibility")?);
+        }
+        Ok((changed, events))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(changed)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_suppress_elements(ids: Array) -> Result<u32, JsValue> {
+    let (changed, events) = with_web_viewer_state_mut(|state| {
+        let ids = semantic_ids_from_array(&ids)?;
+        let changed = state.runtime_scene.suppress_elements(ids.iter()) as u32;
+        let mut events = vec![state.upload_runtime_scene(false)?];
+        if changed > 0 {
+            events.push(state.viewer_state_change_event("visibility")?);
+        }
+        Ok((changed, events))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(changed)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_unsuppress_elements(ids: Array) -> Result<u32, JsValue> {
+    let (changed, events) = with_web_viewer_state_mut(|state| {
+        let ids = semantic_ids_from_array(&ids)?;
+        let changed = state.runtime_scene.unsuppress_elements(ids.iter()) as u32;
+        let mut events = vec![state.upload_runtime_scene(false)?];
+        if changed > 0 {
+            events.push(state.viewer_state_change_event("visibility")?);
+        }
+        Ok((changed, events))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(changed)
 }
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn viewer_select_elements(ids: Array) -> Result<u32, JsValue> {
-    with_web_viewer_state_mut(|state| {
+    let (changed, events) = with_web_viewer_state_mut(|state| {
         let ids = semantic_ids_from_array(&ids)?;
         let changed = state.runtime_scene.select_elements(ids.iter()) as u32;
-        state.upload_runtime_scene(false);
-        Ok(changed)
-    })
+        let mut events = vec![state.upload_runtime_scene(false)?];
+        if changed > 0 {
+            events.push(state.viewer_state_change_event("selection")?);
+        }
+        Ok((changed, events))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(changed)
 }
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn viewer_clear_selection() -> Result<u32, JsValue> {
-    with_web_viewer_state_mut(|state| {
+    let (changed, events) = with_web_viewer_state_mut(|state| {
         let changed = state.runtime_scene.clear_selection() as u32;
-        state.upload_runtime_scene(false);
-        Ok(changed)
-    })
+        let mut events = vec![state.upload_runtime_scene(false)?];
+        if changed > 0 {
+            events.push(state.viewer_state_change_event("selection")?);
+        }
+        Ok((changed, events))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(changed)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2116,20 +2240,19 @@ pub async fn viewer_pick_rect_json(x0: f32, y0: f32, x1: f32, y1: f32) -> Result
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn viewer_frame_visible() -> Result<(), JsValue> {
-    with_web_viewer_state_mut(|state| {
-        state.frame_visible_scene();
-        Ok(())
-    })
+    let event = with_web_viewer_state_mut(|state| state.frame_visible_scene())?;
+    dispatch_web_events(vec![event]).map_err(|error| JsValue::from_str(&error))
 }
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn viewer_resize_viewport() -> Result<(), JsValue> {
-    with_web_viewer_state_mut(|state| {
-        state.resize_to_window()?;
+    let events = with_web_viewer_state_mut(|state| {
+        let event = state.resize_to_window()?;
         state.render()?;
-        Ok(())
-    })
+        Ok(event.into_iter().collect::<Vec<_>>())
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2149,17 +2272,20 @@ async fn stream_current_visible_view_to_json() -> Result<String, JsValue> {
             .await
             .map_err(|error| JsValue::from_str(&error))?;
 
-    with_web_viewer_state_mut(|state| {
+    let (json, events) = with_web_viewer_state_mut(|state| {
         if state.current_resource != resource {
             return Err("w web viewer resource changed while streaming geometry".to_string());
         }
-        state
+        let resident_instances = state
             .runtime_scene
             .mark_instance_batch_resident(&instance_batch);
-        state
+        let resident_definitions = state
             .runtime_scene
             .mark_definition_batch_resident(&definition_batch);
-        state.upload_runtime_scene(false);
+        let mut events = vec![state.upload_runtime_scene(false)?];
+        if resident_instances > 0 || resident_definitions > 0 {
+            events.push(state.viewer_state_change_event("stream")?);
+        }
 
         let remaining = state
             .runtime_scene
@@ -2172,8 +2298,10 @@ async fn stream_current_visible_view_to_json() -> Result<String, JsValue> {
             ));
         }
 
-        state.view_state_json()
-    })
+        Ok((state.view_state_json()?, events))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(json)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2490,15 +2618,8 @@ impl WebViewerApp {
         let resource_picker = typed_element::<HtmlSelectElement>(&document, "resource-picker")?;
         let tool_picker = typed_element::<HtmlSelectElement>(&document, "tool-picker")?;
         let status_line = typed_element::<HtmlElement>(&document, "status-line")?;
-        let resources = match fetch_available_resources(&window).await {
-            Ok(resources) => resources,
-            Err(error) => {
-                log_viewer_error(&format!(
-                    "w web viewer resource catalog fell back to IFC-only resources: {error}"
-                ));
-                fallback_web_resources()
-            }
-        };
+        let resource_catalog = fetch_available_resource_catalog(&window).await?;
+        let resources = resource_catalog_resources(&resource_catalog);
         populate_resource_picker(&resource_picker, &resources);
         let initial_resource = initial_web_resource(&window, &resources);
         resource_picker.set_value(&initial_resource);
@@ -2563,6 +2684,7 @@ impl WebViewerApp {
             resource_picker: resource_picker.clone(),
             tool_picker: tool_picker.clone(),
             status_line,
+            resource_catalog,
             current_resource: initial_resource.clone(),
             runtime_scene,
             surface,
@@ -2593,7 +2715,12 @@ impl WebViewerApp {
 
         let tool_state = state.clone();
         let tool_change = Closure::wrap(Box::new(move |_event: Event| {
-            tool_state.borrow_mut().sync_interaction_mode_from_picker();
+            let event = tool_state.borrow_mut().sync_interaction_mode_from_picker();
+            if let Some(event) = event {
+                if let Err(error) = event.dispatch() {
+                    log_viewer_error(&error);
+                }
+            }
         }) as Box<dyn FnMut(Event)>);
         tool_picker
             .add_event_listener_with_callback("change", tool_change.as_ref().unchecked_ref())
@@ -2601,9 +2728,12 @@ impl WebViewerApp {
 
         let mouse_down_state = state.clone();
         let mouse_down = Closure::wrap(Box::new(move |event: MouseEvent| {
-            mouse_down_state
+            let event = mouse_down_state
                 .borrow_mut()
                 .begin_drag(event.client_x() as f32, event.client_y() as f32);
+            if let Err(error) = event.dispatch() {
+                log_viewer_error(&error);
+            }
         }) as Box<dyn FnMut(MouseEvent)>);
         canvas
             .add_event_listener_with_callback("mousedown", mouse_down.as_ref().unchecked_ref())
@@ -2611,11 +2741,20 @@ impl WebViewerApp {
 
         let mouse_move_state = state.clone();
         let mouse_move = Closure::wrap(Box::new(move |event: MouseEvent| {
-            if let Err(error) = mouse_move_state
+            let event = match mouse_move_state
                 .borrow_mut()
                 .drag_to(event.client_x() as f32, event.client_y() as f32)
             {
-                log_viewer_error(&error);
+                Ok(event) => event,
+                Err(error) => {
+                    log_viewer_error(&error);
+                    return;
+                }
+            };
+            if let Some(event) = event {
+                if let Err(error) = event.dispatch() {
+                    log_viewer_error(&error);
+                }
             }
         }) as Box<dyn FnMut(MouseEvent)>);
         window
@@ -2624,7 +2763,10 @@ impl WebViewerApp {
 
         let mouse_up_state = state.clone();
         let mouse_up = Closure::wrap(Box::new(move |_event: MouseEvent| {
-            let request = mouse_up_state.borrow_mut().end_drag();
+            let (request, event) = mouse_up_state.borrow_mut().end_drag();
+            if let Err(error) = event.dispatch() {
+                log_viewer_error(&error);
+            }
             if let Some(request) = request {
                 let mouse_up_state = mouse_up_state.clone();
                 spawn_local(async move {
@@ -2659,7 +2801,12 @@ impl WebViewerApp {
         let mouse_leave_state = state.clone();
         let mouse_leave = Closure::wrap(Box::new(move |event: MouseEvent| {
             if event.buttons() == 0 {
-                mouse_leave_state.borrow_mut().cancel_drag();
+                let drag_event = mouse_leave_state.borrow_mut().cancel_drag();
+                if let Some(drag_event) = drag_event {
+                    if let Err(error) = drag_event.dispatch() {
+                        log_viewer_error(&error);
+                    }
+                }
             }
         }) as Box<dyn FnMut(MouseEvent)>);
         canvas
@@ -2669,8 +2816,13 @@ impl WebViewerApp {
         let wheel_state = state.clone();
         let wheel = Closure::wrap(Box::new(move |event: WheelEvent| {
             event.prevent_default();
-            if let Err(error) = wheel_state.borrow_mut().zoom(event.delta_y() as f32) {
-                log_viewer_error(&error);
+            match wheel_state.borrow_mut().zoom(event.delta_y() as f32) {
+                Ok(event) => {
+                    if let Err(error) = event.dispatch() {
+                        log_viewer_error(&error);
+                    }
+                }
+                Err(error) => log_viewer_error(&error),
             }
         }) as Box<dyn FnMut(WheelEvent)>);
         canvas
@@ -2679,8 +2831,17 @@ impl WebViewerApp {
 
         let resize_state = state.clone();
         let resize = Closure::wrap(Box::new(move |_event: Event| {
-            if let Err(error) = resize_state.borrow_mut().resize_to_window() {
-                log_viewer_error(&error);
+            let event = match resize_state.borrow_mut().resize_to_window() {
+                Ok(event) => event,
+                Err(error) => {
+                    log_viewer_error(&error);
+                    return;
+                }
+            };
+            if let Some(event) = event {
+                if let Err(error) = event.dispatch() {
+                    log_viewer_error(&error);
+                }
             }
         }) as Box<dyn FnMut(Event)>);
         window
@@ -2738,6 +2899,7 @@ struct WebViewerState {
     resource_picker: HtmlSelectElement,
     tool_picker: HtmlSelectElement,
     status_line: HtmlElement,
+    resource_catalog: WebResourceCatalog,
     current_resource: String,
     runtime_scene: RuntimeSceneState,
     surface: wgpu::Surface<'static>,
@@ -2769,6 +2931,28 @@ struct WebPickReadback {
 }
 
 #[cfg(target_arch = "wasm32")]
+struct DeferredWebEvent {
+    window: Window,
+    event_name: &'static str,
+    json: String,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl DeferredWebEvent {
+    fn dispatch(self) -> Result<(), String> {
+        dispatch_json_event(&self.window, self.event_name, &self.json)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn dispatch_web_events(events: Vec<DeferredWebEvent>) -> Result<(), String> {
+    for event in events {
+        event.dispatch()?;
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
 impl WebViewerState {
     fn begin_resource_load(&mut self, resource: &str) {
         self.resource_picker.set_disabled(true);
@@ -2786,20 +2970,27 @@ impl WebViewerState {
         ));
     }
 
-    fn apply_runtime_scene(&mut self, resource: String, runtime_scene: RuntimeSceneState) {
+    fn apply_runtime_scene(
+        &mut self,
+        resource: String,
+        runtime_scene: RuntimeSceneState,
+    ) -> Result<Vec<DeferredWebEvent>, String> {
         self.runtime_scene = runtime_scene;
         self.current_resource = resource.clone();
         self.resource_picker.set_disabled(false);
         self.resource_picker.set_value(&resource);
         self.last_pick_hits.clear();
-        self.upload_runtime_scene(true);
+        Ok(vec![
+            self.upload_runtime_scene(true)?,
+            self.viewer_state_change_event("resource")?,
+        ])
     }
 
-    fn resize_to_window(&mut self) -> Result<(), String> {
+    fn resize_to_window(&mut self) -> Result<Option<DeferredWebEvent>, String> {
         let (width, height) =
             resize_canvases_to_window(&self.window, &self.canvas, &self.axes_overlay)?;
         if self.config.width == width && self.config.height == height {
-            return Ok(());
+            return Ok(None);
         }
 
         self.config.width = width;
@@ -2814,12 +3005,11 @@ impl WebViewerState {
         self.renderer
             .resize(&self.queue, ViewportSize::new(width, height));
         self.draw_world_axes_overlay()?;
-        self.dispatch_pick_anchor_update()?;
 
-        Ok(())
+        Ok(Some(self.pick_anchor_event()?))
     }
 
-    fn upload_runtime_scene(&mut self, reset_camera: bool) {
+    fn upload_runtime_scene(&mut self, reset_camera: bool) -> Result<DeferredWebEvent, String> {
         let render_scene = self.runtime_scene.compose_render_scene();
         self.renderer
             .upload_prepared_scene(&self.device, &self.queue, &render_scene);
@@ -2829,31 +3019,42 @@ impl WebViewerState {
             self.renderer.set_camera(&self.queue, self.orbit.camera());
         }
         self.refresh_status();
-        let _ = self.dispatch_pick_anchor_update();
+        self.pick_anchor_event()
     }
 
-    fn frame_visible_scene(&mut self) {
+    fn commit_runtime_scene_change(
+        &mut self,
+        reset_camera: bool,
+        reason: &str,
+    ) -> Result<Vec<DeferredWebEvent>, String> {
+        Ok(vec![
+            self.upload_runtime_scene(reset_camera)?,
+            self.viewer_state_change_event(reason)?,
+        ])
+    }
+
+    fn frame_visible_scene(&mut self) -> Result<DeferredWebEvent, String> {
         let render_scene = self.runtime_scene.compose_render_scene();
         let camera = fit_camera_to_render_scene(&render_scene);
         self.orbit = OrbitCameraController::from_camera(camera);
         self.renderer.set_camera(&self.queue, self.orbit.camera());
         self.refresh_status();
-        let _ = self.dispatch_pick_anchor_update();
+        self.pick_anchor_event()
     }
 
-    fn begin_drag(&mut self, x: f32, y: f32) {
+    fn begin_drag(&mut self, x: f32, y: f32) -> DeferredWebEvent {
         self.drag.active = true;
         self.drag.suppress_next_click = false;
         self.drag.start_x = x;
         self.drag.start_y = y;
         self.drag.last_x = x;
         self.drag.last_y = y;
-        let _ = dispatch_json_event(&self.window, "w-viewer-drag-start", r#"{}"#);
+        self.web_event("w-viewer-drag-start", r#"{}"#.to_string())
     }
 
-    fn drag_to(&mut self, x: f32, y: f32) -> Result<(), String> {
+    fn drag_to(&mut self, x: f32, y: f32) -> Result<Option<DeferredWebEvent>, String> {
         if !self.drag.active {
-            return Ok(());
+            return Ok(None);
         }
 
         let mode = self.interaction_mode();
@@ -2862,15 +3063,14 @@ impl WebViewerState {
         self.drag.last_x = x;
         self.drag.last_y = y;
         if !mode.can_orbit() {
-            return Ok(());
+            return Ok(None);
         }
         self.orbit.orbit_by_pixels(dx, dy);
         self.renderer.set_camera(&self.queue, self.orbit.camera());
-        self.dispatch_pick_anchor_update()?;
-        Ok(())
+        Ok(Some(self.pick_anchor_event()?))
     }
 
-    fn end_drag(&mut self) -> Option<WebPickRequest> {
+    fn end_drag(&mut self) -> (Option<WebPickRequest>, DeferredWebEvent) {
         let request = if self.drag.active {
             let mode = self.interaction_mode();
             let is_box_select = self.drag.is_box_select();
@@ -2884,29 +3084,30 @@ impl WebViewerState {
             None
         };
         self.drag.active = false;
-        let _ = dispatch_json_event(&self.window, "w-viewer-drag-end", r#"{}"#);
-        request
+        (request, self.web_event("w-viewer-drag-end", r#"{}"#.to_string()))
     }
 
-    fn cancel_drag(&mut self) {
+    fn cancel_drag(&mut self) -> Option<DeferredWebEvent> {
         let was_active = self.drag.active;
         self.drag.active = false;
         self.drag.suppress_next_click = false;
         if was_active {
-            let _ = dispatch_json_event(&self.window, "w-viewer-drag-end", r#"{}"#);
+            Some(self.web_event("w-viewer-drag-end", r#"{}"#.to_string()))
+        } else {
+            None
         }
     }
 
-    fn zoom(&mut self, delta_y: f32) -> Result<(), String> {
+    fn zoom(&mut self, delta_y: f32) -> Result<DeferredWebEvent, String> {
         self.orbit.zoom_by_wheel(delta_y);
         self.renderer.set_camera(&self.queue, self.orbit.camera());
-        self.dispatch_pick_anchor_update()?;
-        Ok(())
+        self.pick_anchor_event()
     }
 
-    fn sync_interaction_mode_from_picker(&mut self) {
-        self.cancel_drag();
+    fn sync_interaction_mode_from_picker(&mut self) -> Option<DeferredWebEvent> {
+        let drag_event = self.cancel_drag();
         self.refresh_status();
+        drag_event
     }
 
     fn interaction_mode(&self) -> WebInteractionMode {
@@ -3162,9 +3363,16 @@ impl WebViewerState {
         self.refresh_status();
     }
 
-    fn dispatch_pick_anchor_update(&self) -> Result<(), String> {
-        let json = self.pick_anchor_event_json()?;
-        dispatch_json_event(&self.window, "w-viewer-anchor", &json)
+    fn web_event(&self, event_name: &'static str, json: String) -> DeferredWebEvent {
+        DeferredWebEvent {
+            window: self.window.clone(),
+            event_name,
+            json,
+        }
+    }
+
+    fn pick_anchor_event(&self) -> Result<DeferredWebEvent, String> {
+        Ok(self.web_event("w-viewer-anchor", self.pick_anchor_event_json()?))
     }
 
     fn pick_anchor_event_json(&self) -> Result<String, String> {
@@ -3271,12 +3479,17 @@ impl WebViewerState {
         let selected_element_ids = self.runtime_scene.selected_element_ids();
         let selected_instance_ids =
             selected_instance_ids_from_catalog(&catalog, &selected_element_ids);
+        let default_element_ids = self
+            .runtime_scene
+            .resolve_start_view(&GeometryStartViewRequest::Default)
+            .visible_element_ids;
         let snapshot = WebViewerViewState {
             resource: self.current_resource.clone(),
             view_mode: web_view_mode_name(self.runtime_scene.start_view_request()).to_string(),
             total_elements: catalog.elements.len(),
             total_instances: catalog.instances.len(),
             total_definitions: catalog.definitions.len(),
+            default_element_ids: semantic_ids_to_strings(default_element_ids),
             base_visible_element_ids: semantic_ids_to_strings(
                 self.runtime_scene.base_visible_element_ids(),
             ),
@@ -3290,6 +3503,9 @@ impl WebViewerState {
                 .collect(),
             hidden_element_ids: semantic_ids_to_strings(self.runtime_scene.hidden_element_ids()),
             shown_element_ids: semantic_ids_to_strings(self.runtime_scene.shown_element_ids()),
+            suppressed_element_ids: semantic_ids_to_strings(
+                self.runtime_scene.suppressed_element_ids(),
+            ),
             resident_instances: residency.instances,
             resident_definitions: residency.definitions,
             missing_instance_ids: missing.instance_ids.iter().map(|id| id.0).collect(),
@@ -3299,6 +3515,17 @@ impl WebViewerState {
         };
         serde_json::to_string(&snapshot)
             .map_err(|error| format!("failed to encode viewer view state JSON: {error}"))
+    }
+
+    fn viewer_state_change_event(&self, reason: &str) -> Result<DeferredWebEvent, String> {
+        let state: serde_json::Value = serde_json::from_str(&self.view_state_json()?)
+            .map_err(|error| format!("failed to reparse viewer state JSON: {error}"))?;
+        let json = serde_json::to_string(&serde_json::json!({
+            "reason": reason,
+            "state": state,
+        }))
+        .map_err(|error| format!("failed to encode viewer state change JSON: {error}"))?;
+        Ok(self.web_event("w-viewer-state-change", json))
     }
 
     fn draw_world_axes_overlay(&self) -> Result<(), String> {
@@ -3551,6 +3778,7 @@ fn friendly_resource_label(resource: &str) -> &str {
         "demo/mapped-pentagon-pair" => "mapped-pentagon-pair (per-instance color)",
         _ if resource.starts_with("demo/") => resource.trim_start_matches("demo/"),
         _ if resource.starts_with("ifc/") => resource.trim_start_matches("ifc/"),
+        _ if resource.starts_with("project/") => resource.trim_start_matches("project/"),
         _ => resource,
     }
 }

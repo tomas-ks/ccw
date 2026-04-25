@@ -31,7 +31,8 @@ use cc_w_backend::GeometryBackend;
 use cc_w_platform_web::{
     WebGeometryCatalogRequest, WebGeometryCatalogResponse, WebGeometryDefinitionBatch,
     WebGeometryDefinitionBatchRequest, WebGeometryInstanceBatch, WebGeometryInstanceBatchRequest,
-    WebPreparedGeometryPackage, WebPreparedPackageResponse, WebResourceCatalog,
+    WebPreparedGeometryPackage, WebPreparedPackageResponse, WebProjectResourceCatalogEntry,
+    WebResourceCatalog,
 };
 use cc_w_types::{
     ExternalId, GeometryDefinitionBatch, GeometryDefinitionId, GeometryInstanceBatch,
@@ -1958,6 +1959,10 @@ fn serve_resources_api(
 ) -> Result<(), String> {
     let payload = WebResourceCatalog {
         resources: available_server_resources(&state.project_registry, &state.ifc_artifacts_root),
+        projects: available_server_project_resources(
+            &state.project_registry,
+            &state.ifc_artifacts_root,
+        ),
     };
     if head_only {
         return write_response(
@@ -2934,6 +2939,35 @@ fn available_server_resources(
     }
     resources.sort();
     resources
+}
+
+fn available_server_project_resources(
+    registry: &ProjectResourceRegistry,
+    ifc_artifacts_root: &Path,
+) -> Vec<WebProjectResourceCatalogEntry> {
+    let available_ifc = available_ifc_body_resources(ifc_artifacts_root)
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut projects = registry
+        .projects
+        .iter()
+        .filter_map(|spec| {
+            let members = spec
+                .members
+                .iter()
+                .filter(|member| available_ifc.contains(*member))
+                .cloned()
+                .collect::<Vec<_>>();
+            (!members.is_empty()).then(|| WebProjectResourceCatalogEntry {
+                resource: spec.resource.clone(),
+                label: spec.label.clone(),
+                members,
+            })
+        })
+        .collect::<Vec<_>>();
+    projects.sort_by(|left, right| left.resource.cmp(&right.resource));
+    projects
 }
 
 fn project_resource_spec<'a>(

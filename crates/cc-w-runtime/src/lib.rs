@@ -115,6 +115,7 @@ pub enum ElementVisibilityOverride {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeElementState {
     pub visibility: ElementVisibilityOverride,
+    pub suppressed: bool,
     pub selected: bool,
 }
 
@@ -335,6 +336,19 @@ impl RuntimeSceneState {
 
     pub fn shown_element_ids(&self) -> Vec<SemanticElementId> {
         self.element_ids_with_visibility_override(ElementVisibilityOverride::Visible)
+    }
+
+    pub fn suppressed_element_ids(&self) -> Vec<SemanticElementId> {
+        self.catalog
+            .elements
+            .iter()
+            .filter(|element| {
+                self.elements_by_id
+                    .get(&element.id)
+                    .is_some_and(|indexed| indexed.state.suppressed)
+            })
+            .map(|element| element.id.clone())
+            .collect()
     }
 
     pub fn stream_plan_for_visible_elements(&self) -> GeometryStreamPlan {
@@ -607,6 +621,20 @@ impl RuntimeSceneState {
         self.set_visibility_override(ids, ElementVisibilityOverride::Inherit)
     }
 
+    pub fn suppress_elements<'a, I>(&mut self, ids: I) -> usize
+    where
+        I: IntoIterator<Item = &'a SemanticElementId>,
+    {
+        self.set_suppressed(ids, true)
+    }
+
+    pub fn unsuppress_elements<'a, I>(&mut self, ids: I) -> usize
+    where
+        I: IntoIterator<Item = &'a SemanticElementId>,
+    {
+        self.set_suppressed(ids, false)
+    }
+
     pub fn select_elements<'a, I>(&mut self, ids: I) -> usize
     where
         I: IntoIterator<Item = &'a SemanticElementId>,
@@ -766,6 +794,9 @@ impl RuntimeSceneState {
 
     fn is_element_visible_by_id(&self, id: &SemanticElementId) -> Option<bool> {
         let indexed = self.elements_by_id.get(id)?;
+        if indexed.state.suppressed {
+            return Some(false);
+        }
         Some(match indexed.state.visibility {
             ElementVisibilityOverride::Inherit => self.base_visible_element_ids.contains(id),
             ElementVisibilityOverride::Hidden => false,
@@ -804,6 +835,23 @@ impl RuntimeSceneState {
             };
             if indexed.state.visibility != visibility {
                 indexed.state.visibility = visibility;
+                changed += 1;
+            }
+        }
+        changed
+    }
+
+    fn set_suppressed<'a, I>(&mut self, ids: I, suppressed: bool) -> usize
+    where
+        I: IntoIterator<Item = &'a SemanticElementId>,
+    {
+        let mut changed = 0;
+        for id in ids {
+            let Some(indexed) = self.elements_by_id.get_mut(id) else {
+                continue;
+            };
+            if indexed.state.suppressed != suppressed {
+                indexed.state.suppressed = suppressed;
                 changed += 1;
             }
         }
@@ -2051,6 +2099,41 @@ mod tests {
         );
         assert_eq!(runtime_scene.shown_element_ids(), vec![space_id]);
         assert!(runtime_scene.hidden_element_ids().is_empty());
+    }
+
+    #[test]
+    fn runtime_scene_suppression_is_separate_from_visibility_overrides() {
+        let physical_id = SemanticElementId::new("synthetic/physical");
+        let space_id = SemanticElementId::new("synthetic/space");
+        let mut runtime_scene =
+            RuntimeSceneState::from_prepared_package(mixed_render_class_package()).expect("scene");
+
+        assert_eq!(runtime_scene.show_elements([&space_id]), 1);
+        assert_eq!(
+            runtime_scene.visible_element_ids(),
+            vec![physical_id.clone(), space_id.clone()]
+        );
+
+        assert_eq!(
+            runtime_scene.suppress_elements([&physical_id, &space_id]),
+            2
+        );
+        assert!(runtime_scene.visible_element_ids().is_empty());
+        assert_eq!(
+            runtime_scene.suppressed_element_ids(),
+            vec![physical_id.clone(), space_id.clone()]
+        );
+        assert_eq!(runtime_scene.shown_element_ids(), vec![space_id.clone()]);
+
+        assert_eq!(runtime_scene.hide_elements([&physical_id]), 1);
+        assert_eq!(
+            runtime_scene.unsuppress_elements([&physical_id, &space_id]),
+            2
+        );
+        assert_eq!(runtime_scene.visible_element_ids(), vec![space_id.clone()]);
+        assert_eq!(runtime_scene.hidden_element_ids(), vec![physical_id]);
+        assert_eq!(runtime_scene.shown_element_ids(), vec![space_id]);
+        assert!(runtime_scene.suppressed_element_ids().is_empty());
     }
 
     #[test]

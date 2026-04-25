@@ -51,6 +51,11 @@ Naming convention:
 9. Internal world space is right-handed, Z-up, and metric.
    The engine should normalize incoming IFC, STEP, and authoring-space data into a shared world basis with `+X` right, `+Y` forward, `+Z` up, and `1.0 = 1 meter`.
 
+10. State ownership must be explicit.
+    App intent, renderer state, and database truth each have different owners. UI widgets should
+    render from committed snapshots instead of keeping competing local truth. The detailed contract
+    lives in [state-management.md](./state-management.md).
+
 ## Coordinate Frame
 
 The internal engine coordinate frame is:
@@ -158,8 +163,12 @@ browser should not reach into renderer internals directly.
 Current status:
 
 - the web viewer now keeps a runtime scene-state layer above the prepared package
-- the browser exposes a small `window.wViewer` API for `listElementIds`, `hide`, `show`,
-  `resetVisibility`, `select`, `clearSelection`, and `frameVisible`
+- the browser exposes a small `window.wViewer` API for committed state snapshots and semantic
+  element commands such as `viewState`, `defaultElementIds`, `hide`, `show`, `suppress`,
+  `unsuppress`, `resetVisibility`, `select`, `clearSelection`, and `frameVisible`
+- web state ownership is documented in [state-management.md](./state-management.md): app intent
+  lives in the web shell, renderer truth lives in Rust runtime state, and rich semantic truth lives
+  in Velr/IFC databases
 - the browser REPL is now wired to that viewer API
 - the local Rust web server now exposes `GET /api/resources` and `POST /api/package`
 - when started through the Rust web server, the web viewer now lists both demo and IFC resources

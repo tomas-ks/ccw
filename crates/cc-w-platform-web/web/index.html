@@ -101,6 +101,13 @@
         border-color: rgba(141, 182, 255, 0.32);
       }
 
+      .icon-button:disabled {
+        opacity: 0.45;
+        cursor: default;
+        color: rgba(243, 246, 255, 0.44);
+        border-color: rgba(255, 255, 255, 0.08);
+      }
+
       .icon-button.active,
       .icon-button[aria-pressed="true"] {
         color: #f3f6ff;
@@ -117,6 +124,101 @@
         stroke-width: 1.8;
         stroke-linecap: round;
         stroke-linejoin: round;
+      }
+
+      .outliner-window {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        z-index: 18;
+        width: min(320px, calc(100% - 24px));
+        max-height: min(420px, calc(100% - 24px));
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
+        background: rgba(18, 24, 39, 0.9);
+        box-shadow: 0 18px 38px rgba(0, 0, 0, 0.32);
+        backdrop-filter: blur(10px);
+      }
+
+      .outliner-window[hidden] {
+        display: none;
+      }
+
+      .outliner-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 11px 12px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      }
+
+      .outliner-title {
+        margin: 0;
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .outliner-subtitle {
+        margin: 2px 0 0;
+        font-size: 11px;
+        color: rgba(243, 246, 255, 0.58);
+      }
+
+      .outliner-close-button {
+        width: 24px;
+        height: 22px;
+        flex: 0 0 auto;
+      }
+
+      .outliner-body {
+        min-height: 0;
+        overflow: auto;
+        padding: 8px;
+      }
+
+      .outliner-empty {
+        padding: 10px;
+        color: rgba(243, 246, 255, 0.64);
+        font-size: 12px;
+      }
+
+      .outliner-row {
+        width: 100%;
+        display: grid;
+        grid-template-columns: auto 1fr auto;
+        align-items: center;
+        gap: 9px;
+        padding: 8px;
+        border-radius: 6px;
+        color: inherit;
+      }
+
+      .outliner-row:hover {
+        background: rgba(141, 182, 255, 0.08);
+      }
+
+      .outliner-row input {
+        margin: 0;
+        accent-color: #8db6ff;
+      }
+
+      .outliner-name {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      .outliner-count {
+        font-size: 11px;
+        color: rgba(243, 246, 255, 0.56);
+        white-space: nowrap;
       }
 
       .viewer-footer {
@@ -936,12 +1038,31 @@
       </div>
       <div class="header-actions" aria-label="Viewer panels">
         <button
+          class="icon-button outliner-toggle-button"
+          id="outliner-toggle-button"
+          type="button"
+          aria-label="Toggle project outliner"
+          aria-pressed="false"
+          title="Outliner"
+          disabled
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M8 6h12" />
+            <path d="M8 12h12" />
+            <path d="M8 18h12" />
+            <rect x="4" y="5" width="2.4" height="2.4" rx=".4" />
+            <rect x="4" y="11" width="2.4" height="2.4" rx=".4" />
+            <rect x="4" y="17" width="2.4" height="2.4" rx=".4" />
+          </svg>
+        </button>
+        <button
           class="icon-button terminal-toggle-button"
           id="terminal-toggle-button"
           type="button"
           aria-label="Toggle terminal panel"
           aria-pressed="false"
           title="Terminal"
+          disabled
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <rect x="4" y="5" width="16" height="14" rx="2" />
@@ -956,6 +1077,7 @@
           aria-label="Toggle graph viewport"
           aria-pressed="false"
           title="Graph"
+          disabled
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <circle cx="6" cy="7" r="2.4" />
@@ -975,6 +1097,34 @@
         <div class="viewport">
           <canvas id="viewer-canvas"></canvas>
           <canvas id="axes-overlay"></canvas>
+          <section
+            class="outliner-window"
+            id="project-outliner"
+            aria-label="Project outliner"
+            hidden
+          >
+            <div class="outliner-header">
+              <div>
+                <h2 class="outliner-title">Project</h2>
+                <p class="outliner-subtitle" id="outliner-subtitle">Project assets</p>
+              </div>
+              <button
+                class="icon-button outliner-close-button"
+                id="outliner-close-button"
+                type="button"
+                aria-label="Close project outliner"
+                title="Close"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M6 6l12 12" />
+                  <path d="M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <div class="outliner-body" id="outliner-body">
+              <div class="outliner-empty">No project assets loaded.</div>
+            </div>
+          </section>
           <div class="pick-anchor-marker" id="pick-anchor-marker" aria-hidden="true" hidden></div>
           <div class="properties-balloon" id="properties-balloon" role="dialog" aria-live="polite" hidden>
             <button class="properties-close" id="properties-close-button" type="button" aria-label="Close properties">
@@ -1163,12 +1313,14 @@
       import init, {
         viewer_clear_selection,
         viewer_current_resource,
+        viewer_default_element_ids,
         viewer_frame_visible,
         viewer_hide_elements,
         viewer_list_element_ids,
         viewer_pick_at_json,
         viewer_pick_rect_json,
         viewer_resize_viewport,
+        viewer_resource_catalog_json,
         viewer_reset_all_visibility,
         viewer_reset_element_visibility,
         viewer_select_elements,
@@ -1176,6 +1328,8 @@
         viewer_set_view_mode,
         viewer_show_elements,
         viewer_stream_visible as viewer_stream_newly_visible_geometry,
+        viewer_suppress_elements,
+        viewer_unsuppress_elements,
         viewer_view_state_json,
         viewer_visible_element_ids,
       } from "./pkg/cc_w_platform_web.js";
@@ -1217,6 +1371,10 @@
         height: 640,
       };
       const GRAPH_CAMERA_BASE_PADDING = 1.18;
+      const resourceCatalogState = {
+        resources: [],
+        projects: [],
+      };
       const DrawCurvedGraphEdgeLabel = createDrawCurvedEdgeLabel({
         curvatureAttribute: "curvature",
         defaultCurvature: DEFAULT_EDGE_CURVATURE * 0.68,
@@ -1253,12 +1411,251 @@
         return "none";
       }
 
+      function createAppStateStore(initial = {}) {
+        const defaultState = {
+          requestedResource: null,
+          committedViewerState: null,
+          panels: {
+            graph: !document.body.classList.contains("graph-hidden"),
+            terminal: !document.body.classList.contains("terminal-hidden"),
+            outliner: false,
+          },
+          tools: parseViewerToolValue(
+            document.getElementById("tool-picker")?.value || "orbit-pick"
+          ),
+          terminal: {
+            activeTool: "ai",
+          },
+          focus: {
+            source: "none",
+            resource: null,
+            dbNodeId: null,
+            graphNodeId: null,
+            semanticId: null,
+          },
+          balloon: {
+            open: false,
+            anchor: null,
+            source: "none",
+            dismissed: false,
+          },
+        };
+        let state = {
+          ...defaultState,
+          ...initial,
+          panels: { ...defaultState.panels, ...(initial.panels || {}) },
+          tools: { ...defaultState.tools, ...(initial.tools || {}) },
+          terminal: { ...defaultState.terminal, ...(initial.terminal || {}) },
+          focus: { ...defaultState.focus, ...(initial.focus || {}) },
+          balloon: { ...defaultState.balloon, ...(initial.balloon || {}) },
+        };
+        const listeners = new Set();
+        const emit = (previous, action) => {
+          const snapshot = state;
+          for (const listener of Array.from(listeners)) {
+            listener(snapshot, previous, action);
+          }
+          window.dispatchEvent(
+            new CustomEvent("w-app-state-change", {
+              detail: { state: snapshot, previous, action },
+            })
+          );
+        };
+        const patch = (action, updater) => {
+          const previous = state;
+          const next = updater(previous);
+          if (next === previous) {
+            return previous;
+          }
+          state = next;
+          emit(previous, action);
+          return state;
+        };
+        return {
+          getState: () => state,
+          subscribe: (listener) => {
+            listeners.add(listener);
+            listener(state, state, { type: "init" });
+            return () => listeners.delete(listener);
+          },
+          renderAll: () => {
+            emit(state, { type: "render" });
+            return state;
+          },
+          dispatch: (action) => {
+            switch (action?.type) {
+              case "resource/requested": {
+                const resource = String(action.resource || "").trim() || null;
+                return patch(action, (previous) => ({
+                  ...previous,
+                  requestedResource: resource,
+                }));
+              }
+              case "viewer/committed": {
+                const committedResource = String(action.state?.resource || "").trim() || null;
+                return patch(action, (previous) => ({
+                  ...previous,
+                  committedViewerState: action.state || null,
+                  requestedResource:
+                    committedResource && committedResource === previous.requestedResource
+                      ? null
+                      : previous.requestedResource,
+                }));
+              }
+              case "panel/set": {
+                const panel = String(action.panel || "");
+                if (!Object.prototype.hasOwnProperty.call(state.panels, panel)) {
+                  return state;
+                }
+                const visible = Boolean(action.visible);
+                return patch(action, (previous) => ({
+                  ...previous,
+                  panels: {
+                    ...previous.panels,
+                    [panel]: visible,
+                  },
+                }));
+              }
+              case "panel/toggle": {
+                const panel = String(action.panel || "");
+                if (!Object.prototype.hasOwnProperty.call(state.panels, panel)) {
+                  return state;
+                }
+                return patch(action, (previous) => ({
+                  ...previous,
+                  panels: {
+                    ...previous.panels,
+                    [panel]: !previous.panels[panel],
+                  },
+                }));
+              }
+              case "tools/set": {
+                return patch(action, (previous) => ({
+                  ...previous,
+                  tools: {
+                    orbit: Boolean(action.tools?.orbit),
+                    pick: Boolean(action.tools?.pick),
+                  },
+                }));
+              }
+              case "tools/toggle": {
+                const tool = String(action.tool || "");
+                if (tool !== "orbit" && tool !== "pick") {
+                  return state;
+                }
+                return patch(action, (previous) => ({
+                  ...previous,
+                  tools: {
+                    ...previous.tools,
+                    [tool]: !previous.tools[tool],
+                  },
+                }));
+              }
+              case "terminal/set-active": {
+                const activeTool = String(action.activeTool || "").trim();
+                if (!activeTool) {
+                  return state;
+                }
+                return patch(action, (previous) => ({
+                  ...previous,
+                  terminal: {
+                    ...previous.terminal,
+                    activeTool,
+                  },
+                }));
+              }
+              case "focus/set": {
+                return patch(action, (previous) => ({
+                  ...previous,
+                  focus: {
+                    source: String(action.source || "none"),
+                    resource: action.resource || null,
+                    dbNodeId: action.dbNodeId ?? null,
+                    graphNodeId: action.graphNodeId ?? null,
+                    semanticId: action.semanticId || null,
+                  },
+                }));
+              }
+              case "focus/clear": {
+                return patch(action, (previous) => ({
+                  ...previous,
+                  focus: {
+                    source: "none",
+                    resource: null,
+                    dbNodeId: null,
+                    graphNodeId: null,
+                    semanticId: null,
+                  },
+                  balloon: {
+                    ...previous.balloon,
+                    open: false,
+                    anchor: null,
+                    source: "none",
+                  },
+                }));
+              }
+              case "balloon/open": {
+                return patch(action, (previous) => ({
+                  ...previous,
+                  balloon: {
+                    open: true,
+                    source: String(action.source || previous.focus?.source || "none"),
+                    anchor: action.anchor || null,
+                    dismissed: false,
+                  },
+                }));
+              }
+              case "balloon/close": {
+                return patch(action, (previous) => ({
+                  ...previous,
+                  balloon: {
+                    ...previous.balloon,
+                    open: false,
+                    anchor: null,
+                    source: "none",
+                    dismissed: Boolean(action.dismissed ?? previous.balloon?.dismissed),
+                  },
+                }));
+              }
+              case "balloon/dismiss": {
+                return patch(action, (previous) => ({
+                  ...previous,
+                  balloon: {
+                    ...previous.balloon,
+                    open: false,
+                    anchor: null,
+                    source: "none",
+                    dismissed: true,
+                  },
+                }));
+              }
+              case "balloon/anchor": {
+                return patch(action, (previous) => ({
+                  ...previous,
+                  balloon: {
+                    ...previous.balloon,
+                    anchor: action.anchor || null,
+                  },
+                }));
+              }
+              default:
+                return state;
+            }
+          },
+        };
+      }
+
+      const appState = createAppStateStore();
+
       function createViewerApi() {
         const parseViewState = (json) => JSON.parse(json);
         const parsePickResult = (json) => JSON.parse(json);
+        const parseResourceCatalog = (json) => JSON.parse(json);
         const currentViewerElementIds = (ids, options = {}) =>
           semanticIdsForViewerResource(ids, viewer_current_resource(), options);
-        const setViewModeAsync = async (mode) => parseViewState(await viewer_set_view_mode(mode));
+        const setViewModeAsync = async (mode) => {
+          return parseViewState(await viewer_set_view_mode(mode));
+        };
         const pickAtAsync = async (x, y) => parsePickResult(await viewer_pick_at_json(x, y));
         const pickRectAsync = async (x0, y0, x1, y1) =>
           parsePickResult(await viewer_pick_rect_json(x0, y0, x1, y1));
@@ -1287,6 +1684,7 @@
         };
         const api = {
           currentResource: () => viewer_current_resource(),
+          resourceCatalog: () => parseResourceCatalog(viewer_resource_catalog_json()),
           viewState: () => parseViewState(viewer_view_state_json()),
           state: () => api.viewState(),
           setViewMode: (mode) => setViewModeSoon(mode),
@@ -1300,12 +1698,23 @@
             pickRect: pickRectAsync,
           },
           listElementIds: () => Array.from(viewer_list_element_ids()),
+          defaultElementIds: () => Array.from(viewer_default_element_ids()),
           visibleElementIds: () => Array.from(viewer_visible_element_ids()),
           selectedElementIds: () => Array.from(viewer_selected_element_ids()),
           selectedInstanceIds: () => api.viewState().selectedInstanceIds || [],
-          hide: (ids, options = {}) => viewer_hide_elements(currentViewerElementIds(ids, options)),
+          hide: (ids, options = {}) => {
+            return viewer_hide_elements(currentViewerElementIds(ids, options));
+          },
           show: (ids, options = {}) => {
             const changed = viewer_show_elements(currentViewerElementIds(ids, options));
+            streamNewlyVisibleGeometrySoon();
+            return changed;
+          },
+          suppress: (ids, options = {}) => {
+            return viewer_suppress_elements(currentViewerElementIds(ids, options));
+          },
+          unsuppress: (ids, options = {}) => {
+            const changed = viewer_unsuppress_elements(currentViewerElementIds(ids, options));
             streamNewlyVisibleGeometrySoon();
             return changed;
           },
@@ -1554,6 +1963,56 @@
           : ifcResource;
       }
 
+      function updateResourceCatalogState(payload) {
+        resourceCatalogState.resources = Array.isArray(payload?.resources)
+          ? payload.resources.map((resource) => String(resource || "").trim()).filter(Boolean)
+          : [];
+        resourceCatalogState.projects = Array.isArray(payload?.projects)
+          ? payload.projects
+              .map((project) => ({
+                resource: String(project?.resource || "").trim(),
+                label: String(project?.label || "").trim(),
+                members: Array.isArray(project?.members)
+                  ? project.members.map((member) => String(member || "").trim()).filter(isIfcResource)
+                  : [],
+              }))
+              .filter((project) => isProjectResource(project.resource) && project.members.length)
+          : [];
+        window.dispatchEvent(
+          new CustomEvent("w-resource-catalog-change", {
+            detail: {
+              resources: resourceCatalogState.resources,
+              projects: resourceCatalogState.projects,
+            },
+          })
+        );
+      }
+
+      function projectEntryForResource(resource) {
+        const active = String(resource || "").trim();
+        if (!active) {
+          return null;
+        }
+        const exact = resourceCatalogState.projects.find((project) => project.resource === active);
+        if (exact) {
+          return exact;
+        }
+        const containing = resourceCatalogState.projects.find((project) =>
+          project.members.includes(active)
+        );
+        if (containing) {
+          return containing;
+        }
+        if (isIfcResource(active)) {
+          return {
+            resource: active,
+            label: "IFC",
+            members: [active],
+          };
+        }
+        return null;
+      }
+
       async function postJson(url, payload) {
         const response = await fetch(url, {
           method: "POST",
@@ -1580,6 +2039,27 @@
 
       function sleep(ms) {
         return new Promise((resolve) => window.setTimeout(resolve, ms));
+      }
+
+      async function waitForViewerReady(viewer, attempts = 160) {
+        let lastError = null;
+        for (let attempt = 0; attempt < attempts; attempt += 1) {
+          try {
+            const state = viewer.viewState();
+            const catalog = viewer.resourceCatalog();
+            if (state?.resource && Array.isArray(catalog?.resources) && catalog.resources.length) {
+              return { state, catalog };
+            }
+          } catch (error) {
+            lastError = error;
+          }
+          await sleep(50);
+        }
+        throw new Error(
+          `w web viewer did not initialize before the JS shell booted${
+            lastError?.message ? `: ${lastError.message}` : ""
+          }`
+        );
       }
 
       function sanitizeTerminalText(text) {
@@ -1778,168 +2258,285 @@
         schedulePaneRefresh({ immediate: true });
       }
 
-      function installHeaderControls(viewer, graphShell) {
+      function installHeaderControls(viewer, graphShell, appStateStore) {
         const toolPicker = document.getElementById("tool-picker");
         const toolButtons = Array.from(document.querySelectorAll("[data-tool-button]"));
         const graphToggleButton = document.getElementById("graph-toggle-button");
         const terminalToggleButton = document.getElementById("terminal-toggle-button");
         const terminalCloseButton = document.getElementById("terminal-close-button");
-        const activeTools = () => parseViewerToolValue(toolPicker?.value || "none");
+        let lastToolValue = null;
+        let lastGraphVisible = null;
+        let lastTerminalVisible = null;
+        let renderingTools = false;
+        graphToggleButton?.removeAttribute("disabled");
+        terminalToggleButton?.removeAttribute("disabled");
 
-        const syncToolButtons = () => {
-          const nextTools = activeTools();
+        const render = (state) => {
+          const nextTools = state.tools || { orbit: false, pick: false };
           const nextTool = viewerToolsToPickerValue(nextTools);
+          if (toolPicker && toolPicker.value !== nextTool) {
+            renderingTools = true;
+            toolPicker.value = nextTool;
+            toolPicker.dispatchEvent(new Event("change", { bubbles: true }));
+            renderingTools = false;
+          }
           for (const button of toolButtons) {
             const active = Boolean(nextTools[button.dataset.toolButton]);
             button.classList.toggle("active", active);
             button.setAttribute("aria-pressed", String(active));
           }
-          window.dispatchEvent(
-            new CustomEvent("w-viewer-tool-change", {
-              detail: { tool: nextTool, tools: nextTools },
-            })
-          );
+
+          const graphVisible = Boolean(state.panels?.graph);
+          document.body.classList.toggle("graph-hidden", !graphVisible);
+          graphToggleButton?.classList.toggle("active", graphVisible);
+          graphToggleButton?.setAttribute("aria-pressed", String(graphVisible));
+
+          const terminalVisible = Boolean(state.panels?.terminal);
+          document.body.classList.toggle("terminal-hidden", !terminalVisible);
+          terminalToggleButton?.classList.toggle("active", terminalVisible);
+          terminalToggleButton?.setAttribute("aria-pressed", String(terminalVisible));
+
+          if (lastToolValue !== nextTool) {
+            lastToolValue = nextTool;
+            window.dispatchEvent(
+              new CustomEvent("w-viewer-tool-change", {
+                detail: { tool: nextTool, tools: nextTools },
+              })
+            );
+          }
+          if (lastGraphVisible !== graphVisible || lastTerminalVisible !== terminalVisible) {
+            requestAnimationFrame(() => {
+              graphShell?.resize?.();
+              viewer?.resizeViewport?.();
+            });
+          }
+          if (lastTerminalVisible !== null && lastTerminalVisible !== terminalVisible) {
+            requestAnimationFrame(() => {
+              window.dispatchEvent(
+                new CustomEvent("w-terminal-visibility-change", {
+                  detail: { visible: terminalVisible },
+                })
+              );
+            });
+          }
+          lastGraphVisible = graphVisible;
+          lastTerminalVisible = terminalVisible;
         };
 
         for (const button of toolButtons) {
           button.addEventListener("click", () => {
-            if (!toolPicker) {
-              return;
-            }
-            const nextTools = activeTools();
-            const tool = button.dataset.toolButton;
-            if (tool === "orbit" || tool === "pick") {
-              nextTools[tool] = !nextTools[tool];
-            }
-            toolPicker.value = viewerToolsToPickerValue(nextTools);
-            toolPicker.dispatchEvent(new Event("change", { bubbles: true }));
+            appStateStore.dispatch({ type: "tools/toggle", tool: button.dataset.toolButton });
           });
         }
-        toolPicker?.addEventListener("change", syncToolButtons);
-        syncToolButtons();
-
-        const setGraphVisible = (visible) => {
-          document.body.classList.toggle("graph-hidden", !visible);
-          graphToggleButton?.classList.toggle("active", visible);
-          graphToggleButton?.setAttribute("aria-pressed", String(visible));
-          requestAnimationFrame(() => {
-            graphShell?.resize?.();
-            viewer?.resizeViewport?.();
+        toolPicker?.addEventListener("change", () => {
+          if (renderingTools) {
+            return;
+          }
+          appStateStore.dispatch({
+            type: "tools/set",
+            tools: parseViewerToolValue(toolPicker.value),
           });
-          return visible;
-        };
+        });
+        appStateStore.subscribe((state) => render(state));
 
         graphToggleButton?.addEventListener("click", () => {
-          setGraphVisible(document.body.classList.contains("graph-hidden"));
+          appStateStore.dispatch({ type: "panel/toggle", panel: "graph" });
         });
-
-        const setTerminalVisible = (visible) => {
-          document.body.classList.toggle("terminal-hidden", !visible);
-          terminalToggleButton?.classList.toggle("active", visible);
-          terminalToggleButton?.setAttribute("aria-pressed", String(visible));
-          requestAnimationFrame(() => {
-            graphShell?.resize?.();
-            viewer?.resizeViewport?.();
-            window.dispatchEvent(
-              new CustomEvent("w-terminal-visibility-change", {
-                detail: { visible },
-              })
-            );
-          });
-          return visible;
-        };
 
         terminalToggleButton?.addEventListener("click", () => {
-          setTerminalVisible(document.body.classList.contains("terminal-hidden"));
+          appStateStore.dispatch({ type: "panel/toggle", panel: "terminal" });
         });
         terminalCloseButton?.addEventListener("click", () => {
-          setTerminalVisible(false);
+          appStateStore.dispatch({ type: "panel/set", panel: "terminal", visible: false });
         });
 
         return {
-          activeTool: () => viewerToolsToPickerValue(activeTools()),
-          activeTools,
-          setGraphVisible,
-          showGraph: () => setGraphVisible(true),
-          hideGraph: () => setGraphVisible(false),
-          toggleGraph: () => setGraphVisible(document.body.classList.contains("graph-hidden")),
-          setTerminalVisible,
-          showTerminal: () => setTerminalVisible(true),
-          hideTerminal: () => setTerminalVisible(false),
+          activeTool: () => viewerToolsToPickerValue(appStateStore.getState().tools),
+          activeTools: () => appStateStore.getState().tools,
+          setGraphVisible: (visible) =>
+            appStateStore.dispatch({ type: "panel/set", panel: "graph", visible }),
+          showGraph: () =>
+            appStateStore.dispatch({ type: "panel/set", panel: "graph", visible: true }),
+          hideGraph: () =>
+            appStateStore.dispatch({ type: "panel/set", panel: "graph", visible: false }),
+          toggleGraph: () => appStateStore.dispatch({ type: "panel/toggle", panel: "graph" }),
+          setTerminalVisible: (visible) =>
+            appStateStore.dispatch({ type: "panel/set", panel: "terminal", visible }),
+          showTerminal: () =>
+            appStateStore.dispatch({ type: "panel/set", panel: "terminal", visible: true }),
+          hideTerminal: () =>
+            appStateStore.dispatch({ type: "panel/set", panel: "terminal", visible: false }),
           toggleTerminal: () =>
-            setTerminalVisible(document.body.classList.contains("terminal-hidden")),
+            appStateStore.dispatch({ type: "panel/toggle", panel: "terminal" }),
         };
       }
 
-      function ensureResourcePickerOption(picker, resource) {
-        if (!picker || !resource || resourcePickerHasOption(resource)) {
-          return false;
-        }
-        const option = document.createElement("option");
-        option.value = resource;
-        option.textContent = resource;
-        picker.appendChild(option);
-        return true;
-      }
-
-      function requestedUrlResource() {
-        try {
-          const params = new URLSearchParams(window.location.search);
-          const resource = String(params.get("resource") || "").trim();
-          return isKnownResource(resource) ? resource : null;
-        } catch (_error) {
+      function installProjectOutliner(viewer, appStateStore) {
+        const panel = document.getElementById("project-outliner");
+        const body = document.getElementById("outliner-body");
+        const subtitle = document.getElementById("outliner-subtitle");
+        const toggleButton = document.getElementById("outliner-toggle-button");
+        const closeButton = document.getElementById("outliner-close-button");
+        const picker = document.getElementById("resource-picker");
+        if (!panel || !body || !toggleButton) {
           return null;
         }
-      }
+        toggleButton.removeAttribute("disabled");
 
-      async function waitForViewerResourceReady(viewer, picker, attempts = 80) {
-        for (let attempt = 0; attempt < attempts; attempt += 1) {
-          if (!picker?.disabled && safeViewerCurrentResource(viewer)) {
-            return true;
+        const renderVisibility = (visible) => {
+          panel.hidden = !visible;
+          toggleButton.classList.toggle("active", visible);
+          toggleButton.setAttribute("aria-pressed", String(visible));
+          if (visible) {
+            renderSafely();
           }
-          await sleep(50);
-        }
-        return Boolean(safeViewerCurrentResource(viewer));
+          return visible;
+        };
+
+        const setVisible = (visible) => {
+          appStateStore.dispatch({ type: "panel/set", panel: "outliner", visible });
+          return visible;
+        };
+
+        const memberScopedIds = (member, ids, resource) => {
+          if (isProjectResource(resource)) {
+            const prefix = `${member}::`;
+            return ids.filter((id) => id.startsWith(prefix));
+          }
+          if (resource === member) {
+            return ids.filter((id) => !parseSourceScopedSemanticId(id));
+          }
+          return [];
+        };
+
+        const memberDefaultElementIds = (member, defaultElementIds, resource) =>
+          memberScopedIds(member, defaultElementIds, resource);
+
+        const labelForMember = (member) => member.replace(/^ifc\//, "");
+
+        const render = () => {
+          const state = appStateStore.getState();
+          const viewState = state.committedViewerState || null;
+          const resource =
+            String(viewState?.resource || "").trim() ||
+            safeViewerCurrentResource(viewer) ||
+            picker?.value ||
+            "";
+          const project = projectEntryForResource(resource);
+          const fragment = document.createDocumentFragment();
+          if (!project || !project.members.length) {
+            if (subtitle) {
+              subtitle.textContent = "No project selected";
+            }
+            const empty = document.createElement("div");
+            empty.className = "outliner-empty";
+            empty.textContent = "Select a project resource to see its IFC assets.";
+            fragment.appendChild(empty);
+            body.replaceChildren(fragment);
+            return;
+          }
+
+          if (subtitle) {
+            subtitle.textContent = project.resource === resource
+              ? project.label || project.resource
+              : `${project.label || project.resource} assets`;
+          }
+          if (!viewState) {
+            const empty = document.createElement("div");
+            empty.className = "outliner-empty";
+            empty.textContent = "Loading project assets.";
+            fragment.appendChild(empty);
+            body.replaceChildren(fragment);
+            return;
+          }
+          const defaultElementIds = Array.isArray(viewState.defaultElementIds)
+            ? viewState.defaultElementIds
+            : [];
+          const suppressed = new Set(viewState.suppressedElementIds || []);
+          for (const member of project.members) {
+            const ids = memberDefaultElementIds(member, defaultElementIds, resource);
+            const enabledCount = ids.filter((id) => !suppressed.has(id)).length;
+            const row = document.createElement("label");
+            row.className = "outliner-row";
+
+            const checkbox = document.createElement("input");
+            checkbox.type = "checkbox";
+            checkbox.checked = ids.length > 0 && enabledCount > 0;
+            checkbox.indeterminate =
+              ids.length > 0 && enabledCount > 0 && enabledCount < ids.length;
+            checkbox.disabled = ids.length === 0;
+            checkbox.setAttribute("aria-label", `Toggle ${member}`);
+            checkbox.addEventListener("change", () => {
+              if (!ids.length) {
+                renderSafely();
+                return;
+              }
+              if (checkbox.checked) {
+                viewer.unsuppress(ids, { sourceResource: member });
+              } else {
+                viewer.suppress(ids, { sourceResource: member });
+              }
+              renderSafely();
+            });
+
+            const name = document.createElement("span");
+            name.className = "outliner-name";
+            name.textContent = labelForMember(member);
+            name.title = member;
+
+            const count = document.createElement("span");
+            count.className = "outliner-count";
+            count.textContent = ids.length ? `${enabledCount}/${ids.length} default` : "not loaded";
+
+            row.append(checkbox, name, count);
+            fragment.appendChild(row);
+          }
+          body.replaceChildren(fragment);
+        };
+
+        const renderSafely = () => {
+          try {
+            render();
+          } catch (error) {
+            console.error("project outliner render failed", error);
+          }
+        };
+
+        toggleButton.addEventListener("click", () => {
+          appStateStore.dispatch({ type: "panel/toggle", panel: "outliner" });
+        });
+        closeButton?.addEventListener("click", () => {
+          setVisible(false);
+        });
+        window.addEventListener("w-resource-catalog-change", () => {
+          if (!panel.hidden) {
+            renderSafely();
+          }
+        });
+        appStateStore.subscribe((state) => {
+          renderVisibility(Boolean(state.panels?.outliner));
+        });
+
+        return {
+          render,
+          setVisible,
+          show: () => setVisible(true),
+          hide: () => setVisible(false),
+          toggle: () => appStateStore.dispatch({ type: "panel/toggle", panel: "outliner" }),
+        };
       }
 
-      function installProjectResourcePickerSupport({ viewer, graph, agentShell }) {
+      function installProjectResourcePickerSupport({ appStateStore }) {
         const picker = document.getElementById("resource-picker");
         if (!picker) {
           return;
         }
         picker.addEventListener("change", (event) => {
           const nextResource = String(event?.target?.value || "").trim();
-          if (!isProjectResource(nextResource)) {
-            return;
+          if (isKnownResource(nextResource)) {
+            appStateStore.dispatch({ type: "resource/requested", resource: nextResource });
           }
-          void agentShell?.handleResourceSwitch?.(nextResource);
-          graph?.clear?.({ silent: true });
-          graph?.setStatus?.(`Loading project resource ${nextResource} in the viewer.`);
         });
-        const requestedResource = requestedUrlResource();
-        getJson("/api/resources")
-          .then(async (payload) => {
-            const resources = Array.isArray(payload?.resources) ? payload.resources : [];
-            await waitForViewerResourceReady(viewer, picker);
-            for (const resource of resources) {
-              const value = String(resource || "").trim();
-              if (isProjectResource(value)) {
-                ensureResourcePickerOption(picker, value);
-              }
-            }
-            if (!isProjectResource(requestedResource) || !resourcePickerHasOption(requestedResource)) {
-              return;
-            }
-            await waitForViewerResourceReady(viewer, picker);
-            if (safeViewerCurrentResource(viewer) === requestedResource) {
-              return;
-            }
-            picker.value = requestedResource;
-            picker.dispatchEvent(new Event("change", { bubbles: true }));
-          })
-          .catch((error) => {
-            console.warn("Project resource catalog unavailable", error);
-          });
       }
 
       function formatResult(value) {
@@ -2708,7 +3305,7 @@
         return fragment;
       }
 
-      function createGraphShell(viewer) {
+      function createGraphShell(viewer, appStateStore) {
         const dom = {
           panelTabs: Array.from(document.querySelectorAll("[data-panel-tab]")),
           panelViews: Array.from(document.querySelectorAll("[data-panel-view]")),
@@ -2868,7 +3465,7 @@
           }
         };
 
-        const hidePropertiesBalloon = () => {
+        const applyHiddenPropertiesBalloon = () => {
           if (dom.propertiesBalloon) {
             dom.propertiesBalloon.hidden = true;
           }
@@ -2877,9 +3474,13 @@
           }
         };
 
+        const hidePropertiesBalloon = () => {
+          appStateStore.dispatch({ type: "balloon/close" });
+        };
+
         const dismissPropertiesBalloon = () => {
           state.propertiesBalloonDismissed = true;
-          hidePropertiesBalloon();
+          appStateStore.dispatch({ type: "balloon/dismiss" });
         };
 
         const hidePickAnchorMarker = () => {
@@ -2888,7 +3489,7 @@
           }
         };
 
-        const showPropertiesBalloonAtClientPoint = (
+        const positionPropertiesBalloonAtClientPoint = (
           clientX,
           clientY,
           { anchored = false, marker = false } = {}
@@ -2952,13 +3553,63 @@
           dom.propertiesBalloon.style.setProperty("--arrow-y", `${Math.round(arrowY)}px`);
         };
 
+        const showPropertiesBalloonAtClientPoint = (
+          clientX,
+          clientY,
+          { anchored = false, marker = false, source = state.selectionOrigin || "none" } = {}
+        ) => {
+          appStateStore.dispatch({
+            type: "balloon/open",
+            source,
+            anchor: {
+              kind: "client",
+              clientX,
+              clientY,
+              anchored,
+              marker,
+            },
+          });
+        };
+
         const showPropertiesBalloonAtViewportCenter = () => {
           if (!dom.viewport) {
             return;
           }
           const rect = dom.viewport.getBoundingClientRect();
-          showPropertiesBalloonAtClientPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+          appStateStore.dispatch({
+            type: "balloon/open",
+            source: state.selectionOrigin || "none",
+            anchor: {
+              kind: "viewport-center",
+              clientX: rect.left + rect.width / 2,
+              clientY: rect.top + rect.height / 2,
+              anchored: false,
+              marker: false,
+            },
+          });
         };
+
+        appStateStore.subscribe((app) => {
+          const balloon = app.balloon || {};
+          state.propertiesBalloonDismissed = Boolean(balloon.dismissed);
+          if (!balloon.open || !balloon.anchor) {
+            applyHiddenPropertiesBalloon();
+            return;
+          }
+          const anchor = balloon.anchor || {};
+          if (
+            anchor.kind === "client" ||
+            anchor.kind === "viewport-center" ||
+            (Number.isFinite(anchor.clientX) && Number.isFinite(anchor.clientY))
+          ) {
+            positionPropertiesBalloonAtClientPoint(anchor.clientX, anchor.clientY, {
+              anchored: Boolean(anchor.anchored),
+              marker: Boolean(anchor.marker),
+            });
+          } else {
+            applyHiddenPropertiesBalloon();
+          }
+        });
 
         const pickRegionClientCenter = (detail) => {
           const region = detail?.region;
@@ -3007,6 +3658,40 @@
         const selectedRenderableSourceResource = () => {
           const node = currentSelectedNode();
           return node ? graphNodeSourceResource(node) : state.pickedResource;
+        };
+
+        const setAppFocusFromGraphNode = (nodeId) => {
+          const node = nodeId ? graphNodeForKey(nodeId) : null;
+          if (!node) {
+            appStateStore.dispatch({ type: "focus/clear" });
+            return;
+          }
+          appStateStore.dispatch({
+            type: "focus/set",
+            source: "graph",
+            graphNodeId: String(nodeId),
+            dbNodeId: graphDbNodeIdForKey(nodeId),
+            semanticId: graphNodeSemanticId(node),
+            resource: graphNodeSourceResource(node) || state.lastResource || safeViewerCurrentResource(viewer),
+          });
+        };
+
+        const setAppFocusFromPick = ({
+          semanticId = state.pickedSemanticId,
+          dbNodeId = state.pickedDbNodeId,
+          resource = state.pickedResource || safeViewerCurrentResource(viewer),
+        } = {}) => {
+          if (!semanticId && dbNodeId === null) {
+            appStateStore.dispatch({ type: "focus/clear" });
+            return;
+          }
+          appStateStore.dispatch({
+            type: "focus/set",
+            source: "pick",
+            semanticId,
+            dbNodeId,
+            resource,
+          });
         };
 
         const cypherStringLiteral = (value) => {
@@ -3126,6 +3811,11 @@
           dom.propertiesEmptyState.hidden = true;
           state.pickedDbNodeId = lookup?.dbNodeId || node.dbNodeId || null;
           state.pickedResource = resource;
+          setAppFocusFromPick({
+            semanticId: ifcId || hit?.elementId || null,
+            dbNodeId: state.pickedDbNodeId,
+            resource,
+          });
           setPickedGraphButtonVisible(Boolean(state.pickedDbNodeId));
 
           const rows = [];
@@ -3161,6 +3851,7 @@
               dom.propertiesEmptyState.textContent = "No semantic IFC node was found for this pick.";
               state.pickedDbNodeId = null;
               state.pickedResource = null;
+              setAppFocusFromPick({ semanticId: hit.elementId || null, dbNodeId: null, resource: lookup?.resource || null });
               setPickedGraphButtonVisible(false);
               return;
             }
@@ -3184,6 +3875,7 @@
             dom.propertiesEmptyState.textContent = `Could not load IFC properties: ${error.message || error}`;
             state.pickedDbNodeId = null;
             state.pickedResource = null;
+            setAppFocusFromPick({ semanticId: hit.elementId || null, dbNodeId: null });
             setPickedGraphButtonVisible(false);
           }
         };
@@ -3386,9 +4078,11 @@
             syncActionButtons();
             hidePropertiesBalloon();
             hidePickAnchorMarker();
+            appStateStore.dispatch({ type: "focus/clear" });
             return false;
           }
 
+          setAppFocusFromPick({ semanticId: state.pickedSemanticId, dbNodeId: null });
           dom.propertiesTitle.textContent = "Loading IFC properties";
           dom.propertiesSubtitle.textContent = hit.elementId ? `id: ${hit.elementId}` : "id unavailable";
           dom.propertiesEmptyState.hidden = true;
@@ -4530,6 +5224,11 @@
               nodeId === null || nodeId === undefined ? null : String(nodeId);
             state.selectedNodeId = nextId && state.nodesById.has(nextId) ? nextId : null;
             state.selectionOrigin = state.selectedNodeId ? options.origin || "graph" : "none";
+            if (state.selectedNodeId) {
+              setAppFocusFromGraphNode(state.selectedNodeId);
+            } else {
+              appStateStore.dispatch({ type: "focus/clear" });
+            }
             const preserveProperties = options.preserveProperties === true;
             if (!preserveProperties) {
               state.activePickHasHit = false;
@@ -4614,6 +5313,7 @@
             state.pickedDbNodeId = null;
             state.pickedResource = null;
             setPickedGraphButtonVisible(false);
+            appStateStore.dispatch({ type: "focus/clear" });
             state.expandedNodeIds = new Set();
             state.layoutPositions = new Map();
             state.cameraState = null;
@@ -4958,8 +5658,8 @@
           });
         });
 
-        dom.resourcePicker?.addEventListener("change", () => {
-          const nextResource = safeViewerCurrentResource(viewer);
+        window.addEventListener("w-viewer-state-change", (event) => {
+          const nextResource = event.detail?.state?.resource || safeViewerCurrentResource(viewer);
           if (nextResource !== state.lastResource) {
             state.lastResource = nextResource;
             api.clear({ silent: true });
@@ -6138,41 +6838,29 @@
         }
 
         if (kind === "elements.hide") {
-          const semanticIds = semanticIdsForViewerResource(
-            agentSemanticIds(action),
-            safeViewerCurrentResource(viewer),
-            { sourceResource: agentActionResource(action, viewer) }
-          );
+          const semanticIds = agentSemanticIds(action);
           if (!semanticIds.length) {
             return null;
           }
-          viewer.hide(semanticIds);
+          viewer.hide(semanticIds, { sourceResource: agentActionResource(action, viewer) });
           return "elements.hide";
         }
 
         if (kind === "elements.show") {
-          const semanticIds = semanticIdsForViewerResource(
-            agentSemanticIds(action),
-            safeViewerCurrentResource(viewer),
-            { sourceResource: agentActionResource(action, viewer) }
-          );
+          const semanticIds = agentSemanticIds(action);
           if (!semanticIds.length) {
             return null;
           }
-          viewer.show(semanticIds);
+          viewer.show(semanticIds, { sourceResource: agentActionResource(action, viewer) });
           return "elements.show";
         }
 
         if (kind === "elements.select") {
-          const semanticIds = semanticIdsForViewerResource(
-            agentSemanticIds(action),
-            safeViewerCurrentResource(viewer),
-            { sourceResource: agentActionResource(action, viewer) }
-          );
+          const semanticIds = agentSemanticIds(action);
           if (!semanticIds.length) {
             return null;
           }
-          viewer.select(semanticIds);
+          viewer.select(semanticIds, { sourceResource: agentActionResource(action, viewer) });
           return "elements.select";
         }
 
@@ -7020,20 +7708,18 @@
         });
       }
 
-      function installTerminalToolSelector(terminals) {
+      function installTerminalToolSelector(terminals, appStateStore) {
         const buttons = Array.from(document.querySelectorAll("[data-terminal-tool]"));
         const terminalMap = new Map(
           terminals
             .map((terminal) => [terminal.id, terminal.shell])
             .filter((entry) => entry[1])
         );
-        let activeTool = terminals.find((terminal) => terminal.defaultActive)?.id || terminals[0]?.id || null;
 
         const setActiveTool = (nextTool) => {
           if (!terminalMap.has(nextTool)) {
             return;
           }
-          activeTool = nextTool;
           for (const [toolId, shell] of terminalMap.entries()) {
             if (toolId === nextTool) {
               shell.activate();
@@ -7050,32 +7736,48 @@
 
         for (const button of buttons) {
           button.addEventListener("click", () => {
-            setActiveTool(button.dataset.terminalTool);
+            appStateStore.dispatch({
+              type: "terminal/set-active",
+              activeTool: button.dataset.terminalTool,
+            });
           });
         }
 
-        if (activeTool) {
-          setActiveTool(activeTool);
-        }
+        appStateStore.subscribe((state) => {
+          const activeTool =
+            state.terminal?.activeTool ||
+            terminals.find((terminal) => terminal.defaultActive)?.id ||
+            terminals[0]?.id ||
+            null;
+          if (activeTool) {
+            setActiveTool(activeTool);
+          }
+        });
 
         return {
-          activeTool: () => activeTool,
-          resize: () => terminalMap.get(activeTool)?.resize(),
-          focus: () => terminalMap.get(activeTool)?.focus(),
-          setActiveTool,
+          activeTool: () => appStateStore.getState().terminal?.activeTool || null,
+          resize: () => terminalMap.get(appStateStore.getState().terminal?.activeTool)?.resize(),
+          focus: () => terminalMap.get(appStateStore.getState().terminal?.activeTool)?.focus(),
+          setActiveTool: (activeTool) =>
+            appStateStore.dispatch({ type: "terminal/set-active", activeTool }),
         };
       }
 
       init()
-        .then(() => {
+        .then(async () => {
           const viewer = createViewerApi();
-          const graphShell = createGraphShell(viewer);
+          const initialViewer = await waitForViewerReady(viewer);
+          updateResourceCatalogState(initialViewer.catalog);
+          const graphShell = createGraphShell(viewer, appState);
           graphShell.api.installController(createGraphController(viewer));
-          const headerControls = installHeaderControls(viewer, graphShell);
+          const headerControls = installHeaderControls(viewer, graphShell, appState);
+          const outliner = installProjectOutliner(viewer, appState);
           const repl = createReplApi(viewer, graphShell.api);
+          window.wAppState = appState;
           window.wViewer = viewer;
           window.viewer = viewer;
           window.wHeader = headerControls;
+          window.wOutliner = outliner;
           window.wGraph = graphShell.api;
           window.graph = graphShell.api;
           window.wGraphShell = graphShell.bridge;
@@ -7111,23 +7813,35 @@
           window.frame = repl.frame;
           const replShell = installRepl(repl);
           const agentShell = installAgentTerminal(viewer, graphShell.api);
+          window.addEventListener("w-viewer-state-change", (event) => {
+            appState.dispatch({
+              type: "viewer/committed",
+              state: event.detail?.state || viewer.viewState(),
+              reason: event.detail?.reason || "unknown",
+            });
+          });
+          appState.dispatch({ type: "viewer/committed", state: initialViewer.state, reason: "init" });
+          let committedResource = appState.getState().committedViewerState?.resource || null;
+          appState.subscribe((state, previous) => {
+            const nextResource = state.committedViewerState?.resource || null;
+            const previousResource = previous.committedViewerState?.resource || committedResource;
+            if (!nextResource || nextResource === previousResource) {
+              return;
+            }
+            committedResource = nextResource;
+            void agentShell?.handleResourceSwitch?.(nextResource);
+          });
           installProjectResourcePickerSupport({
-            viewer,
-            graph: graphShell.api,
-            agentShell,
+            appStateStore: appState,
           });
           const terminalShell = installTerminalToolSelector([
             { id: "ai", shell: agentShell, defaultActive: true },
             { id: "js", shell: replShell },
-          ]);
+          ], appState);
           window.addEventListener("w-terminal-visibility-change", () => {
             terminalShell?.resize();
             viewer.resizeViewport();
             graphShell.resize();
-          });
-          document.getElementById("resource-picker")?.addEventListener("change", (event) => {
-            const nextResource = event?.target?.value;
-            void agentShell?.handleResourceSwitch?.(nextResource);
           });
           installLayoutResizers({
             onSidePanelResize: () => {
