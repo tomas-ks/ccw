@@ -224,7 +224,7 @@ function installIpc() {
   });
   ipcMain.on("ccw:theme", (_event, theme) => {
     nativeTheme.themeSource = theme === "light" ? "light" : "dark";
-    const color = theme === "light" ? "#fafbfb" : "#2b2d30";
+    const color = theme === "light" ? "#fafbfb" : "#24282d";
     for (const window of BrowserWindow.getAllWindows()) {
       window.setBackgroundColor(color);
     }
