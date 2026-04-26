@@ -163,6 +163,7 @@ function createWindow(baseUrl) {
   });
   mainWindow = window;
 
+  installEditAccelerators(window);
   window.loadURL(viewerUrl(baseUrl));
   syncWindowState(window);
   window.on("maximize", () => syncWindowState(window));
@@ -185,6 +186,22 @@ function createWindow(baseUrl) {
     }, autoCloseMs).unref();
   }
   return window;
+}
+
+function installEditAccelerators(window) {
+  window.webContents.on("before-input-event", (event, input) => {
+    if (input.type !== "keyDown") {
+      return;
+    }
+    const key = String(input.key || "").toLowerCase();
+    const pasteModifier = process.platform === "darwin" ? input.meta : input.control;
+    if (!pasteModifier || input.alt || key !== "v") {
+      return;
+    }
+
+    event.preventDefault();
+    window.webContents.paste();
+  });
 }
 
 function syncWindowState(window) {

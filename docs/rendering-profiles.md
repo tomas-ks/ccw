@@ -14,11 +14,13 @@ The first profiles are:
 - `architectural-v1`: solid shaded geometry plus geometry-derived crease and boundary lines
 - `architectural-v2`: solid shaded geometry plus screen-space depth and object-id outlines
 - `architectural-v3`: solid shaded geometry plus screen-space outlines and selective crease lines
+- `bim`: the default BIM presentation profile, based on `architectural-v3` plus opaque inspection
+  focus and x-ray context geometry
 - `architectural-v4`: experimental `architectural-v3` plus normal-aware screen-space ambient
   occlusion
 
-Later experimental profiles may include normal-buffer edges, hidden-line views, x-ray display,
-analysis colors, or other technical illustration styles.
+Later experimental profiles may include normal-buffer edges, hidden-line views, analysis colors, or
+other technical illustration styles.
 
 ## Ownership
 
@@ -51,7 +53,7 @@ A profile may define:
 - pass ordering
 - geometry edge overlays
 - screen-space post-processing overlays
-- selection/highlight style
+- selection, inspection, and highlight style
 - tunable visual constants such as line color, opacity, crease angle, and depth bias
 
 A profile must preserve:
@@ -144,6 +146,34 @@ presentation style.
 The architectural profiles intentionally use a softer matte surface shader than `diffuse`: the
 directional light is still present, but dark-facing surfaces keep a stronger ambient fill so models
 read more like architectural presentation geometry and less like game-lit assets.
+
+### `bim`
+
+The default BIM presentation profile. It started as `architectural-v3-inspection`, and that old
+profile name remains accepted as a compatibility alias.
+
+Inspection is runtime render state, similar to selection. It does not change geometry residency,
+visibility overrides, picking ids, IFC ids, graph ids, or the active project. Runtime state marks
+instances with a `PreparedRenderRole`:
+
+- `Normal`: regular visible geometry
+- `Selected`: selected regular geometry
+- `Inspected`: the current inspection focus
+- `InspectionContext`: visible geometry outside the current focus
+
+Pass stack:
+
+1. X-ray context pass for `InspectionContext` instances, drawn with alpha blending and no depth
+   writes.
+2. Matte solid shaded opaque pass for normal/focused geometry.
+3. Surface decal pass for normal/focused decals.
+4. Selective geometry-derived crease/detail line pass.
+5. Visible object-id pass for normal/focused geometry.
+6. Fullscreen screen-space outline pass that samples final depth and visible object id.
+
+This profile is the default for the web app and the renderer. `architectural-v3` remains available
+as the non-inspection architectural baseline, while `bim` is the everyday mode for semantic
+inspection workflows.
 
 ### `architectural-v4`
 
@@ -258,11 +288,17 @@ profile. The renderer should decide which passes and pipelines that profile impl
     - add a crease-only mesh edge pass before the fullscreen outline composite
     - keep boundary edges out of the v3 mesh pass to avoid double-drawing object boundaries
 14. Add render smoke coverage for `architectural-v3`.
-15. Implement `architectural-v4` as the normal-aware SSAO profile:
+15. Implement `bim` as the default inspection-capable BIM presentation profile:
+    - add `PreparedRenderRole` to prepared render instances
+    - let runtime inspection focus mark `Inspected` and `InspectionContext`
+    - draw context geometry through a translucent no-depth-write pass only in the BIM profile
+    - keep picking profile-independent and ID-correct
+16. Add runtime and renderer smoke coverage for `bim`.
+17. Implement `architectural-v4` as the normal-aware SSAO profile:
     - render visible opaque geometry into a view-space normal target
     - sample normal plus reverse-Z depth in a fullscreen AO overlay
     - draw v3 crease/detail lines and screen-space outlines after AO
-16. Add render smoke coverage for `architectural-v4`.
+18. Add render smoke coverage for `architectural-v4`.
 
 ## Open Decisions
 
@@ -273,5 +309,7 @@ profile. The renderer should decide which passes and pipelines that profile impl
 - What crease threshold best fits IFC sample models without exposing too much tessellation noise.
 - Whether `architectural-v3` should keep its crease-only mesh pass or eventually use a normal buffer
   for detail edges.
+- Whether `bim` should keep a single x-ray context pass or evolve into a separate
+  front/back/depth-peeled style.
 - Which semantic classes should receive explicit `outline_group_id` values once terrain tile seams
   and aggregate objects need finer control than per-instance outline suppression.

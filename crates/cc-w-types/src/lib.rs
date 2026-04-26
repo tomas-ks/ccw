@@ -1021,6 +1021,15 @@ pub struct PreparedRenderDefinition {
     pub mesh: PreparedMesh,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PreparedRenderRole {
+    #[default]
+    Normal,
+    Selected,
+    Inspected,
+    InspectionContext,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedRenderInstance {
     pub id: GeometryInstanceId,
@@ -1030,6 +1039,7 @@ pub struct PreparedRenderInstance {
     pub world_bounds: Bounds3,
     pub material: PreparedMaterial,
     pub default_render_class: DefaultRenderClass,
+    pub render_role: PreparedRenderRole,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

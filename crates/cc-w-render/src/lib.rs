@@ -2,7 +2,8 @@ use bytemuck::{Pod, Zeroable, bytes_of, cast_slice};
 use cc_w_types::{
     Bounds3, DefaultRenderClass, GeometryDefinitionId, GeometryInstanceId, PickHit, PickRegion,
     PickResult, PreparedMaterial, PreparedMesh, PreparedRenderDefinition, PreparedRenderInstance,
-    PreparedRenderScene, SemanticElementId, WORLD_FORWARD, WORLD_RIGHT, WORLD_UP,
+    PreparedRenderRole, PreparedRenderScene, SemanticElementId, WORLD_FORWARD, WORLD_RIGHT,
+    WORLD_UP,
 };
 use glam::{DMat4, DVec3, DVec4, Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
@@ -137,6 +138,64 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
     let diffuse_fill = min(lighting.factors.y, 1.0 - ambient_fill);
     let lit = ambient_fill + (diffuse * diffuse_fill);
     return vec4<f32>(input.material_color.xyz * lit, input.material_color.w);
+}
+"#;
+
+pub const INSPECTION_CONTEXT_MESH_SHADER_WGSL: &str = r#"
+struct Camera {
+    clip_from_world : mat4x4<f32>,
+};
+
+struct Lighting {
+    light_direction : vec4<f32>,
+    factors : vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera : Camera;
+
+@group(0) @binding(1)
+var<uniform> lighting : Lighting;
+
+struct VertexInput {
+    @location(0) position : vec3<f32>,
+    @location(1) normal : vec3<f32>,
+    @location(2) model_col0 : vec4<f32>,
+    @location(3) model_col1 : vec4<f32>,
+    @location(4) model_col2 : vec4<f32>,
+    @location(5) model_col3 : vec4<f32>,
+    @location(6) material_color : vec4<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) position : vec4<f32>,
+    @location(0) normal : vec3<f32>,
+    @location(1) material_color : vec4<f32>,
+};
+
+@vertex
+fn vs_main(input : VertexInput) -> VertexOutput {
+    var out : VertexOutput;
+    let model_from_object = mat4x4<f32>(
+        input.model_col0,
+        input.model_col1,
+        input.model_col2,
+        input.model_col3,
+    );
+    let world_position = model_from_object * vec4<f32>(input.position, 1.0);
+    out.position = camera.clip_from_world * world_position;
+    out.normal = (model_from_object * vec4<f32>(input.normal, 0.0)).xyz;
+    out.material_color = input.material_color;
+    return out;
+}
+
+@fragment
+fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+    let diffuse = max(dot(normalize(input.normal), normalize(lighting.light_direction.xyz)), 0.0);
+    let lit = 0.62 + diffuse * 0.22;
+    let neutral = vec3<f32>(0.48, 0.56, 0.66);
+    let tint = mix(neutral, input.material_color.xyz, 0.28) * lit;
+    return vec4<f32>(tint, 0.24);
 }
 "#;
 
@@ -1329,14 +1388,59 @@ struct GpuInstanceBatch {
 enum RenderLayer {
     Opaque,
     SurfaceDecal,
+    InspectionContextOpaque,
+    InspectionContextSurfaceDecal,
 }
 
 impl RenderLayer {
-    fn for_render_class(class: DefaultRenderClass) -> Self {
+    fn for_instance(instance: &PreparedRenderInstance) -> Self {
+        match (
+            instance.render_role,
+            RenderLayer::base_for_render_class(instance.default_render_class),
+        ) {
+            (PreparedRenderRole::InspectionContext, RenderLayer::Opaque) => {
+                Self::InspectionContextOpaque
+            }
+            (PreparedRenderRole::InspectionContext, RenderLayer::SurfaceDecal) => {
+                Self::InspectionContextSurfaceDecal
+            }
+            (_, base) => base,
+        }
+    }
+
+    fn base_for_render_class(class: DefaultRenderClass) -> Self {
         match class {
             DefaultRenderClass::SurfaceDecal => Self::SurfaceDecal,
             _ => Self::Opaque,
         }
+    }
+
+    fn draws_as_opaque(self, inspection_profile: bool) -> bool {
+        matches!(self, Self::Opaque)
+            || (!inspection_profile && matches!(self, Self::InspectionContextOpaque))
+    }
+
+    fn draws_as_surface_decal(self, inspection_profile: bool) -> bool {
+        matches!(self, Self::SurfaceDecal)
+            || (!inspection_profile && matches!(self, Self::InspectionContextSurfaceDecal))
+    }
+
+    fn draws_as_inspection_context(self) -> bool {
+        matches!(
+            self,
+            Self::InspectionContextOpaque | Self::InspectionContextSurfaceDecal
+        )
+    }
+
+    fn picks_as_opaque(self) -> bool {
+        matches!(self, Self::Opaque | Self::InspectionContextOpaque)
+    }
+
+    fn picks_as_surface_decal(self) -> bool {
+        matches!(
+            self,
+            Self::SurfaceDecal | Self::InspectionContextSurfaceDecal
+        )
     }
 }
 
@@ -1525,6 +1629,7 @@ impl ScreenSpaceAmbientOcclusionTargets {
 pub struct MeshRenderer {
     pipeline: wgpu::RenderPipeline,
     architectural_pipeline: wgpu::RenderPipeline,
+    inspection_context_pipeline: wgpu::RenderPipeline,
     surface_decal_pipeline: wgpu::RenderPipeline,
     architectural_surface_decal_pipeline: wgpu::RenderPipeline,
     reference_grid_pipeline: wgpu::RenderPipeline,
@@ -1645,6 +1750,10 @@ impl MeshRenderer {
             label: Some("w architectural mesh shader"),
             source: wgpu::ShaderSource::Wgsl(ARCHITECTURAL_MESH_SHADER_WGSL.into()),
         });
+        let inspection_context_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("w inspection context mesh shader"),
+            source: wgpu::ShaderSource::Wgsl(INSPECTION_CONTEXT_MESH_SHADER_WGSL.into()),
+        });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("w mesh pipeline"),
             layout: Some(&pipeline_layout),
@@ -1718,6 +1827,46 @@ impl MeshRenderer {
                     targets: &[Some(wgpu::ColorTargetState {
                         format: color_format,
                         blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        let inspection_context_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("w inspection context mesh pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &inspection_context_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[GpuVertex::layout(), GpuInstance::layout()],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: defaults.front_face,
+                    cull_mode: defaults.cull_mode,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: defaults.depth_format,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &inspection_context_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
@@ -2264,6 +2413,7 @@ impl MeshRenderer {
         Self {
             pipeline,
             architectural_pipeline,
+            inspection_context_pipeline,
             surface_decal_pipeline,
             architectural_surface_decal_pipeline,
             reference_grid_pipeline,
@@ -2285,7 +2435,7 @@ impl MeshRenderer {
             viewport: viewport.clamped(),
             camera,
             defaults,
-            profile: RenderProfileId::Diffuse,
+            profile: RenderProfileId::Bim,
             reference_grid_visible: false,
             reference_grid_vertex_buffer: None,
             reference_grid_vertex_count: 0,
@@ -2319,6 +2469,7 @@ impl MeshRenderer {
                     world_bounds: mesh.bounds,
                     material: PreparedMaterial::default(),
                     default_render_class: DefaultRenderClass::Physical,
+                    render_role: PreparedRenderRole::Normal,
                 }],
             },
         )
@@ -2347,6 +2498,10 @@ impl MeshRenderer {
 
         let mut opaque_instances_by_mesh = vec![Vec::new(); scene.definitions.len()];
         let mut surface_decal_instances_by_mesh = vec![Vec::new(); scene.definitions.len()];
+        let mut inspection_context_opaque_instances_by_mesh =
+            vec![Vec::new(); scene.definitions.len()];
+        let mut inspection_context_surface_decal_instances_by_mesh =
+            vec![Vec::new(); scene.definitions.len()];
         for instance in &scene.instances {
             let mesh_index = scene
                 .definitions
@@ -2371,10 +2526,17 @@ impl MeshRenderer {
                 pick_index,
                 instance.default_render_class,
             );
-            match RenderLayer::for_render_class(instance.default_render_class) {
+            match RenderLayer::for_instance(instance) {
                 RenderLayer::Opaque => opaque_instances_by_mesh[mesh_index].push(gpu_instance),
                 RenderLayer::SurfaceDecal => {
                     surface_decal_instances_by_mesh[mesh_index].push(gpu_instance);
+                }
+                RenderLayer::InspectionContextOpaque => {
+                    inspection_context_opaque_instances_by_mesh[mesh_index].push(gpu_instance);
+                }
+                RenderLayer::InspectionContextSurfaceDecal => {
+                    inspection_context_surface_decal_instances_by_mesh[mesh_index]
+                        .push(gpu_instance);
                 }
             }
         }
@@ -2390,6 +2552,34 @@ impl MeshRenderer {
                 continue;
             }
             self.upload_instance_batch(device, mesh_index, RenderLayer::SurfaceDecal, &instances);
+        }
+        for (mesh_index, instances) in inspection_context_opaque_instances_by_mesh
+            .into_iter()
+            .enumerate()
+        {
+            if instances.is_empty() {
+                continue;
+            }
+            self.upload_instance_batch(
+                device,
+                mesh_index,
+                RenderLayer::InspectionContextOpaque,
+                &instances,
+            );
+        }
+        for (mesh_index, instances) in inspection_context_surface_decal_instances_by_mesh
+            .into_iter()
+            .enumerate()
+        {
+            if instances.is_empty() {
+                continue;
+            }
+            self.upload_instance_batch(
+                device,
+                mesh_index,
+                RenderLayer::InspectionContextSurfaceDecal,
+                &instances,
+            );
         }
 
         self.upload_reference_grid(device, scene.bounds);
@@ -2582,10 +2772,12 @@ impl MeshRenderer {
             return;
         }
 
+        let inspection_profile = self.profile == RenderProfileId::Bim;
         let needs_depth_sampling = matches!(
             self.profile,
             RenderProfileId::ArchitecturalV2
                 | RenderProfileId::ArchitecturalV3
+                | RenderProfileId::Bim
                 | RenderProfileId::ArchitecturalV4
         ) && device.is_some();
         {
@@ -2626,13 +2818,28 @@ impl MeshRenderer {
             } else {
                 &self.surface_decal_pipeline
             };
-            pass.set_pipeline(mesh_pipeline);
             pass.set_bind_group(0, &self.scene_bind_group, &[]);
 
+            if inspection_profile {
+                pass.set_pipeline(&self.inspection_context_pipeline);
+                for batch in self
+                    .instance_batches
+                    .iter()
+                    .filter(|batch| batch.render_layer.draws_as_inspection_context())
+                {
+                    let mesh = &self.meshes[batch.mesh_index];
+                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
+                    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
+                }
+            }
+
+            pass.set_pipeline(mesh_pipeline);
             for batch in self
                 .instance_batches
                 .iter()
-                .filter(|batch| batch.render_layer == RenderLayer::Opaque)
+                .filter(|batch| batch.render_layer.draws_as_opaque(inspection_profile))
             {
                 let mesh = &self.meshes[batch.mesh_index];
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -2642,11 +2849,11 @@ impl MeshRenderer {
             }
 
             pass.set_pipeline(surface_decal_pipeline);
-            for batch in self
-                .instance_batches
-                .iter()
-                .filter(|batch| batch.render_layer == RenderLayer::SurfaceDecal)
-            {
+            for batch in self.instance_batches.iter().filter(|batch| {
+                batch
+                    .render_layer
+                    .draws_as_surface_decal(inspection_profile)
+            }) {
                 let mesh = &self.meshes[batch.mesh_index];
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
@@ -2661,7 +2868,10 @@ impl MeshRenderer {
             if self.profile == RenderProfileId::ArchitecturalV1 {
                 self.draw_mesh_edges(&mut pass);
             }
-            if self.profile == RenderProfileId::ArchitecturalV3 {
+            if matches!(
+                self.profile,
+                RenderProfileId::ArchitecturalV3 | RenderProfileId::Bim
+            ) {
                 self.draw_mesh_crease_edges(&mut pass);
             }
         }
@@ -2709,11 +2919,12 @@ impl MeshRenderer {
         pass: &mut wgpu::RenderPass<'pass>,
         pipeline: &'pass wgpu::RenderPipeline,
     ) {
+        let inspection_profile = self.profile == RenderProfileId::Bim;
         pass.set_pipeline(pipeline);
         for batch in self
             .instance_batches
             .iter()
-            .filter(|batch| batch.render_layer == RenderLayer::Opaque)
+            .filter(|batch| batch.render_layer.draws_as_opaque(inspection_profile))
         {
             let mesh = &self.meshes[batch.mesh_index];
             let Some(edge_vertex_buffer) = &mesh.edge_vertex_buffer else {
@@ -2797,7 +3008,7 @@ impl MeshRenderer {
         for batch in self
             .instance_batches
             .iter()
-            .filter(|batch| batch.render_layer == RenderLayer::Opaque)
+            .filter(|batch| batch.render_layer.draws_as_opaque(false))
         {
             let mesh = &self.meshes[batch.mesh_index];
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -2884,10 +3095,11 @@ impl MeshRenderer {
         pass.set_pipeline(&self.outline_id_pipeline);
         pass.set_bind_group(0, &self.scene_bind_group, &[]);
 
+        let inspection_profile = self.profile == RenderProfileId::Bim;
         for batch in self
             .instance_batches
             .iter()
-            .filter(|batch| batch.render_layer == RenderLayer::Opaque)
+            .filter(|batch| batch.render_layer.draws_as_opaque(inspection_profile))
         {
             let mesh = &self.meshes[batch.mesh_index];
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -2984,7 +3196,7 @@ impl MeshRenderer {
         for batch in self
             .instance_batches
             .iter()
-            .filter(|batch| batch.render_layer == RenderLayer::Opaque)
+            .filter(|batch| batch.render_layer.picks_as_opaque())
         {
             let mesh = &self.meshes[batch.mesh_index];
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -2997,7 +3209,7 @@ impl MeshRenderer {
         for batch in self
             .instance_batches
             .iter()
-            .filter(|batch| batch.render_layer == RenderLayer::SurfaceDecal)
+            .filter(|batch| batch.render_layer.picks_as_surface_decal())
         {
             let mesh = &self.meshes[batch.mesh_index];
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -3314,6 +3526,7 @@ fn uses_architectural_surface_lighting(profile: RenderProfileId) -> bool {
         RenderProfileId::ArchitecturalV1
             | RenderProfileId::ArchitecturalV2
             | RenderProfileId::ArchitecturalV3
+            | RenderProfileId::Bim
             | RenderProfileId::ArchitecturalV4
     )
 }
@@ -3323,6 +3536,7 @@ fn uses_screen_space_outline(profile: RenderProfileId) -> bool {
         profile,
         RenderProfileId::ArchitecturalV2
             | RenderProfileId::ArchitecturalV3
+            | RenderProfileId::Bim
             | RenderProfileId::ArchitecturalV4
     )
 }
@@ -3452,6 +3666,7 @@ pub async fn render_prepared_mesh_offscreen(
                 world_bounds: mesh.bounds,
                 material: PreparedMaterial::default(),
                 default_render_class: DefaultRenderClass::Physical,
+                render_role: PreparedRenderRole::Normal,
             }],
         },
         viewport,
@@ -3650,8 +3865,8 @@ mod tests {
     use super::*;
     use cc_w_types::{
         Bounds3, DisplayColor, GeometryDefinitionId, GeometryInstanceId, PreparedMaterial,
-        PreparedRenderDefinition, PreparedRenderInstance, PreparedRenderScene, PreparedVertex,
-        WORLD_UP,
+        PreparedRenderDefinition, PreparedRenderInstance, PreparedRenderRole, PreparedRenderScene,
+        PreparedVertex, WORLD_UP,
     };
     use glam::DVec3;
 
@@ -3780,9 +3995,43 @@ mod tests {
         assert!(uses_architectural_surface_lighting(
             RenderProfileId::ArchitecturalV3
         ));
+        assert!(uses_architectural_surface_lighting(RenderProfileId::Bim));
         assert!(uses_architectural_surface_lighting(
             RenderProfileId::ArchitecturalV4
         ));
+    }
+
+    #[test]
+    fn inspection_context_instances_use_context_layers_only_in_inspection_profile() {
+        let base_instance = PreparedRenderInstance {
+            id: GeometryInstanceId(1),
+            element_id: SemanticElementId::new("synthetic/context"),
+            definition_id: GeometryDefinitionId(7),
+            model_from_object: DMat4::IDENTITY,
+            world_bounds: Bounds3::zero(),
+            material: PreparedMaterial::default(),
+            default_render_class: DefaultRenderClass::Physical,
+            render_role: PreparedRenderRole::InspectionContext,
+        };
+        let opaque_layer = RenderLayer::for_instance(&base_instance);
+        assert_eq!(opaque_layer, RenderLayer::InspectionContextOpaque);
+        assert!(opaque_layer.draws_as_opaque(false));
+        assert!(!opaque_layer.draws_as_opaque(true));
+        assert!(opaque_layer.draws_as_inspection_context());
+        assert!(opaque_layer.picks_as_opaque());
+
+        let surface_decal_instance = PreparedRenderInstance {
+            default_render_class: DefaultRenderClass::SurfaceDecal,
+            ..base_instance
+        };
+        let surface_decal_layer = RenderLayer::for_instance(&surface_decal_instance);
+        assert_eq!(
+            surface_decal_layer,
+            RenderLayer::InspectionContextSurfaceDecal
+        );
+        assert!(surface_decal_layer.draws_as_surface_decal(false));
+        assert!(!surface_decal_layer.draws_as_surface_decal(true));
+        assert!(surface_decal_layer.picks_as_surface_decal());
     }
 
     #[test]
@@ -3968,6 +4217,7 @@ mod tests {
                     world_bounds: mesh.bounds.transformed(left_transform),
                     material: PreparedMaterial::default(),
                     default_render_class: DefaultRenderClass::Physical,
+                    render_role: PreparedRenderRole::Normal,
                 },
                 PreparedRenderInstance {
                     id: GeometryInstanceId(2),
@@ -3977,6 +4227,7 @@ mod tests {
                     world_bounds: mesh.bounds.transformed(right_transform),
                     material: PreparedMaterial::default(),
                     default_render_class: DefaultRenderClass::Physical,
+                    render_role: PreparedRenderRole::Normal,
                 },
             ],
         };
@@ -4075,6 +4326,7 @@ mod tests {
                         world_bounds: mesh.bounds,
                         material: PreparedMaterial::default(),
                         default_render_class: DefaultRenderClass::Physical,
+                        render_role: PreparedRenderRole::Normal,
                     },
                     PreparedRenderInstance {
                         id: GeometryInstanceId(2),
@@ -4086,6 +4338,7 @@ mod tests {
                             .transformed(DMat4::from_translation(DVec3::new(5.0, 0.0, 0.0))),
                         material: PreparedMaterial::new(DisplayColor::new(0.9, 0.3, 0.2)),
                         default_render_class: DefaultRenderClass::Physical,
+                        render_role: PreparedRenderRole::Normal,
                     },
                     PreparedRenderInstance {
                         id: GeometryInstanceId(3),
@@ -4097,6 +4350,7 @@ mod tests {
                             .transformed(DMat4::from_translation(DVec3::new(2.5, 0.0, 0.0))),
                         material: PreparedMaterial::new(DisplayColor::new(1.0, 1.0, 1.0)),
                         default_render_class: DefaultRenderClass::SurfaceDecal,
+                        render_role: PreparedRenderRole::Normal,
                     },
                 ],
             };
@@ -4197,6 +4451,7 @@ mod tests {
                         world_bounds: mesh.bounds.transformed(left_transform),
                         material: PreparedMaterial::default(),
                         default_render_class: DefaultRenderClass::Physical,
+                        render_role: PreparedRenderRole::Normal,
                     },
                     PreparedRenderInstance {
                         id: GeometryInstanceId(2),
@@ -4206,6 +4461,7 @@ mod tests {
                         world_bounds: mesh.bounds.transformed(right_transform),
                         material: PreparedMaterial::new(DisplayColor::new(0.9, 0.3, 0.2)),
                         default_render_class: DefaultRenderClass::Physical,
+                        render_role: PreparedRenderRole::Normal,
                     },
                 ],
             };
@@ -4222,6 +4478,7 @@ mod tests {
             for profile in [
                 RenderProfileId::ArchitecturalV2,
                 RenderProfileId::ArchitecturalV3,
+                RenderProfileId::Bim,
                 RenderProfileId::ArchitecturalV4,
             ] {
                 renderer.set_profile(profile);

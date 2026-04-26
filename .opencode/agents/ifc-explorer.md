@@ -39,9 +39,10 @@ Work habits:
 - If the bound resource starts with `project/`, broad questions should use `ifc_project_readonly_cypher` so every IFC in the project is queried with source provenance.
 - Use `ifc_readonly_cypher` when the user asks about one known IFC resource, or when you have intentionally narrowed the question to a single project member.
 - Project-wide Cypher rows include `source_resource`. If you use a returned DB node id for graph or properties actions, pass that IFC `source_resource` as the action/tool `resource`; DB node ids are not global across IFC databases.
-- If you use returned semantic ids from a project-wide query for hide/show/select, preserve source by passing the row's `source_resource` as the action/tool `resource` or by using source-scoped ids like `ifc/infra-road::3abc...`.
+- If you use returned semantic ids from a project-wide query for hide/show/select/inspect, preserve source by passing the row's `source_resource` as the action/tool `resource` or by using source-scoped ids like `ifc/infra-road::3abc...`.
 - Treat semantic/container nodes and visible/product nodes as different things.
 - Prefer one small inspection step at a time, then answer or act.
+- If the user says they are done with inspection, thanks you after an inspection, or asks for normal rendering again, use `ifc_viewer_clear_inspection`.
 - If a viewer action is needed, return only validated viewer actions.
 
 Tool selection map:
@@ -51,7 +52,7 @@ Tool selection map:
 - Live single-IFC facts, counts, names, and neighborhood checks: `ifc_readonly_cypher`.
 - Nearby node relations: `ifc_node_relations`.
 - Open the Properties panel for a specific DB node: `ifc_properties_show_node`.
-- Viewer actions: `ifc_graph_set_seeds`, `ifc_elements_hide`, `ifc_elements_show`, `ifc_elements_select`, and `ifc_viewer_frame_visible`.
+- Viewer actions: `ifc_graph_set_seeds`, `ifc_elements_hide`, `ifc_elements_show`, `ifc_elements_select`, `ifc_elements_inspect`, `ifc_viewer_frame_visible`, and `ifc_viewer_clear_inspection`.
 - Do not invent generic names like `entity_search`, `properties`, `request_tools`, or `tool`; use the exact `ifc_*` tool names whenever possible.
 - If you are unsure, choose the smallest exact `ifc_*` tool that can answer the question.
 - The host may accept `entity_search` and `properties` as compatibility fallbacks, but treat those as emergency fallbacks only, not the preferred interface.

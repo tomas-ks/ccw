@@ -7,8 +7,8 @@ use cc_w_types::{
     GeometryPrioritizedStreamPlan, GeometryStartViewRequest, GeometryStreamPlan,
     GeometryStreamPlanReason, GeometryStreamingBudget, PreparedGeometryDefinition,
     PreparedGeometryElement, PreparedGeometryInstance, PreparedGeometryPackage, PreparedMaterial,
-    PreparedRenderDefinition, PreparedRenderInstance, PreparedRenderScene, ResidencyState,
-    ResolvedGeometryStartView, SemanticElementId,
+    PreparedRenderDefinition, PreparedRenderInstance, PreparedRenderRole, PreparedRenderScene,
+    ResidencyState, ResolvedGeometryStartView, SemanticElementId,
 };
 use glam::{DVec3, DVec4};
 use std::collections::{HashMap, HashSet};
@@ -117,6 +117,7 @@ pub struct RuntimeElementState {
     pub visibility: ElementVisibilityOverride,
     pub suppressed: bool,
     pub selected: bool,
+    pub inspected: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -312,6 +313,19 @@ impl RuntimeSceneState {
             .collect()
     }
 
+    pub fn inspected_element_ids(&self) -> Vec<SemanticElementId> {
+        self.catalog
+            .elements
+            .iter()
+            .filter(|element| {
+                self.elements_by_id
+                    .get(&element.id)
+                    .is_some_and(|indexed| indexed.state.inspected)
+            })
+            .map(|element| element.id.clone())
+            .collect()
+    }
+
     pub fn visible_element_ids(&self) -> Vec<SemanticElementId> {
         self.catalog
             .elements
@@ -416,7 +430,7 @@ impl RuntimeSceneState {
             let Some(indexed) = self.elements_by_id.get(&element_id) else {
                 continue;
             };
-            let selected = indexed.state.selected;
+            let selected = indexed.state.selected || indexed.state.inspected;
             for instance_index in &indexed.instance_indices {
                 let Some(instance) = self.catalog.instances.get(*instance_index) else {
                     continue;
@@ -680,6 +694,37 @@ impl RuntimeSceneState {
         changed
     }
 
+    pub fn set_inspection_focus<'a, I>(&mut self, ids: I) -> usize
+    where
+        I: IntoIterator<Item = &'a SemanticElementId>,
+    {
+        let focused_ids = ids
+            .into_iter()
+            .filter(|id| self.elements_by_id.contains_key(*id))
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut changed = 0;
+        for (id, indexed) in self.elements_by_id.iter_mut() {
+            let inspected = focused_ids.contains(id);
+            if indexed.state.inspected != inspected {
+                indexed.state.inspected = inspected;
+                changed += 1;
+            }
+        }
+        changed
+    }
+
+    pub fn clear_inspection(&mut self) -> usize {
+        let mut changed = 0;
+        for indexed in self.elements_by_id.values_mut() {
+            if indexed.state.inspected {
+                indexed.state.inspected = false;
+                changed += 1;
+            }
+        }
+        changed
+    }
+
     pub fn visible_bounds(&self) -> Option<Bounds3> {
         self.bounds_for_elements(self.visible_element_ids().iter())
     }
@@ -734,6 +779,7 @@ impl RuntimeSceneState {
                     })
             })
             .collect::<Vec<_>>();
+        let inspection_active = self.inspection_active();
         let instances = visible_instances
             .into_iter()
             .filter_map(|instance| {
@@ -750,6 +796,8 @@ impl RuntimeSceneState {
                             .element(&resident_instance.element_id)
                             .map(|element| element.default_render_class)
                             .unwrap_or(DefaultRenderClass::Physical),
+                        render_role: self
+                            .render_role_for_instance(resident_instance, inspection_active),
                     })
             })
             .collect::<Vec<_>>();
@@ -860,6 +908,33 @@ impl RuntimeSceneState {
             }
         }
         changed
+    }
+
+    fn inspection_active(&self) -> bool {
+        self.elements_by_id
+            .values()
+            .any(|indexed| indexed.state.inspected)
+    }
+
+    fn render_role_for_instance(
+        &self,
+        instance: &cc_w_types::GeometryInstanceCatalogEntry,
+        inspection_active: bool,
+    ) -> PreparedRenderRole {
+        let Some(indexed) = self.elements_by_id.get(&instance.element_id) else {
+            return PreparedRenderRole::Normal;
+        };
+        if inspection_active {
+            if indexed.state.inspected {
+                PreparedRenderRole::Inspected
+            } else {
+                PreparedRenderRole::InspectionContext
+            }
+        } else if indexed.state.selected {
+            PreparedRenderRole::Selected
+        } else {
+            PreparedRenderRole::Normal
+        }
     }
 
     fn material_for_instance(
@@ -2290,6 +2365,61 @@ mod tests {
         assert_eq!(
             render_scene.instances[1].material.color.as_rgb(),
             [0.24, 0.78, 0.55]
+        );
+    }
+
+    #[test]
+    fn runtime_scene_inspection_focus_replaces_focus_and_marks_context_roles() {
+        let left_id = SemanticElementId::new("synthetic/mapped/left");
+        let right_id = SemanticElementId::new("synthetic/mapped/right");
+        let mut runtime_scene = RuntimeSceneState::from_prepared_package(mapped_triangle_package(
+            "Synthetic Mapped Triangle",
+            "synthetic/mapped/left",
+        ))
+        .expect("scene");
+
+        assert_eq!(runtime_scene.set_inspection_focus([&right_id]), 1);
+        assert_eq!(
+            runtime_scene.inspected_element_ids(),
+            vec![right_id.clone()]
+        );
+
+        let render_scene = runtime_scene.compose_render_scene();
+        assert_eq!(
+            render_scene
+                .instances
+                .iter()
+                .map(|instance| (&instance.element_id, instance.render_role))
+                .collect::<Vec<_>>(),
+            vec![
+                (&left_id, PreparedRenderRole::InspectionContext),
+                (&right_id, PreparedRenderRole::Inspected)
+            ]
+        );
+
+        assert_eq!(runtime_scene.set_inspection_focus([&left_id]), 2);
+        assert_eq!(runtime_scene.inspected_element_ids(), vec![left_id.clone()]);
+        let render_scene = runtime_scene.compose_render_scene();
+        assert_eq!(
+            render_scene
+                .instances
+                .iter()
+                .map(|instance| (&instance.element_id, instance.render_role))
+                .collect::<Vec<_>>(),
+            vec![
+                (&left_id, PreparedRenderRole::Inspected),
+                (&right_id, PreparedRenderRole::InspectionContext)
+            ]
+        );
+
+        assert_eq!(runtime_scene.clear_inspection(), 1);
+        let render_scene = runtime_scene.compose_render_scene();
+        assert!(runtime_scene.inspected_element_ids().is_empty());
+        assert!(
+            render_scene
+                .instances
+                .iter()
+                .all(|instance| instance.render_role == PreparedRenderRole::Normal)
         );
     }
 

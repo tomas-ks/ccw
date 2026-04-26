@@ -27,7 +27,8 @@ This project is an IFC-focused renderer and semantic exploration tool. The 3D vi
 - Viewer actions are allowed and expected when the user asks for a viewer change. Read-only restrictions apply to database inspection, not to validated viewer actions.
 - `graph.set_seeds` expects DB node ids, typically returned as `id(n) AS node_id`.
 - `properties.show_node` expects exactly one DB node id and is useful when you want the Properties tab to open on a node you are discussing.
-- `elements.hide`, `elements.show`, and `elements.select` expect renderable semantic ids, typically returned from `GlobalId` / `global_id`.
+- `elements.hide`, `elements.show`, `elements.select`, and `elements.inspect` expect renderable semantic ids, typically returned from `GlobalId` / `global_id`.
+- `viewer.clear_inspection` expects no ids and clears the current inspection focus.
 - Do not wrap `id(...)` in `toString(...)`; when you need graph ids, return raw numeric ids as `id(n) AS node_id`.
 - If you only have DB node ids, use graph actions rather than element actions.
 

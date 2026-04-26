@@ -464,6 +464,32 @@ export const elements_select = tool({
   },
 });
 
+export const elements_inspect = tool({
+  description:
+    "Ask the host viewer to set the inspection focus to one or more renderable semantic ids, drawing those elements opaque while the surrounding scene can be x-rayed by an inspection render profile.",
+  args: {
+    semantic_ids: tool.schema
+      .array(tool.schema.string())
+      .min(1)
+      .describe("Renderable semantic ids to inspect. In project mode these may be source-scoped as ifc/resource::GlobalId"),
+    resource: tool.schema
+      .string()
+      .optional()
+      .describe("IFC resource the semantic ids came from, for example ifc/infra-road"),
+    why: tool.schema.string().optional().describe("Short reason for the viewer action"),
+  },
+  async execute(args) {
+    const count = args.semantic_ids.length;
+    const reason = args.why?.trim();
+    return [
+      `Prepared elements.inspect for ${count} element${count === 1 ? "" : "s"}.`,
+      reason ? `Why: ${reason}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  },
+});
+
 export const viewer_frame_visible = tool({
   description: "Ask the host viewer to frame the visible scene.",
   args: {
@@ -475,6 +501,20 @@ export const viewer_frame_visible = tool({
       "Prepared viewer.frame_visible.",
       reason ? `Why: ${reason}` : null,
     ]
+      .filter(Boolean)
+      .join("\n");
+  },
+});
+
+export const viewer_clear_inspection = tool({
+  description:
+    "Ask the host viewer to clear the current inspection focus and return the scene to normal rendering.",
+  args: {
+    why: tool.schema.string().optional().describe("Short reason for clearing inspection"),
+  },
+  async execute(args) {
+    const reason = args.why?.trim();
+    return ["Prepared viewer.clear_inspection.", reason ? `Why: ${reason}` : null]
       .filter(Boolean)
       .join("\n");
   },

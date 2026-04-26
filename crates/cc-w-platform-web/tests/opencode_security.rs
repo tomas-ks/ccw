@@ -224,7 +224,9 @@ fn strict_ifc_agent_config_is_deny_by_default_and_mentions_only_canonical_ifc_to
         "ifc_elements_hide",
         "ifc_elements_show",
         "ifc_elements_select",
+        "ifc_elements_inspect",
         "ifc_viewer_frame_visible",
+        "ifc_viewer_clear_inspection",
     ] {
         assert!(
             backticked_tokens.contains(token),
@@ -410,7 +412,9 @@ fn playbook_and_cypher_debug_agent_is_deny_by_default_and_uses_two_tools() {
             && !backticked_tokens.contains("ifc_elements_hide")
             && !backticked_tokens.contains("ifc_elements_show")
             && !backticked_tokens.contains("ifc_elements_select")
-            && !backticked_tokens.contains("ifc_viewer_frame_visible"),
+            && !backticked_tokens.contains("ifc_elements_inspect")
+            && !backticked_tokens.contains("ifc_viewer_frame_visible")
+            && !backticked_tokens.contains("ifc_viewer_clear_inspection"),
         "the two-tool debug agent should not mention any other IFC tools"
     );
 }

@@ -180,7 +180,9 @@ Initial action set:
 - `elements.hide`
 - `elements.show`
 - `elements.select`
+- `elements.inspect`
 - `viewer.frame_visible`
+- `viewer.clear_inspection`
 
 Example:
 
@@ -190,10 +192,14 @@ Example:
     { "kind": "graph.set_seeds", "dbNodeIds": [395, 396, 397] },
     { "kind": "elements.hide", "semanticIds": ["2iPwJwpPDCSgMheXwk9cBT"] },
     { "kind": "elements.select", "semanticIds": ["12UVOn4wvAJPMUExKdZLb8"] },
+    { "kind": "elements.inspect", "semanticIds": ["12UVOn4wvAJPMUExKdZLb8"] },
     { "kind": "viewer.frame_visible" }
   ]
 }
 ```
+
+Use `viewer.clear_inspection` as a separate viewer action when the user asks to leave
+inspection mode or return to normal rendering.
 
 The server must reject:
 

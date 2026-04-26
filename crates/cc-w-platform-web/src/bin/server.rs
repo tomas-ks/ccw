@@ -1295,8 +1295,16 @@ enum AgentUiAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resource: Option<String>,
     },
+    #[serde(rename = "elements.inspect")]
+    ElementsInspect {
+        semantic_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "viewer.frame_visible")]
     ViewerFrameVisible,
+    #[serde(rename = "viewer.clear_inspection")]
+    ViewerClearInspection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1344,6 +1352,15 @@ impl AgentActionCandidate {
         }
     }
 
+    fn elements_inspect(semantic_ids: Vec<String>) -> Self {
+        Self {
+            kind: "elements.inspect".to_owned(),
+            semantic_ids,
+            db_node_ids: Vec::new(),
+            resource: None,
+        }
+    }
+
     fn properties_show_node(db_node_id: i64) -> Self {
         Self {
             kind: "properties.show_node".to_owned(),
@@ -1356,6 +1373,15 @@ impl AgentActionCandidate {
     fn viewer_frame_visible() -> Self {
         Self {
             kind: "viewer.frame_visible".to_owned(),
+            semantic_ids: Vec::new(),
+            db_node_ids: Vec::new(),
+            resource: None,
+        }
+    }
+
+    fn viewer_clear_inspection() -> Self {
+        Self {
+            kind: "viewer.clear_inspection".to_owned(),
             semantic_ids: Vec::new(),
             db_node_ids: Vec::new(),
             resource: None,
@@ -5215,7 +5241,15 @@ fn agent_ui_action_from_backend(action: BackendAgentUiAction) -> AgentUiAction {
             semantic_ids,
             resource,
         },
+        BackendAgentUiAction::ElementsInspect {
+            semantic_ids,
+            resource,
+        } => AgentUiAction::ElementsInspect {
+            semantic_ids,
+            resource,
+        },
         BackendAgentUiAction::ViewerFrameVisible => AgentUiAction::ViewerFrameVisible,
+        BackendAgentUiAction::ViewerClearInspection => AgentUiAction::ViewerClearInspection,
     }
 }
 
@@ -5578,11 +5612,27 @@ fn validate_agent_action_candidate(
                 resource: candidate.resource,
             })
         }
+        "elements.inspect" => {
+            if !candidate.db_node_ids.is_empty() {
+                return Err("elements.inspect does not accept dbNodeIds".to_owned());
+            }
+            let semantic_ids = normalize_agent_semantic_ids(candidate.semantic_ids)?;
+            Ok(AgentUiAction::ElementsInspect {
+                semantic_ids,
+                resource: candidate.resource,
+            })
+        }
         "viewer.frame_visible" => {
             if !candidate.semantic_ids.is_empty() || !candidate.db_node_ids.is_empty() {
                 return Err("viewer.frame_visible does not accept ids".to_owned());
             }
             Ok(AgentUiAction::ViewerFrameVisible)
+        }
+        "viewer.clear_inspection" => {
+            if !candidate.semantic_ids.is_empty() || !candidate.db_node_ids.is_empty() {
+                return Err("viewer.clear_inspection does not accept ids".to_owned());
+            }
+            Ok(AgentUiAction::ViewerClearInspection)
         }
         other => Err(format!("unsupported agent UI action kind `{other}`")),
     }
@@ -5597,13 +5647,17 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
     let mut show_seen = HashSet::new();
     let mut merged_select_groups = Vec::<(Option<String>, Vec<String>)>::new();
     let mut select_seen = HashSet::new();
+    let mut merged_inspect_groups = Vec::<(Option<String>, Vec<String>)>::new();
+    let mut inspect_seen = HashSet::new();
     let mut latest_properties_node = None::<(i64, Option<String>)>;
     let mut graph_set_seeds_present = false;
     let mut properties_show_present = false;
     let mut elements_hide_present = false;
     let mut elements_show_present = false;
     let mut elements_select_present = false;
+    let mut elements_inspect_present = false;
     let mut frame_visible_present = false;
+    let mut clear_inspection_present = false;
     let mut order = Vec::new();
 
     for action in actions {
@@ -5690,10 +5744,33 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                     );
                 }
             }
+            AgentUiAction::ElementsInspect {
+                semantic_ids,
+                resource,
+            } => {
+                if !elements_inspect_present {
+                    order.push(5u8);
+                    elements_inspect_present = true;
+                }
+                for semantic_id in semantic_ids {
+                    push_semantic_action_group(
+                        &mut merged_inspect_groups,
+                        &mut inspect_seen,
+                        resource.clone(),
+                        semantic_id,
+                    );
+                }
+            }
             AgentUiAction::ViewerFrameVisible => {
                 if !frame_visible_present {
-                    order.push(5u8);
+                    order.push(6u8);
                     frame_visible_present = true;
+                }
+            }
+            AgentUiAction::ViewerClearInspection => {
+                if !clear_inspection_present {
+                    order.push(7u8);
+                    clear_inspection_present = true;
                 }
             }
         }
@@ -5753,7 +5830,27 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                     }
                 }
             }
-            5 => normalized.push(AgentUiAction::ViewerFrameVisible),
+            5 if merged_inspect_groups.iter().any(|(_, ids)| !ids.is_empty()) => {
+                let semantic_ids = merged_inspect_groups
+                    .iter()
+                    .flat_map(|(resource, ids)| {
+                        ids.iter().map(move |semantic_id| match resource {
+                            Some(resource) if !semantic_id.contains("::") => {
+                                format!("{resource}::{semantic_id}")
+                            }
+                            _ => semantic_id.clone(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if !semantic_ids.is_empty() {
+                    normalized.push(AgentUiAction::ElementsInspect {
+                        semantic_ids,
+                        resource: None,
+                    });
+                }
+            }
+            6 => normalized.push(AgentUiAction::ViewerFrameVisible),
+            7 => normalized.push(AgentUiAction::ViewerClearInspection),
             _ => {}
         }
     }
@@ -7990,7 +8087,10 @@ mod tests {
                 "A".to_owned(),
                 "B".to_owned(),
             ]),
+            AgentActionCandidate::elements_inspect(vec!["C".to_owned(), "C".to_owned()])
+                .with_resource("ifc/building-hvac"),
             AgentActionCandidate::viewer_frame_visible(),
+            AgentActionCandidate::viewer_clear_inspection(),
         ])
         .unwrap();
 
@@ -8009,7 +8109,12 @@ mod tests {
                     semantic_ids: vec!["A".to_owned(), "B".to_owned()],
                     resource: None,
                 },
+                AgentUiAction::ElementsInspect {
+                    semantic_ids: vec!["ifc/building-hvac::C".to_owned()],
+                    resource: None,
+                },
                 AgentUiAction::ViewerFrameVisible,
+                AgentUiAction::ViewerClearInspection,
             ]
         );
     }
@@ -8039,6 +8144,28 @@ mod tests {
                     resource: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn agent_action_validation_merges_inspection_focus_across_resources() {
+        let actions = validate_agent_action_candidates(vec![
+            AgentActionCandidate::elements_inspect(vec!["hvac-a".to_owned()])
+                .with_resource("ifc/building-hvac"),
+            AgentActionCandidate::elements_inspect(vec!["arch-a".to_owned(), "arch-a".to_owned()])
+                .with_resource("ifc/building-architecture"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            actions,
+            vec![AgentUiAction::ElementsInspect {
+                semantic_ids: vec![
+                    "ifc/building-hvac::hvac-a".to_owned(),
+                    "ifc/building-architecture::arch-a".to_owned(),
+                ],
+                resource: None,
+            }]
         );
     }
 

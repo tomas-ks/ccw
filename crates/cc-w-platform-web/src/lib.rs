@@ -1577,6 +1577,7 @@ struct WebViewerViewState {
     base_visible_element_ids: Vec<String>,
     visible_element_ids: Vec<String>,
     selected_element_ids: Vec<String>,
+    inspected_element_ids: Vec<String>,
     selected_instance_ids: Vec<u64>,
     picked_instance_ids: Vec<u64>,
     hidden_element_ids: Vec<String>,
@@ -2187,6 +2188,15 @@ pub fn viewer_selected_element_ids() -> Result<Array, JsValue> {
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
+pub fn viewer_inspected_element_ids() -> Result<Array, JsValue> {
+    with_web_viewer_state(|state| {
+        let ids = state.runtime_scene.inspected_element_ids();
+        Ok(semantic_ids_to_array(ids.iter()))
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
 pub fn viewer_hide_elements(ids: Array) -> Result<u32, JsValue> {
     let (changed, events) = with_web_viewer_state_mut(|state| {
         let ids = semantic_ids_from_array(&ids)?;
@@ -2311,6 +2321,37 @@ pub fn viewer_clear_selection() -> Result<u32, JsValue> {
         let mut events = vec![state.upload_runtime_scene(false)?];
         if changed > 0 {
             events.push(state.viewer_state_change_event("selection")?);
+        }
+        Ok((changed, events))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(changed)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_inspect_elements(ids: Array) -> Result<u32, JsValue> {
+    let (changed, events) = with_web_viewer_state_mut(|state| {
+        let ids = semantic_ids_from_array(&ids)?;
+        let changed = state.runtime_scene.set_inspection_focus(ids.iter()) as u32;
+        let mut events = vec![state.upload_runtime_scene(false)?];
+        if changed > 0 {
+            events.push(state.viewer_state_change_event("inspection")?);
+        }
+        Ok((changed, events))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(changed)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_clear_inspection() -> Result<u32, JsValue> {
+    let (changed, events) = with_web_viewer_state_mut(|state| {
+        let changed = state.runtime_scene.clear_inspection() as u32;
+        let mut events = vec![state.upload_runtime_scene(false)?];
+        if changed > 0 {
+            events.push(state.viewer_state_change_event("inspection")?);
         }
         Ok((changed, events))
     })?;
@@ -2764,7 +2805,7 @@ impl WebViewerApp {
             camera,
             defaults,
         );
-        renderer.set_profile(RenderProfileId::ArchitecturalV3);
+        renderer.set_profile(RenderProfileId::Bim);
         renderer.set_reference_grid_visible(true);
         renderer.upload_prepared_scene(&device, &queue, &render_scene);
         populate_render_profile_picker(&profile_picker, renderer.available_profiles());
@@ -3676,6 +3717,9 @@ impl WebViewerState {
             ),
             visible_element_ids: semantic_ids_to_strings(self.runtime_scene.visible_element_ids()),
             selected_element_ids: semantic_ids_to_strings(selected_element_ids.clone()),
+            inspected_element_ids: semantic_ids_to_strings(
+                self.runtime_scene.inspected_element_ids(),
+            ),
             selected_instance_ids,
             picked_instance_ids: self
                 .last_pick_hits
@@ -4308,6 +4352,7 @@ fn web_viewer_status_line(runtime_scene: &RuntimeSceneState, profile: RenderProf
     let visible_elements = runtime_scene.visible_element_ids().len();
     let total_elements = catalog.elements.len();
     let selected_elements = runtime_scene.selected_element_ids().len();
+    let inspected_elements = runtime_scene.inspected_element_ids().len();
     let view_mode = match web_view_mode_name(runtime_scene.start_view_request()) {
         "default" => "Default",
         "minimal" => "Minimal",
@@ -4324,8 +4369,13 @@ fn web_viewer_status_line(runtime_scene: &RuntimeSceneState, profile: RenderProf
             missing.definition_ids.len()
         )
     };
+    let inspection_status = if inspected_elements == 0 {
+        String::new()
+    } else {
+        format!(" · {inspected_elements} inspected")
+    };
     format!(
-        "{} · {view_mode} · {} meshes · {} tris · {} draws · {visible_elements}/{total_elements} visible · {selected_elements} selected · {stream_status}",
+        "{} · {view_mode} · {} meshes · {} tris · {} draws · {visible_elements}/{total_elements} visible · {selected_elements} selected{inspection_status} · {stream_status}",
         profile.label(),
         render_scene.definitions.len(),
         render_scene.triangle_count(),

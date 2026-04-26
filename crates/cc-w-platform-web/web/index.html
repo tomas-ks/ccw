@@ -1628,6 +1628,9 @@
         viewer_default_element_ids,
         viewer_frame_visible,
         viewer_hide_elements,
+        viewer_clear_inspection,
+        viewer_inspect_elements,
+        viewer_inspected_element_ids,
         viewer_list_element_ids,
         viewer_pick_at_json,
         viewer_pick_rect_json,
@@ -2195,6 +2198,7 @@
           defaultElementIds: () => Array.from(viewer_default_element_ids()),
           visibleElementIds: () => Array.from(viewer_visible_element_ids()),
           selectedElementIds: () => Array.from(viewer_selected_element_ids()),
+          inspectedElementIds: () => Array.from(viewer_inspected_element_ids()),
           selectedInstanceIds: () => api.viewState().selectedInstanceIds || [],
           hide: (ids, options = {}) => {
             return viewer_hide_elements(currentViewerElementIds(ids, options));
@@ -2224,6 +2228,9 @@
           },
           select: (ids, options = {}) => viewer_select_elements(currentViewerElementIds(ids, options)),
           clearSelection: () => viewer_clear_selection(),
+          inspect: (ids, options = {}) =>
+            viewer_inspect_elements(currentViewerElementIds(ids, options)),
+          clearInspection: () => viewer_clear_inspection(),
           pickAt: pickAtSoon,
           pickRect: pickRectSoon,
           frameVisible: () => viewer_frame_visible(),
@@ -6776,6 +6783,7 @@
           listIds: () => viewer.listElementIds(),
           visibleIds: () => viewer.visibleElementIds(),
           selectedIds: () => viewer.selectedElementIds(),
+          inspectedIds: () => viewer.inspectedElementIds(),
           selectedInstanceIds: () => viewer.selectedInstanceIds(),
           query: async (cypher, resource = currentQueryResource()) =>
             viewer.queryCypher(cypher, resource),
@@ -6786,9 +6794,11 @@
           hide: (ids, options = {}) => viewer.hide(ids, options),
           show: (ids, options = {}) => viewer.show(ids, options),
           select: (ids, options = {}) => viewer.select(ids, options),
+          inspect: (ids, options = {}) => viewer.inspect(ids, options),
           resetVisibility: (ids, options = {}) =>
             Array.isArray(ids) ? viewer.resetVisibility(ids, options) : viewer.resetAllVisibility(),
           clearSelection: () => viewer.clearSelection(),
+          clearInspection: () => viewer.clearInspection(),
           frame: () => viewer.frameVisible(),
           frameVisible: () => viewer.frameVisible(),
           resizeViewport: () => viewer.resizeViewport(),
@@ -6805,6 +6815,11 @@
           selectQuery: async (cypher, resource = currentQueryResource()) => {
             const ids = await api.queryIds(cypher, resource);
             viewer.select(ids, { sourceResource: resource });
+            return ids;
+          },
+          inspectQuery: async (cypher, resource = currentQueryResource()) => {
+            const ids = await api.queryIds(cypher, resource);
+            viewer.inspect(ids, { sourceResource: resource });
             return ids;
           },
         };
@@ -7504,9 +7519,23 @@
           return "elements.select";
         }
 
+        if (kind === "elements.inspect") {
+          const semanticIds = agentSemanticIds(action);
+          if (!semanticIds.length) {
+            return null;
+          }
+          viewer.inspect(semanticIds, { sourceResource: agentActionResource(action, viewer) });
+          return "elements.inspect";
+        }
+
         if (kind === "viewer.frame_visible" || kind === "viewer.framevisible") {
           viewer.frameVisible();
           return "viewer.frame_visible";
+        }
+
+        if (kind === "viewer.clear_inspection" || kind === "viewer.clearinspection") {
+          viewer.clearInspection();
+          return "viewer.clear_inspection";
         }
 
         return null;
@@ -7995,6 +8024,34 @@
           moveCursorLeft(tail.length + eraseColumns);
         };
 
+        const normalizePastedTerminalText = (text) =>
+          String(text || "")
+            .replace(/\r\n?/g, "\n")
+            .replace(/\n/g, " ")
+            .replace(/[^\S\t ]+/g, " ")
+            .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "");
+
+        const unwrapBracketedPaste = (data) => {
+          const start = "\u001b[200~";
+          const end = "\u001b[201~";
+          if (!data.startsWith(start) || !data.endsWith(end)) {
+            return null;
+          }
+          return data.slice(start.length, -end.length);
+        };
+
+        const insertTextAtCursor = (text) => {
+          const pasted = normalizePastedTerminalText(text);
+          if (!pasted || running) {
+            return;
+          }
+          const before = currentLine.slice(0, cursorIndex);
+          const tail = currentLine.slice(cursorIndex);
+          currentLine = before + pasted + tail;
+          cursorIndex += pasted.length;
+          renderPromptLine();
+        };
+
         const replaceCurrentLine = (next) => {
           currentLine = next;
           cursorIndex = currentLine.length;
@@ -8211,6 +8268,12 @@
             return;
           }
 
+          const bracketedPaste = unwrapBracketedPaste(data);
+          if (bracketedPaste !== null) {
+            insertTextAtCursor(bracketedPaste);
+            return;
+          }
+
           if (data === "\r") {
             void runCurrentCommand(currentLine);
             return;
@@ -8312,6 +8375,16 @@
           }
         });
 
+        term.textarea?.addEventListener("paste", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (running) {
+            return;
+          }
+          const text = event.clipboardData?.getData("text/plain") || "";
+          insertTextAtCursor(text);
+        }, { capture: true });
+
         term.onKey(() => {
           if (document.activeElement !== term.textarea) {
             term.focus();
@@ -8361,7 +8434,7 @@
           screenId: "repl-screen",
           hostId: "repl-terminal",
           introLines: [
-            'resource(), profile(), profiles(), setProfile(name), referenceGridVisible(), setReferenceGridVisible(true), theme(), setTheme("light"), allView(), defaultView(), viewState(), state(), pickAt(x,y), pickRect(x0,y0,x1,y1), query(...), ids(...), hide([...]), show([...]), select([...]), graph.reset(...), frame()',
+            'resource(), profile(), profiles(), setProfile(name), referenceGridVisible(), setReferenceGridVisible(true), theme(), setTheme("light"), allView(), defaultView(), viewState(), state(), pickAt(x,y), pickRect(x0,y0,x1,y1), query(...), ids(...), hide([...]), show([...]), select([...]), inspect([...]), clearInspection(), graph.reset(...), frame()',
             'Example: graph.reset("MATCH (p:IfcProject) RETURN id(p) AS node_id LIMIT 1");',
             'Example: var walls = ids("MATCH (w:IfcWall) RETURN w.GlobalId AS global_id LIMIT 8"); hide(walls);',
             "Enter runs. Up/Down walks history. Ctrl+C clears the line.",
@@ -8372,7 +8445,7 @@
               "api",
               "window",
               "document",
-              `"use strict"; const { viewer, graph, resource, profile, profiles, setProfile, referenceGridVisible, setReferenceGridVisible, toggleReferenceGrid, theme, setTheme, viewState, state, setViewMode, defaultView, allView, setViewModeAsync, defaultViewAsync, allViewAsync, pickAt, pickRect, pickAtAsync, pickRectAsync, listIds, visibleIds, selectedIds, selectedInstanceIds, query, queryIds, ids, hide, show, select, resetVisibility, clearSelection, frame, frameVisible, hideQuery, showQuery, selectQuery } = api; return (async () => { ${rewritten} })();`
+              `"use strict"; const { viewer, graph, resource, profile, profiles, setProfile, referenceGridVisible, setReferenceGridVisible, toggleReferenceGrid, theme, setTheme, viewState, state, setViewMode, defaultView, allView, setViewModeAsync, defaultViewAsync, allViewAsync, pickAt, pickRect, pickAtAsync, pickRectAsync, listIds, visibleIds, selectedIds, inspectedIds, selectedInstanceIds, query, queryIds, ids, hide, show, select, inspect, resetVisibility, clearSelection, clearInspection, frame, frameVisible, hideQuery, showQuery, selectQuery, inspectQuery } = api; return (async () => { ${rewritten} })();`
             );
             return fn(replApi, window, document);
           },

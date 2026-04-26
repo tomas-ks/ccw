@@ -285,8 +285,16 @@ pub enum PlannedUiAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resource: Option<String>,
     },
+    #[serde(rename = "elements.inspect")]
+    ElementsInspect {
+        semantic_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "viewer.frame_visible")]
     ViewerFrameVisible,
+    #[serde(rename = "viewer.clear_inspection")]
+    ViewerClearInspection,
 }
 
 #[derive(Debug, Clone)]
@@ -2548,6 +2556,16 @@ fn native_action_candidate_from_tool_call(
             }
             candidate
         }),
+        "elements_inspect" => native_semantic_ids_from_input(input).map(|semantic_ids| {
+            let mut candidate = AgentActionCandidate::elements_inspect(semantic_ids);
+            if let Some(resource) = native_resource_from_input(input) {
+                candidate = candidate.with_resource(resource);
+            }
+            candidate
+        }),
+        "viewer_clear_inspection" | "clear_inspection" => {
+            Some(AgentActionCandidate::viewer_clear_inspection())
+        }
         "viewer_frame_visible" | "frame" => Some(AgentActionCandidate::viewer_frame_visible()),
         _ => None,
     }
@@ -2751,7 +2769,19 @@ fn map_planned_ui_action(action: PlannedUiAction) -> AgentActionCandidate {
                 candidate
             }
         }
+        PlannedUiAction::ElementsInspect {
+            semantic_ids,
+            resource,
+        } => {
+            let candidate = AgentActionCandidate::elements_inspect(semantic_ids);
+            if let Some(resource) = resource {
+                candidate.with_resource(resource)
+            } else {
+                candidate
+            }
+        }
         PlannedUiAction::ViewerFrameVisible => AgentActionCandidate::viewer_frame_visible(),
+        PlannedUiAction::ViewerClearInspection => AgentActionCandidate::viewer_clear_inspection(),
     }
 }
 
@@ -3031,6 +3061,7 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
                         { "kind": "graph.set_seeds", "db_node_ids": [123], "resource": "ifc/building-architecture" },
                         { "kind": "properties.show_node", "db_node_id": 123, "resource": "ifc/building-architecture" },
                         { "kind": "elements.select", "semantic_ids": ["2iPwJwpPDCSgMheXwk9cBT"], "resource": "ifc/building-architecture" },
+                        { "kind": "elements.inspect", "semantic_ids": ["2iPwJwpPDCSgMheXwk9cBT"], "resource": "ifc/building-architecture" },
                         { "kind": "viewer.frame_visible" }
                     ]
                 }
@@ -3040,7 +3071,7 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
         .expect("schema example should serialize"),
         "Allowed toolCalls kinds are only `get_schema_context`, `get_model_details`, `get_entity_reference`, `get_query_playbook`, `get_relation_reference`, `run_readonly_cypher`, `run_project_readonly_cypher`, `describe_nodes`, `get_node_properties`, `get_neighbors`, and `emit_ui_actions`.".to_owned(),
         "Do not invent `request_tools`; use the concrete tools above directly.".to_owned(),
-        "Allowed UI actions are only `graph.set_seeds`, `properties.show_node`, `elements.hide`, `elements.show`, `elements.select`, and `viewer.frame_visible`.".to_owned(),
+        "Allowed UI actions are only `graph.set_seeds`, `properties.show_node`, `elements.hide`, `elements.show`, `elements.select`, `elements.inspect`, `viewer.frame_visible`, and `viewer.clear_inspection`.".to_owned(),
         "Use exact action payload field names: `db_node_ids` for graph seeds, `db_node_id` for properties.show_node, and `semantic_ids` for element actions.".to_owned(),
         "When a DB node id comes from a project-wide query result, include its `source_resource` as the UI action `resource`; DB node ids are only meaningful inside one IFC database.".to_owned(),
         "When semantic ids come from project-wide query results, preserve source by either passing `resource` on the element action or using the source-scoped `source_resource::GlobalId` id returned by the tool.".to_owned(),
@@ -3057,8 +3088,9 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
         "- Before issuing a new discovery query for a repeated factual question, check sessionHistory for an earlier answer. If the fact was already established, answer from that prior finding and only run a small verification query when freshness or certainty really matters.".to_owned(),
         "- If prior history already identified a concrete object with a GlobalId or DB node id, reuse that identifier directly instead of rediscovering the object from scratch.".to_owned(),
         "- Read-only applies to graph/database inspection only. You are allowed to carry out approved viewer actions by returning them in `emit_ui_actions`.".to_owned(),
-        "- When the user asks to hide, show, select, seed the graph, reveal properties, or frame the scene, prefer returning the corresponding validated viewer action instead of refusing on the grounds that this is a planning phase.".to_owned(),
-        "- `elements.hide`, `elements.show`, and `elements.select` require renderable semantic ids, usually returned from `GlobalId` / `global_id` columns. In project mode, carry the source IFC resource with those ids.".to_owned(),
+        "- When the user asks to hide, show, select, inspect, clear inspection, seed the graph, reveal properties, or frame the scene, prefer returning the corresponding validated viewer action instead of refusing on the grounds that this is a planning phase.".to_owned(),
+        "- If the user says they are done with inspection, thanks you after an inspection, or asks to return to normal rendering, emit `viewer.clear_inspection`.".to_owned(),
+        "- `elements.hide`, `elements.show`, `elements.select`, and `elements.inspect` require renderable semantic ids, usually returned from `GlobalId` / `global_id` columns. In project mode, carry the source IFC resource with those ids.".to_owned(),
         "- If the query only returns DB node ids, use `graph.set_seeds`; do not emit element actions from DB ids alone.".to_owned(),
         "- Learn the general difference between semantic/container nodes and visible/product nodes. Do not rely on one-off entity exceptions alone.".to_owned(),
         "- Treat facility roots, project/site/building/storey nodes, relation nodes, aggregate/group nodes, and many `*Part` subdivision nodes as likely semantic/container candidates until the live graph proves otherwise.".to_owned(),
@@ -3084,7 +3116,7 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
         "- Reuse ids and facts already present in sessionHistory, transcript, and prior toolResults before issuing another discovery query.".to_owned(),
         "- Never repeat the exact same discovery tool call in one turn unless the previous result was empty or clearly insufficient. Reuse the prior result and move forward instead of rediscovering the same fact.".to_owned(),
         "- If you already know the target DB node id and the user asks for properties or explanation, prefer `get_node_properties`, `describe_nodes`, and `properties.show_node` over another raw Cypher lookup.".to_owned(),
-        "- Emit one coherent `emit_ui_actions` bundle near the end of the turn. Avoid repeating `elements.select`, `properties.show_node`, or `viewer.frame_visible` multiple times in the same turn unless the target changed.".to_owned(),
+        "- Emit one coherent `emit_ui_actions` bundle near the end of the turn. Avoid repeating `elements.select`, `elements.inspect`, `properties.show_node`, `viewer.frame_visible`, or `viewer.clear_inspection` multiple times in the same turn unless the target changed.".to_owned(),
         "- If a requested 'type' answer only yields opaque numeric codes or low-level enum values, say that plainly and then inspect names and nearby relationships to explain the element's role in the model.".to_owned(),
         "- For product questions like slabs, walls, roofs, and doors, relationship context is often more useful than raw property values. Look for aggregation, containment, type, property-set, and material relationships.".to_owned(),
         "- Distinguish observation from inference. If you infer, say so briefly and ground it in the returned graph facts.".to_owned(),
@@ -3679,7 +3711,10 @@ fn normalize_ui_action(action: Value) -> Value {
                 }
             }
         }
-        Some("elements.hide") | Some("elements.show") | Some("elements.select") => {
+        Some("elements.hide")
+        | Some("elements.show")
+        | Some("elements.select")
+        | Some("elements.inspect") => {
             if let Some(Value::Array(ids)) = semantic_ids {
                 normalized.insert("semantic_ids".to_owned(), Value::Array(ids.clone()));
                 normalized.remove("semanticIds");
@@ -3713,9 +3748,17 @@ fn normalize_ui_action_kind(kind: &str) -> Option<String> {
         "elements.select" | "elements.selectElements" | "elementsSelect" => {
             Some("elements.select".to_owned())
         }
+        "elements.inspect" | "elements.inspectElements" | "elementsInspect" => {
+            Some("elements.inspect".to_owned())
+        }
         "viewer.frame_visible" | "viewer.frameVisible" | "viewerFrameVisible" | "frame" => {
             Some("viewer.frame_visible".to_owned())
         }
+        "viewer.clear_inspection"
+        | "viewer.clearInspection"
+        | "viewerClearInspection"
+        | "clear_inspection"
+        | "clearInspection" => Some("viewer.clear_inspection".to_owned()),
         _ => None,
     }
 }
