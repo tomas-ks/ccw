@@ -35,48 +35,48 @@
 
       :root[data-theme="dark"] {
         color-scheme: dark;
-        --surface-app: #0f1320;
-        --surface-viewer: #0f1320;
-        --surface-header: #151b2a;
-        --surface-footer: #151b2a;
-        --surface-panel: #121827;
-        --surface-panel-strong: #101622;
-        --surface-elevated: rgba(18, 24, 39, 0.9);
-        --surface-elevated-solid: #121827;
-        --surface-terminal: #0d1117;
-        --surface-terminal-strong: #0c1018;
-        --surface-graph: #20242c;
-        --surface-control: #101622;
-        --surface-control-hover: #172033;
-        --surface-control-active: #203052;
-        --text-primary: #f3f6ff;
-        --text-secondary: rgba(243, 246, 255, 0.72);
-        --text-muted: rgba(243, 246, 255, 0.58);
-        --text-soft: rgba(243, 246, 255, 0.68);
-        --text-disabled: rgba(243, 246, 255, 0.36);
-        --border-subtle: rgba(255, 255, 255, 0.08);
-        --border-strong: rgba(255, 255, 255, 0.12);
-        --border-accent: rgba(141, 182, 255, 0.54);
-        --hover-accent: rgba(141, 182, 255, 0.12);
+        --surface-app: #2b2d30;
+        --surface-viewer: #2b2d30;
+        --surface-header: #33363a;
+        --surface-footer: #33363a;
+        --surface-panel: #303236;
+        --surface-panel-strong: #282a2d;
+        --surface-elevated: rgba(48, 50, 54, 0.92);
+        --surface-elevated-solid: #303236;
+        --surface-terminal: #27292d;
+        --surface-terminal-strong: #24262a;
+        --surface-graph: #2f3236;
+        --surface-control: #272a2f;
+        --surface-control-hover: #3a3d42;
+        --surface-control-active: #3f5f8f;
+        --text-primary: #f0f1f2;
+        --text-secondary: rgba(240, 241, 242, 0.72);
+        --text-muted: rgba(240, 241, 242, 0.56);
+        --text-soft: rgba(240, 241, 242, 0.66);
+        --text-disabled: rgba(240, 241, 242, 0.34);
+        --border-subtle: rgba(255, 255, 255, 0.1);
+        --border-strong: rgba(255, 255, 255, 0.16);
+        --border-accent: rgba(100, 145, 205, 0.62);
+        --hover-accent: rgba(100, 145, 205, 0.14);
         --shadow-panel: 0 18px 38px rgba(0, 0, 0, 0.32);
-        --viewer-clear: #0f1320;
-        --terminal-foreground: #d7deee;
-        --terminal-selection: rgba(141, 182, 255, 0.24);
+        --viewer-clear: #2b2d30;
+        --terminal-foreground: #d8dce2;
+        --terminal-selection: rgba(100, 145, 205, 0.28);
         --balloon-arrow-border: rgba(255, 255, 255, 0.13);
-        --graph-label: #d8e4ff;
-        --graph-edge: rgba(141, 182, 255, 0.32);
+        --graph-label: #e2e6ec;
+        --graph-edge: rgba(118, 158, 210, 0.5);
         --graph-edge-size: 1.45;
-        --graph-edge-label: rgba(224, 233, 255, 0.9);
-        --graph-hover-fill: rgba(243, 246, 255, 0.12);
-        --graph-hover-panel: rgba(15, 19, 32, 0.92);
-        --graph-hover-border: rgba(141, 182, 255, 0.28);
-        --graph-node-selected: #f2c879;
-        --graph-node-relation: #9fb5d9;
-        --graph-node-spatial: #8ec2ff;
-        --graph-node-wall: #79d8b7;
-        --graph-node-slab: #f0c187;
-        --graph-node-space: #dba8ff;
-        --graph-node-default: #7fb1e6;
+        --graph-edge-label: rgba(226, 230, 236, 0.88);
+        --graph-hover-fill: rgba(240, 241, 242, 0.11);
+        --graph-hover-panel: rgba(48, 50, 54, 0.94);
+        --graph-hover-border: rgba(100, 145, 205, 0.34);
+        --graph-node-selected: #e6ad55;
+        --graph-node-relation: #a3adb9;
+        --graph-node-spatial: #78a9de;
+        --graph-node-wall: #6fbc9d;
+        --graph-node-slab: #d9a166;
+        --graph-node-space: #b492d6;
+        --graph-node-default: #7da4c8;
       }
 
       :root[data-theme="light"] {
@@ -7971,6 +7971,30 @@
           }
         };
 
+        const moveCursorLeft = (columns) => {
+          if (columns <= 0) {
+            return;
+          }
+          term.write(columns === 1 ? "\x1b[D" : `\x1b[${columns}D`);
+        };
+
+        const moveCursorRight = (columns) => {
+          if (columns <= 0) {
+            return;
+          }
+          term.write(columns === 1 ? "\x1b[C" : `\x1b[${columns}C`);
+        };
+
+        const rewriteTailAtCursor = (tail, eraseColumns = 0) => {
+          if (tail.length) {
+            term.write(sanitizeTerminalText(tail));
+          }
+          if (eraseColumns > 0) {
+            term.write(" ".repeat(eraseColumns));
+          }
+          moveCursorLeft(tail.length + eraseColumns);
+        };
+
         const replaceCurrentLine = (next) => {
           currentLine = next;
           cursorIndex = currentLine.length;
@@ -8201,21 +8225,26 @@
           }
 
           if (data === "\u0001" || data === "\u001b[H" || data === "\u001bOH") {
-            cursorIndex = 0;
-            renderPromptLine();
+            if (cursorIndex > 0) {
+              moveCursorLeft(cursorIndex);
+              cursorIndex = 0;
+            }
             return;
           }
 
           if (data === "\u0005" || data === "\u001b[F" || data === "\u001bOF") {
-            cursorIndex = currentLine.length;
-            renderPromptLine();
+            const moveRight = currentLine.length - cursorIndex;
+            if (moveRight > 0) {
+              moveCursorRight(moveRight);
+              cursorIndex = currentLine.length;
+            }
             return;
           }
 
           if (data === "\u001b[D" || data === "\u001bOD") {
             if (cursorIndex > 0) {
               cursorIndex -= 1;
-              renderPromptLine();
+              moveCursorLeft(1);
             }
             return;
           }
@@ -8223,17 +8252,23 @@
           if (data === "\u001b[C" || data === "\u001bOC") {
             if (cursorIndex < currentLine.length) {
               cursorIndex += 1;
-              renderPromptLine();
+              moveCursorRight(1);
             }
             return;
           }
 
           if (data === "\u007F") {
             if (cursorIndex > 0) {
+              const deletingAtLineEnd = cursorIndex === currentLine.length;
               currentLine =
                 currentLine.slice(0, cursorIndex - 1) + currentLine.slice(cursorIndex);
               cursorIndex -= 1;
-              renderPromptLine();
+              if (deletingAtLineEnd) {
+                term.write("\b \b");
+              } else {
+                moveCursorLeft(1);
+                rewriteTailAtCursor(currentLine.slice(cursorIndex), 1);
+              }
             }
             return;
           }
@@ -8242,7 +8277,7 @@
             if (cursorIndex < currentLine.length) {
               currentLine =
                 currentLine.slice(0, cursorIndex) + currentLine.slice(cursorIndex + 1);
-              renderPromptLine();
+              rewriteTailAtCursor(currentLine.slice(cursorIndex), 1);
             }
             return;
           }
@@ -8258,10 +8293,22 @@
             if (ch < " " && ch !== "\t") {
               continue;
             }
+            const appendingAtLineEnd = cursorIndex === currentLine.length && ch !== "\t";
+            const tail = currentLine.slice(cursorIndex);
             currentLine =
               currentLine.slice(0, cursorIndex) + ch + currentLine.slice(cursorIndex);
             cursorIndex += ch.length;
-            renderPromptLine();
+            if (appendingAtLineEnd) {
+              term.write(sanitizeTerminalText(ch));
+            } else if (ch === "\t") {
+              renderPromptLine();
+            } else {
+              term.write(sanitizeTerminalText(ch));
+              if (tail.length) {
+                term.write(sanitizeTerminalText(tail));
+                moveCursorLeft(tail.length);
+              }
+            }
           }
         });
 

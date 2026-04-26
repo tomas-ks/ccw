@@ -16,7 +16,11 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -305,6 +309,7 @@ pub struct OpencodeNativeServer {
     process: Mutex<Option<Child>>,
     working_directory: Option<PathBuf>,
     event_bus: Arc<NativeEventBus>,
+    shutting_down: AtomicBool,
 }
 
 impl OpencodeNativeServer {
@@ -440,6 +445,7 @@ impl OpencodeNativeServer {
             process: Mutex::new(Some(child)),
             working_directory: config.working_directory.clone(),
             event_bus: Arc::new(NativeEventBus::default()),
+            shutting_down: AtomicBool::new(false),
         });
         server.wait_until_healthy(startup_timeout)?;
         if crate::should_stop_requested() {
@@ -600,7 +606,9 @@ impl OpencodeNativeServer {
             let response = match server.subscribe_events() {
                 Ok(response) => response,
                 Err(error) => {
-                    println!("w web opencode event router failed to subscribe: {}", error);
+                    if !server.is_shutting_down() {
+                        println!("w web opencode event router failed to subscribe: {}", error);
+                    }
                     return;
                 }
             };
@@ -610,7 +618,9 @@ impl OpencodeNativeServer {
                     Ok(NativeStreamEvent::Value(value)) => server.event_bus.publish(value),
                     Ok(NativeStreamEvent::End) => break,
                     Ok(NativeStreamEvent::Error(error)) => {
-                        println!("w web opencode event router error: {}", error);
+                        if !server.is_shutting_down() {
+                            println!("w web opencode event router error: {}", error);
+                        }
                         break;
                     }
                     Err(_) => break,
@@ -620,7 +630,12 @@ impl OpencodeNativeServer {
         });
     }
 
+    fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst) || crate::should_stop_requested()
+    }
+
     pub fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
         if let Ok(mut process) = self.process.lock() {
             if let Some(mut child) = process.take() {
                 let _ = child.kill();

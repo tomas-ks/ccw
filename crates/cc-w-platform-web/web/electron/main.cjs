@@ -12,6 +12,8 @@ let serverProcess = null;
 let mainWindow = null;
 let shuttingDown = false;
 let serverUrl = null;
+let serverStopRequested = false;
+let serverStopTimer = null;
 
 function resolveServerBinary() {
   if (process.env.CC_W_WEB_SERVER_BINARY) {
@@ -73,6 +75,7 @@ function startViewerServer() {
       stdio: ["ignore", "pipe", "pipe"],
     });
     serverProcess = child;
+    serverStopRequested = false;
 
     let stdout = "";
     let settled = false;
@@ -113,6 +116,14 @@ function startViewerServer() {
       }
     });
     child.on("exit", (code, signal) => {
+      if (serverProcess === child) {
+        serverProcess = null;
+      }
+      serverStopRequested = false;
+      if (serverStopTimer) {
+        clearTimeout(serverStopTimer);
+        serverStopTimer = null;
+      }
       if (!shuttingDown && !settled) {
         settled = true;
         clearTimeout(failTimer);
@@ -134,7 +145,7 @@ function viewerUrl(baseUrl) {
 
 function createWindow(baseUrl) {
   const isMac = process.platform === "darwin";
-  mainWindow = new BrowserWindow({
+  const window = new BrowserWindow({
     width: 1480,
     height: 980,
     minWidth: 980,
@@ -150,16 +161,30 @@ function createWindow(baseUrl) {
       sandbox: false,
     },
   });
+  mainWindow = window;
 
-  mainWindow.loadURL(viewerUrl(baseUrl));
-  syncWindowState(mainWindow);
-  mainWindow.on("maximize", () => syncWindowState(mainWindow));
-  mainWindow.on("unmaximize", () => syncWindowState(mainWindow));
+  window.loadURL(viewerUrl(baseUrl));
+  syncWindowState(window);
+  window.on("maximize", () => syncWindowState(window));
+  window.on("unmaximize", () => syncWindowState(window));
+  window.on("closed", () => {
+    if (mainWindow === window) {
+      mainWindow = null;
+    }
+  });
   const autoQuitMs = Number(process.env.CC_W_ELECTRON_AUTO_QUIT_MS || 0);
   if (Number.isFinite(autoQuitMs) && autoQuitMs > 0) {
     setTimeout(() => app.quit(), autoQuitMs).unref();
   }
-  return mainWindow;
+  const autoCloseMs = Number(process.env.CC_W_ELECTRON_AUTO_CLOSE_WINDOW_MS || 0);
+  if (Number.isFinite(autoCloseMs) && autoCloseMs > 0) {
+    setTimeout(() => {
+      if (!window.isDestroyed()) {
+        window.close();
+      }
+    }, autoCloseMs).unref();
+  }
+  return window;
 }
 
 function syncWindowState(window) {
@@ -199,7 +224,7 @@ function installIpc() {
   });
   ipcMain.on("ccw:theme", (_event, theme) => {
     nativeTheme.themeSource = theme === "light" ? "light" : "dark";
-    const color = theme === "light" ? "#fafbfb" : "#0f1320";
+    const color = theme === "light" ? "#fafbfb" : "#2b2d30";
     for (const window of BrowserWindow.getAllWindows()) {
       window.setBackgroundColor(color);
     }
@@ -208,15 +233,25 @@ function installIpc() {
 
 function stopServer() {
   shuttingDown = true;
-  if (!serverProcess || serverProcess.killed) {
+  const child = serverProcess;
+  if (!child) {
     return;
   }
-  serverProcess.kill("SIGTERM");
-  setTimeout(() => {
-    if (serverProcess && !serverProcess.killed) {
-      serverProcess.kill("SIGKILL");
+  if (child.exitCode !== null || child.signalCode !== null) {
+    serverProcess = null;
+    return;
+  }
+  if (serverStopRequested) {
+    return;
+  }
+  serverStopRequested = true;
+  child.kill("SIGTERM");
+  serverStopTimer = setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
     }
-  }, 2_000).unref();
+  }, 2_000);
+  serverStopTimer.unref?.();
 }
 
 app.setName("W Viewer");
@@ -237,11 +272,12 @@ app.whenReady().then(async () => {
 app.on("before-quit", stopServer);
 app.on("window-all-closed", () => {
   stopServer();
-  if (process.platform !== "darwin") {
-    app.quit();
-  }
+  app.quit();
 });
 app.on("activate", () => {
+  if (shuttingDown) {
+    return;
+  }
   if (BrowserWindow.getAllWindows().length === 0 && serverUrl) {
     createWindow(serverUrl);
   }
