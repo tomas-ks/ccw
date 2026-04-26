@@ -1433,14 +1433,11 @@ impl RenderLayer {
     }
 
     fn picks_as_opaque(self) -> bool {
-        matches!(self, Self::Opaque | Self::InspectionContextOpaque)
+        matches!(self, Self::Opaque)
     }
 
     fn picks_as_surface_decal(self) -> bool {
-        matches!(
-            self,
-            Self::SurfaceDecal | Self::InspectionContextSurfaceDecal
-        )
+        matches!(self, Self::SurfaceDecal)
     }
 }
 
@@ -4002,7 +3999,7 @@ mod tests {
     }
 
     #[test]
-    fn inspection_context_instances_use_context_layers_only_in_inspection_profile() {
+    fn inspection_context_instances_use_context_layers_but_do_not_pick() {
         let base_instance = PreparedRenderInstance {
             id: GeometryInstanceId(1),
             element_id: SemanticElementId::new("synthetic/context"),
@@ -4018,7 +4015,7 @@ mod tests {
         assert!(opaque_layer.draws_as_opaque(false));
         assert!(!opaque_layer.draws_as_opaque(true));
         assert!(opaque_layer.draws_as_inspection_context());
-        assert!(opaque_layer.picks_as_opaque());
+        assert!(!opaque_layer.picks_as_opaque());
 
         let surface_decal_instance = PreparedRenderInstance {
             default_render_class: DefaultRenderClass::SurfaceDecal,
@@ -4031,7 +4028,7 @@ mod tests {
         );
         assert!(surface_decal_layer.draws_as_surface_decal(false));
         assert!(!surface_decal_layer.draws_as_surface_decal(true));
-        assert!(surface_decal_layer.picks_as_surface_decal());
+        assert!(!surface_decal_layer.picks_as_surface_decal());
     }
 
     #[test]

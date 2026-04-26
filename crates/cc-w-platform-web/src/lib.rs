@@ -1537,9 +1537,12 @@ use cc_w_render::{
     ViewportSize, fit_camera_to_render_scene, pick_prepared_scene_cpu,
 };
 #[cfg(target_arch = "wasm32")]
-use cc_w_types::{PickHit, PickRegion, PreparedRenderScene, WORLD_FORWARD, WORLD_RIGHT, WORLD_UP};
+use cc_w_types::{
+    PickHit, PickRegion, PreparedRenderRole, PreparedRenderScene, WORLD_FORWARD, WORLD_RIGHT,
+    WORLD_UP,
+};
 #[cfg(target_arch = "wasm32")]
-use glam::{DMat4, DVec3, DVec4, Vec2};
+use glam::{DMat4, DQuat, DVec3, DVec4, Vec2};
 #[cfg(target_arch = "wasm32")]
 use js_sys::{Array, JSON, Promise, decode_uri_component};
 #[cfg(target_arch = "wasm32")]
@@ -1551,8 +1554,8 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 #[cfg(target_arch = "wasm32")]
 use web_sys::{
     CanvasRenderingContext2d, CustomEvent, CustomEventInit, Document, Element, Event,
-    HtmlCanvasElement, HtmlElement, HtmlSelectElement, MouseEvent, RequestInit, Response,
-    WheelEvent, Window,
+    HtmlCanvasElement, HtmlElement, HtmlSelectElement, KeyboardEvent, MouseEvent, RequestInit,
+    Response, WheelEvent, Window,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -2439,9 +2442,16 @@ async fn stream_current_visible_view_to_json() -> Result<String, JsValue> {
 }
 
 #[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy)]
 enum WebPickRequest {
     Point { x: f32, y: f32 },
     Rect { x0: f32, y0: f32, x1: f32, y1: f32 },
+}
+
+#[cfg(target_arch = "wasm32")]
+struct WebOrbitPivotPickRequest {
+    drag_generation: u64,
+    request: WebPickRequest,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2505,7 +2515,7 @@ async fn pick_region_in_state(
     );
     if result.hits.is_empty() {
         let state = app_state.borrow();
-        let render_scene = state.runtime_scene.compose_render_scene();
+        let render_scene = interactive_pick_scene(&state.runtime_scene.compose_render_scene());
         result = pick_prepared_scene_cpu(
             &render_scene,
             state.renderer.camera(),
@@ -2525,6 +2535,71 @@ async fn pick_region_in_state(
     dispatch_json_event(&window, "w-viewer-anchor", &anchor_json)?;
 
     Ok(json)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn interactive_pick_scene(scene: &PreparedRenderScene) -> PreparedRenderScene {
+    let instances = scene
+        .instances
+        .iter()
+        .filter(|instance| instance.render_role != PreparedRenderRole::InspectionContext)
+        .cloned()
+        .collect::<Vec<_>>();
+    let bounds = instances
+        .iter()
+        .fold(None::<Bounds3>, |bounds, instance| {
+            Some(match bounds {
+                Some(bounds) => Bounds3 {
+                    min: bounds.min.min(instance.world_bounds.min),
+                    max: bounds.max.max(instance.world_bounds.max),
+                },
+                None => instance.world_bounds,
+            })
+        })
+        .unwrap_or(scene.bounds);
+
+    PreparedRenderScene {
+        bounds,
+        definitions: scene.definitions.clone(),
+        instances,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn update_orbit_pivot_from_gpu_pick(
+    app_state: Rc<RefCell<WebViewerState>>,
+    request: WebOrbitPivotPickRequest,
+) -> Result<(), String> {
+    let prepared = {
+        let mut state = app_state.borrow_mut();
+        state.prepare_pick_color_readback(request.request)?
+    };
+
+    JsFuture::from(prepared.map_promise)
+        .await
+        .map_err(|error| format!("GPU orbit pivot pick readback failed: {:?}", error))?;
+
+    let mapped = prepared.readback.slice(..).get_mapped_range();
+    let rgba8 = strip_padded_rows_web(
+        &mapped,
+        prepared.unpadded_bytes_per_row as usize,
+        prepared.padded_bytes_per_row as usize,
+        prepared.region.height as usize,
+    );
+    drop(mapped);
+    prepared.readback.unmap();
+
+    let hit = decode_pick_pixels_without_depth(prepared.region, &rgba8, &prepared.pick_targets)
+        .first_hit()
+        .cloned();
+    let Some(hit) = hit else {
+        return Ok(());
+    };
+
+    app_state
+        .borrow_mut()
+        .apply_orbit_pivot_pick(request.drag_generation, hit.world_centroid);
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2579,6 +2654,29 @@ fn decode_pick_pixels_with_depth(
             }
         }
         hits.push(hit);
+    }
+
+    cc_w_types::PickResult { region, hits }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn decode_pick_pixels_without_depth(
+    region: PickRegion,
+    rgba8: &[u8],
+    pick_targets: &[PickHit],
+) -> cc_w_types::PickResult {
+    let mut seen = HashSet::new();
+    let mut hits = Vec::new();
+
+    for pixel in rgba8.chunks_exact(4) {
+        let pick_index = decode_web_pick_index(pixel);
+        if pick_index == 0 || !seen.insert(pick_index) {
+            continue;
+        }
+        let Some(target) = pick_targets.get((pick_index - 1) as usize) else {
+            continue;
+        };
+        hits.push(target.clone());
     }
 
     cc_w_types::PickResult { region, hits }
@@ -2735,6 +2833,10 @@ struct WebViewerApp {
     _mouse_move: Closure<dyn FnMut(MouseEvent)>,
     _mouse_up: Closure<dyn FnMut(MouseEvent)>,
     _mouse_leave: Closure<dyn FnMut(MouseEvent)>,
+    _context_menu: Closure<dyn FnMut(Event)>,
+    _key_down: Closure<dyn FnMut(KeyboardEvent)>,
+    _key_up: Closure<dyn FnMut(KeyboardEvent)>,
+    _window_blur: Closure<dyn FnMut(Event)>,
     _click: Closure<dyn FnMut(MouseEvent)>,
     _wheel: Closure<dyn FnMut(WheelEvent)>,
     _resize: Closure<dyn FnMut(Event)>,
@@ -2838,6 +2940,7 @@ impl WebViewerApp {
             clear_color: defaults.clear_color,
             orbit,
             drag: DragState::default(),
+            space_pan_modifier: false,
             last_pick_hits: Vec::new(),
         }));
         state.borrow().refresh_status();
@@ -2899,11 +3002,24 @@ impl WebViewerApp {
 
         let mouse_down_state = state.clone();
         let mouse_down = Closure::wrap(Box::new(move |event: MouseEvent| {
-            let event = mouse_down_state
-                .borrow_mut()
-                .begin_drag(event.client_x() as f32, event.client_y() as f32);
-            if let Err(error) = event.dispatch() {
+            event.prevent_default();
+            let (drag_event, orbit_pivot_request) = mouse_down_state.borrow_mut().begin_drag(
+                event.client_x() as f32,
+                event.client_y() as f32,
+                event.button(),
+            );
+            if let Err(error) = drag_event.dispatch() {
                 log_viewer_error(&error);
+            }
+            if let Some(request) = orbit_pivot_request {
+                let mouse_down_state = mouse_down_state.clone();
+                spawn_local(async move {
+                    if let Err(error) =
+                        update_orbit_pivot_from_gpu_pick(mouse_down_state, request).await
+                    {
+                        log_viewer_error(&error);
+                    }
+                });
             }
         }) as Box<dyn FnMut(MouseEvent)>);
         canvas
@@ -2984,10 +3100,58 @@ impl WebViewerApp {
             .add_event_listener_with_callback("mouseleave", mouse_leave.as_ref().unchecked_ref())
             .map_err(js_error)?;
 
+        let context_menu = Closure::wrap(Box::new(move |event: Event| {
+            event.prevent_default();
+        }) as Box<dyn FnMut(Event)>);
+        canvas
+            .add_event_listener_with_callback("contextmenu", context_menu.as_ref().unchecked_ref())
+            .map_err(js_error)?;
+
+        let key_down_state = state.clone();
+        let key_down = Closure::wrap(Box::new(move |event: KeyboardEvent| {
+            if !is_space_pan_keyboard_event(&event) || keyboard_event_targets_text_input(&event) {
+                return;
+            }
+            event.prevent_default();
+            key_down_state.borrow_mut().set_space_pan_modifier(true);
+        }) as Box<dyn FnMut(KeyboardEvent)>);
+        window
+            .add_event_listener_with_callback("keydown", key_down.as_ref().unchecked_ref())
+            .map_err(js_error)?;
+
+        let key_up_state = state.clone();
+        let key_up = Closure::wrap(Box::new(move |event: KeyboardEvent| {
+            if !is_space_pan_keyboard_event(&event) {
+                return;
+            }
+            if keyboard_event_targets_text_input(&event) {
+                key_up_state.borrow_mut().set_space_pan_modifier(false);
+                return;
+            }
+            event.prevent_default();
+            key_up_state.borrow_mut().set_space_pan_modifier(false);
+        }) as Box<dyn FnMut(KeyboardEvent)>);
+        window
+            .add_event_listener_with_callback("keyup", key_up.as_ref().unchecked_ref())
+            .map_err(js_error)?;
+
+        let window_blur_state = state.clone();
+        let window_blur = Closure::wrap(Box::new(move |_event: Event| {
+            window_blur_state.borrow_mut().set_space_pan_modifier(false);
+        }) as Box<dyn FnMut(Event)>);
+        window
+            .add_event_listener_with_callback("blur", window_blur.as_ref().unchecked_ref())
+            .map_err(js_error)?;
+
         let wheel_state = state.clone();
         let wheel = Closure::wrap(Box::new(move |event: WheelEvent| {
             event.prevent_default();
-            match wheel_state.borrow_mut().zoom(event.delta_y() as f32) {
+            match wheel_state.borrow_mut().wheel(
+                event.delta_y() as f32,
+                event.delta_mode(),
+                event.client_x() as f32,
+                event.client_y() as f32,
+            ) {
                 Ok(event) => {
                     if let Err(error) = event.dispatch() {
                         log_viewer_error(&error);
@@ -3054,6 +3218,10 @@ impl WebViewerApp {
             _mouse_move: mouse_move,
             _mouse_up: mouse_up,
             _mouse_leave: mouse_leave,
+            _context_menu: context_menu,
+            _key_down: key_down,
+            _key_up: key_up,
+            _window_blur: window_blur,
             _click: click,
             _wheel: wheel,
             _resize: resize,
@@ -3084,6 +3252,7 @@ struct WebViewerState {
     clear_color: wgpu::Color,
     orbit: OrbitCameraController,
     drag: DragState,
+    space_pan_modifier: bool,
     last_pick_hits: Vec<PickHit>,
 }
 
@@ -3102,6 +3271,16 @@ struct WebPickReadback {
     depth_map_promise: Promise,
     depth_unpadded_bytes_per_row: u32,
     depth_padded_bytes_per_row: u32,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct WebPickColorReadback {
+    region: PickRegion,
+    pick_targets: Vec<PickHit>,
+    readback: wgpu::Buffer,
+    map_promise: Promise,
+    unpadded_bytes_per_row: u32,
+    padded_bytes_per_row: u32,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -3241,14 +3420,47 @@ impl WebViewerState {
         self.pick_anchor_event()
     }
 
-    fn begin_drag(&mut self, x: f32, y: f32) -> DeferredWebEvent {
+    fn begin_drag(
+        &mut self,
+        x: f32,
+        y: f32,
+        button: i16,
+    ) -> (DeferredWebEvent, Option<WebOrbitPivotPickRequest>) {
+        let operation = self.drag_operation_for_mouse_down(button);
+        let orbit_pivot = if operation == DragOperation::Orbit {
+            self.scene_bounds_orbit_anchor_at_client(x, y)
+        } else {
+            None
+        };
+        let pan_anchor = if operation == DragOperation::Pan {
+            self.xy_plane_point_at_client(x, y, self.orbit.target_z())
+        } else {
+            None
+        };
+        self.drag.generation = self.drag.generation.wrapping_add(1);
+        let drag_generation = self.drag.generation;
+        let orbit_pivot_pick = if operation == DragOperation::Orbit {
+            let (x, y) = self.client_to_canvas_css(x, y);
+            Some(WebOrbitPivotPickRequest {
+                drag_generation,
+                request: WebPickRequest::Point { x, y },
+            })
+        } else {
+            None
+        };
         self.drag.active = true;
         self.drag.suppress_next_click = false;
+        self.drag.operation = operation;
+        self.drag.orbit_pivot = orbit_pivot;
+        self.drag.pan_anchor = pan_anchor;
         self.drag.start_x = x;
         self.drag.start_y = y;
         self.drag.last_x = x;
         self.drag.last_y = y;
-        self.web_event("w-viewer-drag-start", r#"{}"#.to_string())
+        (
+            self.web_event("w-viewer-drag-start", r#"{}"#.to_string()),
+            orbit_pivot_pick,
+        )
     }
 
     fn drag_to(&mut self, x: f32, y: f32) -> Result<Option<DeferredWebEvent>, String> {
@@ -3261,20 +3473,49 @@ impl WebViewerState {
         let dy = y - self.drag.last_y;
         self.drag.last_x = x;
         self.drag.last_y = y;
-        if !mode.can_orbit() {
-            return Ok(None);
+        match self.drag.operation {
+            DragOperation::Orbit if mode.can_orbit() => {
+                if let Some(pivot) = self.drag.orbit_pivot {
+                    self.orbit.orbit_around_point_by_pixels(dx, dy, pivot);
+                } else {
+                    self.orbit.orbit_by_pixels(dx, dy);
+                }
+                self.renderer.set_camera(&self.queue, self.orbit.camera());
+                Ok(Some(self.pick_anchor_event()?))
+            }
+            DragOperation::Pan if mode.can_pan() => {
+                if let Some(anchor) = self.drag.pan_anchor {
+                    let plane_z = anchor.z;
+                    if let Some(current) = self.xy_plane_point_at_client(x, y, plane_z) {
+                        self.orbit.translate_by(anchor - current);
+                    } else {
+                        self.orbit.pan_by_pixels(
+                            dx,
+                            dy,
+                            ViewportSize::new(self.config.width, self.config.height),
+                        );
+                    }
+                } else {
+                    self.orbit.pan_by_pixels(
+                        dx,
+                        dy,
+                        ViewportSize::new(self.config.width, self.config.height),
+                    );
+                }
+                self.renderer.set_camera(&self.queue, self.orbit.camera());
+                Ok(Some(self.pick_anchor_event()?))
+            }
+            _ => Ok(None),
         }
-        self.orbit.orbit_by_pixels(dx, dy);
-        self.renderer.set_camera(&self.queue, self.orbit.camera());
-        Ok(Some(self.pick_anchor_event()?))
     }
 
     fn end_drag(&mut self) -> (Option<WebPickRequest>, DeferredWebEvent) {
         let request = if self.drag.active {
             let mode = self.interaction_mode();
             let is_box_select = self.drag.is_box_select();
-            self.drag.suppress_next_click = is_box_select;
-            if mode == WebInteractionMode::Pick && is_box_select {
+            self.drag.suppress_next_click =
+                is_box_select || self.drag.operation == DragOperation::Pan;
+            if mode.can_pick() && self.drag.operation == DragOperation::Pick && is_box_select {
                 Some(self.drag_pick_request())
             } else {
                 None
@@ -3283,6 +3524,9 @@ impl WebViewerState {
             None
         };
         self.drag.active = false;
+        self.drag.operation = DragOperation::None;
+        self.drag.orbit_pivot = None;
+        self.drag.pan_anchor = None;
         (
             request,
             self.web_event("w-viewer-drag-end", r#"{}"#.to_string()),
@@ -3292,6 +3536,9 @@ impl WebViewerState {
     fn cancel_drag(&mut self) -> Option<DeferredWebEvent> {
         let was_active = self.drag.active;
         self.drag.active = false;
+        self.drag.operation = DragOperation::None;
+        self.drag.orbit_pivot = None;
+        self.drag.pan_anchor = None;
         self.drag.suppress_next_click = false;
         if was_active {
             Some(self.web_event("w-viewer-drag-end", r#"{}"#.to_string()))
@@ -3300,8 +3547,20 @@ impl WebViewerState {
         }
     }
 
-    fn zoom(&mut self, delta_y: f32) -> Result<DeferredWebEvent, String> {
-        self.orbit.zoom_by_wheel(delta_y);
+    fn wheel(
+        &mut self,
+        delta_y: f32,
+        delta_mode: u32,
+        client_x: f32,
+        client_y: f32,
+    ) -> Result<DeferredWebEvent, String> {
+        let viewport = ViewportSize::new(self.config.width, self.config.height);
+        let (_, delta_y) = wheel_delta_to_pixels(0.0, delta_y, delta_mode, viewport);
+        if let Some(anchor) = self.zoom_anchor_at_client(client_x, client_y) {
+            self.orbit.zoom_towards_anchor_by_wheel(delta_y, anchor);
+        } else {
+            self.orbit.zoom_by_wheel(delta_y);
+        }
         self.renderer.set_camera(&self.queue, self.orbit.camera());
         self.pick_anchor_event()
     }
@@ -3314,6 +3573,77 @@ impl WebViewerState {
 
     fn interaction_mode(&self) -> WebInteractionMode {
         WebInteractionMode::from_picker_value(&self.tool_picker.value())
+    }
+
+    fn set_space_pan_modifier(&mut self, enabled: bool) {
+        self.space_pan_modifier = enabled;
+    }
+
+    fn drag_operation_for_mouse_down(&self, button: i16) -> DragOperation {
+        let mode = self.interaction_mode();
+        let primary_button = button == 0;
+        let pan_gesture = button == 1 || button == 2 || self.space_pan_modifier;
+
+        if mode.can_pan() && (pan_gesture || (primary_button && !mode.can_orbit())) {
+            return DragOperation::Pan;
+        }
+        if mode.can_orbit() && primary_button {
+            return DragOperation::Orbit;
+        }
+        if mode.can_pick() && primary_button {
+            return DragOperation::Pick;
+        }
+        DragOperation::None
+    }
+
+    fn scene_bounds_orbit_anchor_at_client(&self, client_x: f32, client_y: f32) -> Option<DVec3> {
+        let (x, y) = self.client_to_canvas_css(client_x, client_y);
+        let region = self.css_pick_request_to_region(WebPickRequest::Point { x, y });
+        let render_scene = interactive_pick_scene(&self.runtime_scene.compose_render_scene());
+        let viewport = ViewportSize::new(self.config.width, self.config.height);
+        let ray =
+            pick_ray_for_viewport_pixel(self.renderer.camera(), viewport, region.x, region.y)?;
+        far_scene_bounds_intersection(ray.origin, ray.direction, render_scene.bounds)
+    }
+
+    fn apply_orbit_pivot_pick(&mut self, drag_generation: u64, pivot: DVec3) {
+        if !pivot.is_finite()
+            || !self.drag.active
+            || self.drag.generation != drag_generation
+            || self.drag.operation != DragOperation::Orbit
+        {
+            return;
+        }
+        self.drag.orbit_pivot = Some(pivot);
+    }
+
+    fn xy_plane_point_at_client(
+        &self,
+        client_x: f32,
+        client_y: f32,
+        plane_z: f64,
+    ) -> Option<DVec3> {
+        let (x, y) = self.client_to_canvas_css(client_x, client_y);
+        let region = self.css_pick_request_to_region(WebPickRequest::Point { x, y });
+        let ray = pick_ray_for_viewport_pixel(
+            self.renderer.camera(),
+            ViewportSize::new(self.config.width, self.config.height),
+            region.x,
+            region.y,
+        )?;
+        intersect_ray_with_xy_plane(ray.origin, ray.direction, plane_z)
+    }
+
+    fn zoom_anchor_at_client(&self, client_x: f32, client_y: f32) -> Option<DVec3> {
+        let (x, y) = self.client_to_canvas_css(client_x, client_y);
+        let region = self.css_pick_request_to_region(WebPickRequest::Point { x, y });
+        let viewport = ViewportSize::new(self.config.width, self.config.height);
+        let ray =
+            pick_ray_for_viewport_pixel(self.renderer.camera(), viewport, region.x, region.y)?;
+        let render_scene = interactive_pick_scene(&self.runtime_scene.compose_render_scene());
+        far_scene_bounds_intersection(ray.origin, ray.direction, render_scene.bounds).or_else(
+            || intersect_ray_with_xy_plane(ray.origin, ray.direction, self.orbit.target_z()),
+        )
     }
 
     fn click_pick_request(&mut self, x: f32, y: f32) -> Option<WebPickRequest> {
@@ -3553,6 +3883,111 @@ impl WebViewerState {
             depth_map_promise,
             depth_unpadded_bytes_per_row,
             depth_padded_bytes_per_row,
+        })
+    }
+
+    fn prepare_pick_color_readback(
+        &mut self,
+        request: WebPickRequest,
+    ) -> Result<WebPickColorReadback, String> {
+        let region = self.css_pick_request_to_region(request);
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("w web orbit pivot pick texture"),
+            size: wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Uint,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("w web orbit pivot pick texture view"),
+            ..Default::default()
+        });
+        let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("w web orbit pivot pick depth texture"),
+            size: wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.renderer.defaults().depth_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("w web orbit pivot pick depth texture view"),
+            ..Default::default()
+        });
+        let region = self.clamp_pick_region(region);
+        let unpadded_bytes_per_row = region
+            .width
+            .checked_mul(4)
+            .ok_or("orbit pivot pick region row is too wide")?;
+        let padded_bytes_per_row =
+            align_to_web(unpadded_bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let readback_size = u64::from(padded_bytes_per_row)
+            .checked_mul(u64::from(region.height))
+            .ok_or("orbit pivot pick region is too large")?;
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("w web orbit pivot pick readback buffer"),
+            size: readback_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("w web orbit pivot pick encoder"),
+            });
+        self.renderer
+            .render_pick_region(&mut encoder, &view, &depth_view, region);
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: region.x,
+                    y: region.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(region.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: region.width,
+                height: region.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([encoder.finish()]);
+
+        let map_promise = map_buffer_for_read_web(&readback);
+        let _ = self.device.poll(wgpu::PollType::Poll);
+
+        Ok(WebPickColorReadback {
+            region,
+            pick_targets: self.renderer.pick_targets().to_vec(),
+            readback,
+            map_promise,
+            unpadded_bytes_per_row,
+            padded_bytes_per_row,
         })
     }
 
@@ -3816,7 +4251,11 @@ impl WebViewerState {
 
     fn draw_pick_drag_overlay(&self) -> Result<(), String> {
         let mode = self.interaction_mode();
-        if !mode.can_pick() || mode.can_orbit() || !self.drag.active || !self.drag.is_box_select() {
+        if !mode.can_pick()
+            || self.drag.operation != DragOperation::Pick
+            || !self.drag.active
+            || !self.drag.is_box_select()
+        {
             return Ok(());
         }
 
@@ -3853,6 +4292,10 @@ impl WebViewerState {
 struct DragState {
     active: bool,
     suppress_next_click: bool,
+    generation: u64,
+    operation: DragOperation,
+    orbit_pivot: Option<DVec3>,
+    pan_anchor: Option<DVec3>,
     start_x: f32,
     start_y: f32,
     last_x: f32,
@@ -3877,31 +4320,65 @@ impl DragState {
 }
 
 #[cfg(target_arch = "wasm32")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WebInteractionMode {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DragOperation {
+    #[default]
     None,
     Orbit,
+    Pan,
     Pick,
-    OrbitPick,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, Debug)]
+struct WebPickRay {
+    origin: DVec3,
+    direction: DVec3,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WebInteractionMode {
+    orbit: bool,
+    pick: bool,
+    pan: bool,
 }
 
 #[cfg(target_arch = "wasm32")]
 impl WebInteractionMode {
     fn from_picker_value(value: &str) -> Self {
-        match value {
-            "none" => Self::None,
-            "pick" => Self::Pick,
-            "orbit-pick" | "pick-orbit" => Self::OrbitPick,
-            _ => Self::Orbit,
+        let mut mode = Self {
+            orbit: false,
+            pick: false,
+            pan: false,
+        };
+        for token in value.split('-') {
+            match token {
+                "orbit" => mode.orbit = true,
+                "pick" => mode.pick = true,
+                "pan" => mode.pan = true,
+                _ => {}
+            }
         }
+        if !mode.orbit && !mode.pick && !mode.pan && value != "none" {
+            mode.orbit = true;
+        }
+        if mode.orbit {
+            mode.pan = true;
+        }
+        mode
     }
 
     fn can_orbit(self) -> bool {
-        matches!(self, Self::Orbit | Self::OrbitPick)
+        self.orbit
     }
 
     fn can_pick(self) -> bool {
-        matches!(self, Self::Pick | Self::OrbitPick)
+        self.pick
+    }
+
+    fn can_pan(self) -> bool {
+        self.pan
     }
 }
 
@@ -3963,10 +4440,268 @@ impl OrbitCameraController {
             (self.pitch_radians + (f64::from(dy) * ORBIT_SENSITIVITY)).clamp(-MAX_PITCH, MAX_PITCH);
     }
 
+    fn orbit_around_point_by_pixels(&mut self, dx: f32, dy: f32, pivot: DVec3) {
+        const ORBIT_SENSITIVITY: f64 = 0.01;
+
+        let camera = self.camera();
+        let forward = normalized_or(camera.target - camera.eye, -WORLD_FORWARD);
+        let right = normalized_or(forward.cross(WORLD_UP), WORLD_RIGHT);
+        let yaw = DQuat::from_axis_angle(WORLD_UP, -(f64::from(dx) * ORBIT_SENSITIVITY));
+        let pitch = DQuat::from_axis_angle(right, -(f64::from(dy) * ORBIT_SENSITIVITY));
+        let rotation = yaw * pitch;
+        let next_camera = Camera {
+            eye: pivot + rotation * (camera.eye - pivot),
+            target: pivot + rotation * (camera.target - pivot),
+            ..camera
+        };
+        *self = Self::from_camera(next_camera);
+    }
+
+    fn pan_by_pixels(&mut self, dx: f32, dy: f32, viewport: ViewportSize) {
+        const PAN_SPEED: f64 = 1.25;
+
+        let camera = self.camera();
+        let forward = normalized_or(camera.target - camera.eye, -WORLD_FORWARD);
+        let right = normalized_xy_or(forward.cross(WORLD_UP), WORLD_RIGHT);
+        let up = normalized_xy_or(right.cross(forward), forward);
+        let viewport = viewport.clamped();
+        let world_per_pixel =
+            2.0 * self.radius * (self.vertical_fov_degrees.to_radians() * 0.5).tan()
+                / f64::from(viewport.height);
+        let offset = (-right * f64::from(dx) + up * f64::from(dy)) * world_per_pixel * PAN_SPEED;
+        self.target += offset;
+    }
+
+    fn translate_by(&mut self, offset: DVec3) {
+        self.target += DVec3::new(offset.x, offset.y, 0.0);
+    }
+
+    fn target_z(&self) -> f64 {
+        self.target.z
+    }
+
     fn zoom_by_wheel(&mut self, delta_y: f32) {
         let scale = (f64::from(delta_y) * 0.0015).exp();
         self.radius = (self.radius * scale).clamp(0.2, 500.0);
     }
+
+    fn zoom_towards_anchor_by_wheel(&mut self, delta_y: f32, anchor: DVec3) {
+        let scale = (f64::from(delta_y) * 0.0015).exp();
+        let next_radius = (self.radius * scale).clamp(0.2, 500.0);
+        let actual_scale = next_radius / self.radius.max(f64::EPSILON);
+        let camera = self.camera();
+        let next_camera = Camera {
+            eye: anchor + ((camera.eye - anchor) * actual_scale),
+            target: anchor + ((camera.target - anchor) * actual_scale),
+            ..camera
+        };
+        *self = Self::from_camera(next_camera);
+        self.radius = next_radius;
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn normalized_or(vector: DVec3, fallback: DVec3) -> DVec3 {
+    if vector.length_squared() > 1.0e-12 {
+        vector.normalize()
+    } else {
+        fallback
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn normalized_xy_or(vector: DVec3, fallback: DVec3) -> DVec3 {
+    let vector = DVec3::new(vector.x, vector.y, 0.0);
+    if vector.length_squared() > 1.0e-12 {
+        vector.normalize()
+    } else {
+        let fallback = DVec3::new(fallback.x, fallback.y, 0.0);
+        if fallback.length_squared() > 1.0e-12 {
+            fallback.normalize()
+        } else {
+            WORLD_FORWARD
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn pick_ray_for_viewport_pixel(
+    camera: Camera,
+    viewport: ViewportSize,
+    pixel_x: u32,
+    pixel_y: u32,
+) -> Option<WebPickRay> {
+    pick_ray_for_viewport_position(
+        camera,
+        viewport,
+        f64::from(pixel_x) + 0.5,
+        f64::from(pixel_y) + 0.5,
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn pick_ray_for_viewport_position(
+    camera: Camera,
+    viewport: ViewportSize,
+    pixel_x: f64,
+    pixel_y: f64,
+) -> Option<WebPickRay> {
+    let viewport = viewport.clamped();
+    let ndc_x = (pixel_x / f64::from(viewport.width)) * 2.0 - 1.0;
+    let ndc_y = 1.0 - ((pixel_y / f64::from(viewport.height)) * 2.0);
+    let world_from_clip = camera.clip_from_world(viewport).inverse();
+    let near = unproject_clip_point(world_from_clip, DVec4::new(ndc_x, ndc_y, 1.0, 1.0))?;
+    let far = unproject_clip_point(world_from_clip, DVec4::new(ndc_x, ndc_y, 0.0, 1.0))?;
+    let direction = (far - near).try_normalize()?;
+    Some(WebPickRay {
+        origin: near,
+        direction,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn unproject_clip_point(world_from_clip: DMat4, clip: DVec4) -> Option<DVec3> {
+    let world = world_from_clip * clip;
+    if world.w.abs() <= f64::EPSILON {
+        return None;
+    }
+    Some(world.truncate() / world.w)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn intersect_ray_with_xy_plane(origin: DVec3, direction: DVec3, plane_z: f64) -> Option<DVec3> {
+    if direction.z.abs() <= 1.0e-12 {
+        return None;
+    }
+    let distance = (plane_z - origin.z) / direction.z;
+    if !distance.is_finite() || distance < 0.0 {
+        return None;
+    }
+    Some(origin + direction * distance)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn far_scene_bounds_intersection(
+    origin: DVec3,
+    direction: DVec3,
+    bounds: Bounds3,
+) -> Option<DVec3> {
+    let bounds = orbit_anchor_bounds(bounds)?;
+    let mut near_t = f64::NEG_INFINITY;
+    let mut far_t = f64::INFINITY;
+
+    for (origin_axis, direction_axis, min_axis, max_axis) in [
+        (origin.x, direction.x, bounds.min.x, bounds.max.x),
+        (origin.y, direction.y, bounds.min.y, bounds.max.y),
+        (origin.z, direction.z, bounds.min.z, bounds.max.z),
+    ] {
+        if direction_axis.abs() <= 1.0e-12 {
+            if origin_axis < min_axis || origin_axis > max_axis {
+                return None;
+            }
+            continue;
+        }
+
+        let mut t0 = (min_axis - origin_axis) / direction_axis;
+        let mut t1 = (max_axis - origin_axis) / direction_axis;
+        if t0 > t1 {
+            std::mem::swap(&mut t0, &mut t1);
+        }
+        near_t = near_t.max(t0);
+        far_t = far_t.min(t1);
+        if near_t > far_t {
+            return None;
+        }
+    }
+
+    if far_t < 0.0 || !far_t.is_finite() {
+        return None;
+    }
+    Some(origin + direction * far_t)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn orbit_anchor_bounds(bounds: Bounds3) -> Option<Bounds3> {
+    if !bounds.min.is_finite() || !bounds.max.is_finite() {
+        return None;
+    }
+    let size = bounds.size();
+    if size.x < 0.0 || size.y < 0.0 || size.z < 0.0 {
+        return None;
+    }
+    let max_extent = size.x.max(size.y).max(size.z);
+    let epsilon = (max_extent * 1.0e-6).max(1.0e-4);
+    let min = DVec3::new(
+        if size.x <= epsilon {
+            bounds.min.x - epsilon
+        } else {
+            bounds.min.x
+        },
+        if size.y <= epsilon {
+            bounds.min.y - epsilon
+        } else {
+            bounds.min.y
+        },
+        if size.z <= epsilon {
+            bounds.min.z - epsilon
+        } else {
+            bounds.min.z
+        },
+    );
+    let max = DVec3::new(
+        if size.x <= epsilon {
+            bounds.max.x + epsilon
+        } else {
+            bounds.max.x
+        },
+        if size.y <= epsilon {
+            bounds.max.y + epsilon
+        } else {
+            bounds.max.y
+        },
+        if size.z <= epsilon {
+            bounds.max.z + epsilon
+        } else {
+            bounds.max.z
+        },
+    );
+    Some(Bounds3 { min, max })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wheel_delta_to_pixels(
+    delta_x: f32,
+    delta_y: f32,
+    delta_mode: u32,
+    viewport: ViewportSize,
+) -> (f32, f32) {
+    let scale = match delta_mode {
+        // DOM_DELTA_LINE. Browser defaults vary, but 16 px is a good UI-line proxy.
+        1 => 16.0,
+        // DOM_DELTA_PAGE.
+        2 => viewport.clamped().height as f32,
+        _ => 1.0,
+    };
+    (delta_x * scale, delta_y * scale)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn is_space_pan_keyboard_event(event: &KeyboardEvent) -> bool {
+    event.code() == "Space" || event.key() == " " || event.key() == "Spacebar"
+}
+
+#[cfg(target_arch = "wasm32")]
+fn keyboard_event_targets_text_input(event: &KeyboardEvent) -> bool {
+    let Some(target) = event.target() else {
+        return false;
+    };
+    let Some(element) = target.dyn_ref::<Element>() else {
+        return false;
+    };
+    matches!(
+        element.tag_name().to_ascii_lowercase().as_str(),
+        "input" | "textarea" | "select"
+    )
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -521,6 +521,7 @@
 
       #viewer-canvas {
         background: var(--surface-viewer);
+        outline: none;
         touch-action: none;
       }
 
@@ -1227,9 +1228,9 @@
         <div class="header-tools" role="toolbar" aria-label="3D tools">
           <select id="tool-picker" class="visually-hidden" aria-label="Active 3D tools">
             <option value="none">No tools</option>
-            <option value="orbit">Rotate</option>
+            <option value="orbit-pan">Rotate</option>
             <option value="pick">Pick</option>
-            <option value="orbit-pick" selected>Rotate and pick</option>
+            <option value="orbit-pick-pan" selected>Rotate and pick</option>
           </select>
           <button
             class="icon-button tool-button active"
@@ -1401,7 +1402,7 @@
     <main class="workspace">
       <section class="viewer-pane">
         <div class="viewport">
-          <canvas id="viewer-canvas"></canvas>
+          <canvas id="viewer-canvas" tabindex="0" aria-label="3D viewport"></canvas>
           <canvas id="axes-overlay"></canvas>
           <section
             class="outliner-window"
@@ -1713,23 +1714,26 @@
 
       function parseViewerToolValue(value) {
         const tokens = new Set(String(value || "").split("-").filter(Boolean));
+        const orbit = tokens.has("orbit");
         return {
-          orbit: tokens.has("orbit"),
+          orbit,
           pick: tokens.has("pick"),
+          pan: orbit,
         };
       }
 
       function viewerToolsToPickerValue(tools) {
-        if (tools?.orbit && tools?.pick) {
-          return "orbit-pick";
-        }
+        const tokens = [];
         if (tools?.orbit) {
-          return "orbit";
+          tokens.push("orbit");
         }
         if (tools?.pick) {
-          return "pick";
+          tokens.push("pick");
         }
-        return "none";
+        if (tools?.orbit) {
+          tokens.push("pan");
+        }
+        return tokens.length ? tokens.join("-") : "none";
       }
 
       function normalizeViewerTheme(theme) {
@@ -2010,11 +2014,13 @@
                 }));
               }
               case "tools/set": {
+                const orbit = Boolean(action.tools?.orbit);
                 return patch(action, (previous) => ({
                   ...previous,
                   tools: {
-                    orbit: Boolean(action.tools?.orbit),
+                    orbit,
                     pick: Boolean(action.tools?.pick),
+                    pan: orbit,
                   },
                 }));
               }
@@ -2022,6 +2028,19 @@
                 const tool = String(action.tool || "");
                 if (tool !== "orbit" && tool !== "pick") {
                   return state;
+                }
+                if (tool === "orbit") {
+                  return patch(action, (previous) => {
+                    const orbit = !previous.tools.orbit;
+                    return {
+                      ...previous,
+                      tools: {
+                        ...previous.tools,
+                        orbit,
+                        pan: orbit,
+                      },
+                    };
+                  });
                 }
                 return patch(action, (previous) => ({
                   ...previous,
@@ -2962,6 +2981,27 @@
           theme: () => appStateStore.getState().theme,
           setTheme: (theme) => appStateStore.dispatch({ type: "theme/set", theme }),
         };
+      }
+
+      function installViewerKeyboardFocus() {
+        const canvas = document.getElementById("viewer-canvas");
+        if (!canvas) {
+          return null;
+        }
+
+        const activate = () => {
+          window.dispatchEvent(new CustomEvent("w-viewer-keyboard-activate"));
+          try {
+            canvas.focus({ preventScroll: true });
+          } catch (_error) {
+            canvas.focus();
+          }
+        };
+
+        canvas.addEventListener("pointerenter", activate);
+        canvas.addEventListener("pointerdown", activate);
+
+        return { activate };
       }
 
       function installProjectOutliner(viewer, appStateStore) {
@@ -7981,7 +8021,29 @@
         let historyIndex = 0;
         let historyDraft = "";
         let promptBooted = false;
+        let inputActivated = false;
         let liveStatus = null;
+
+        const blurInput = () => {
+          inputActivated = false;
+          try {
+            term.blur?.();
+          } catch (_error) {
+            // Some xterm versions do not expose blur; the textarea fallback is enough.
+          }
+          term.textarea?.blur();
+        };
+
+        const focusInput = () => {
+          inputActivated = true;
+          term.focus();
+        };
+
+        const focusInputIfActivated = () => {
+          if (inputActivated) {
+            term.focus();
+          }
+        };
 
         const setRunning = (next) => {
           running = next;
@@ -8151,7 +8213,7 @@
         const bootPrompt = () => {
           fitTerminal();
           if (promptBooted) {
-            term.focus();
+            focusInputIfActivated();
             return;
           }
           for (const line of introLines) {
@@ -8160,7 +8222,7 @@
           term.write("\r\n");
           promptBooted = true;
           showPrompt();
-          term.focus();
+          focusInputIfActivated();
         };
 
         if (typeof ResizeObserver !== "undefined") {
@@ -8247,7 +8309,7 @@
             stopLiveStatus();
             setRunning(false);
             showPrompt();
-            term.focus();
+            focusInputIfActivated();
           }
         };
 
@@ -8391,7 +8453,13 @@
           }
         });
 
-        host.addEventListener("click", () => term.focus());
+        host.addEventListener("pointerdown", () => focusInput());
+        window.addEventListener("w-viewer-keyboard-activate", () => blurInput());
+        window.addEventListener("w-terminal-visibility-change", (event) => {
+          if (!event.detail?.visible) {
+            blurInput();
+          }
+        });
         if (host.classList.contains("active")) {
           requestAnimationFrame(() => bootPrompt());
           setTimeout(() => bootPrompt(), 50);
@@ -8400,7 +8468,7 @@
 
         shellApi = {
           resize: fitTerminal,
-          focus: () => term.focus(),
+          focus: () => focusInput(),
           setTheme: (theme) => {
             term.options.theme = terminalThemeForTheme(theme);
           },
@@ -8419,6 +8487,7 @@
             });
           },
           deactivate: () => {
+            blurInput();
             host.classList.remove("active");
             host.hidden = true;
           },
@@ -8480,10 +8549,14 @@
 
         for (const button of buttons) {
           button.addEventListener("click", () => {
+            const activeTool = button.dataset.terminalTool;
             appStateStore.dispatch({
               type: "terminal/set-active",
-              activeTool: button.dataset.terminalTool,
+              activeTool,
             });
+            if (!document.body.classList.contains("terminal-hidden")) {
+              requestAnimationFrame(() => terminalMap.get(activeTool)?.focus());
+            }
           });
         }
 
@@ -8515,6 +8588,7 @@
           const graphShell = createGraphShell(viewer, appState);
           graphShell.api.installController(createGraphController(viewer));
           const electronShell = installElectronShellControls();
+          window.wViewerKeyboardFocus = installViewerKeyboardFocus();
           const headerControls = installHeaderControls(viewer, graphShell, appState);
           const outliner = installProjectOutliner(viewer, appState);
           const repl = createReplApi(viewer, graphShell.api);
