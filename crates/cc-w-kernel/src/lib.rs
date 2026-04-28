@@ -190,7 +190,8 @@ fn tessellate_linear_swept_solid(
     request: &TessellationRequest,
 ) -> Result<TriangleMesh, KernelError> {
     let sampled = sample_profile(profile, request)?;
-    let (axis_u, axis_v) = plane_basis_from_normal(vector.normalize());
+    let axis_u = DVec3::X;
+    let axis_v = DVec3::Y;
     let cap_points = sampled
         .flattened_points()
         .into_iter()
@@ -548,12 +549,6 @@ fn map_profile_ring(ring: &[DVec2], origin: DVec3, axis_u: DVec3, axis_v: DVec3)
 
 fn map_profile_point(point: DVec2, origin: DVec3, axis_u: DVec3, axis_v: DVec3) -> DVec3 {
     origin + (axis_u * point.x) + (axis_v * point.y)
-}
-
-fn plane_basis_from_normal(normal: DVec3) -> (DVec3, DVec3) {
-    let axis_u = arbitrary_perpendicular(normal);
-    let axis_v = normal.cross(axis_u).normalize();
-    (axis_u, axis_v)
 }
 
 fn sample_profile(
@@ -1453,6 +1448,31 @@ mod tests {
             .expect("linear swept solid should tessellate");
 
         assert_eq!(mesh.triangle_count(), 8);
+        assert!(mesh.bounds.min.z.abs() <= 1.0e-12);
+        assert!((mesh.bounds.max.z - 2.0).abs() <= 1.0e-12);
+    }
+
+    #[test]
+    fn linear_swept_solids_keep_profile_in_local_xy_plane() {
+        let solid = SweptSolid::new(
+            Profile2::new(
+                rectangular_loop(DVec2::new(2.0, -1.0), DVec2::new(5.0, 3.0)),
+                vec![],
+            ),
+            SweepPath::Linear {
+                vector: DVec3::new(0.0, 0.0, 2.0),
+            },
+        )
+        .expect("solid");
+
+        let mesh = TrivialKernel
+            .tessellate_primitive(&GeometryPrimitive::SweptSolid(solid))
+            .expect("linear swept solid should tessellate");
+
+        assert!((mesh.bounds.min.x - 2.0).abs() <= 1.0e-12);
+        assert!((mesh.bounds.max.x - 5.0).abs() <= 1.0e-12);
+        assert!((mesh.bounds.min.y + 1.0).abs() <= 1.0e-12);
+        assert!((mesh.bounds.max.y - 3.0).abs() <= 1.0e-12);
         assert!(mesh.bounds.min.z.abs() <= 1.0e-12);
         assert!((mesh.bounds.max.z - 2.0).abs() <= 1.0e-12);
     }

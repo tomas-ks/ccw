@@ -5,6 +5,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cc_w_backend::{GeometryBackend, GeometryBackendError};
 use cc_w_db::{ImportedGeometryResourceInstance, ImportedGeometrySceneResource};
@@ -35,9 +36,8 @@ query {
 }
 "#;
 
-const BODY_PACKAGE_CACHE_VERSION: u32 = 19;
+const BODY_PACKAGE_CACHE_VERSION: u32 = 39;
 const BODY_PACKAGE_CACHE_FILE: &str = "prepared-package.json";
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IfcSchemaId {
     Ifc2x3Tc1,
@@ -216,13 +216,13 @@ impl IfcArtifactLayout {
     }
 
     pub fn authoritative_schema(&self) -> Result<IfcSchemaId, VelrIfcError> {
-        if let Some(schema) = schema_from_import_bundle_if_exists(&self.import_bundle)? {
-            return Ok(schema);
-        }
         if let Some(schema) = schema_from_import_log_if_exists(&self.import_log)? {
             return Ok(schema);
         }
         if let Some(schema) = schema_from_source_ifc_if_exists(&self.source_ifc)? {
+            return Ok(schema);
+        }
+        if let Some(schema) = schema_from_import_bundle_if_exists(&self.import_bundle)? {
             return Ok(schema);
         }
 
@@ -380,6 +380,54 @@ impl IfcBodyPackageCacheStatus {
 pub struct IfcBodyPackageLoad {
     pub package: PreparedGeometryPackage,
     pub cache_status: IfcBodyPackageCacheStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IfcBodyPhaseTiming {
+    pub name: &'static str,
+    pub elapsed_ms: u128,
+    pub rows: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IfcBodyBrepDiagnostic {
+    pub limit_items: Option<usize>,
+    pub geometry_items: usize,
+    pub geometry_faces: usize,
+    pub geometry_point_rows: usize,
+    pub metadata_rows: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct IfcBodyPackageDiagnostic {
+    pub package: PreparedGeometryPackage,
+    pub timings: Vec<IfcBodyPhaseTiming>,
+    pub brep: IfcBodyBrepDiagnostic,
+    pub cache_written: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct IfcBodyPackageCacheDiagnostic {
+    pub package: Option<PreparedGeometryPackage>,
+    pub cache_status: IfcBodyPackageCacheStatus,
+    pub cache_bytes: Option<usize>,
+    pub timings: Vec<IfcBodyPhaseTiming>,
+}
+
+impl IfcBodyPackageDiagnostic {
+    pub fn geometry_summary(&self) -> IfcBodyGeometrySummary {
+        summarize_body_package(&self.package)
+    }
+
+    pub fn instance_summaries(&self) -> Vec<IfcBodyInstanceSummary> {
+        summarize_body_instances(&self.package)
+    }
+}
+
+impl IfcBodyPackageCacheDiagnostic {
+    pub fn geometry_summary(&self) -> Option<IfcBodyGeometrySummary> {
+        self.package.as_ref().map(summarize_body_package)
+    }
 }
 
 impl IfcBodyPackageLoad {
@@ -660,6 +708,7 @@ struct IfcBodyRecord {
     product_id: u64,
     placement_id: Option<u64>,
     item_id: u64,
+    occurrence_id: Option<u64>,
     global_id: Option<String>,
     name: Option<String>,
     object_type: Option<String>,
@@ -670,16 +719,130 @@ struct IfcBodyRecord {
     display_color: Option<DisplayColor>,
     declared_entity: String,
     item_transform: DMat4,
-    primitive: GeometryPrimitive,
+    primitive: Arc<GeometryPrimitive>,
+}
+
+#[derive(Clone, Debug)]
+struct FacetedBrepFaceAccumulator {
+    ordinal: Option<u64>,
+    points: Vec<FacetedBrepPoint>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FacetedBrepPoint {
+    ordinal: Option<u64>,
+    sequence: usize,
+    coordinates: DVec3,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FacetedBrepGeometryDiagnostic {
+    geometry_items: usize,
+    geometry_faces: usize,
+    geometry_point_rows: usize,
+}
+
+#[derive(Clone, Debug)]
+struct FacetedBrepGeometryQuery {
+    geometry_by_item: HashMap<u64, Arc<GeometryPrimitive>>,
+    diagnostic: FacetedBrepGeometryDiagnostic,
+    timings: Vec<IfcBodyPhaseTiming>,
+}
+
+#[derive(Clone, Debug)]
+struct FacetedBrepRecordQuery {
+    records: Vec<IfcBodyRecord>,
+    diagnostic: IfcBodyBrepDiagnostic,
+    timings: Vec<IfcBodyPhaseTiming>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ExtrudedBodyGeometry {
+    primitive: Arc<GeometryPrimitive>,
+    item_transform: DMat4,
 }
 
 #[derive(Clone, Debug)]
 struct IfcLocalPlacementRecord {
     placement_id: u64,
-    parent_placement_id: Option<u64>,
+    parent: Option<IfcPlacementParent>,
     relative_location: Option<DVec3>,
     axis: Option<DVec3>,
     ref_direction: Option<DVec3>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IfcPlacementParent {
+    Local(u64),
+    Linear(u64),
+}
+
+#[derive(Clone, Debug)]
+struct IfcLinearPlacementRecord {
+    parent_local_placement_id: Option<u64>,
+    curve_id: Option<u64>,
+    distance_along: f64,
+    offset_longitudinal: f64,
+    offset_lateral: f64,
+    offset_vertical: f64,
+}
+
+#[derive(Clone, Debug)]
+struct IfcGradientCurveRecord {
+    horizontal_segments: Vec<IfcGradientCurveSegment>,
+    vertical_segments: Vec<IfcGradientCurveSegment>,
+}
+
+#[derive(Clone, Debug)]
+struct IfcSectionedSolidProfile {
+    ordinal: u64,
+    points: Vec<DVec2>,
+}
+
+#[derive(Clone, Debug)]
+struct IfcSectionedSolidPosition {
+    ordinal: u64,
+    curve_entity: String,
+    curve_id: u64,
+    distance_along: f64,
+    offset_lateral: f64,
+    offset_vertical: f64,
+}
+
+#[derive(Clone, Debug)]
+struct IfcSectionedSolidRing {
+    positions: Vec<DVec3>,
+    tangent: DVec3,
+}
+
+#[derive(Clone, Debug)]
+struct IfcPolylineDirectrixRecord {
+    points: Vec<DVec3>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IfcPolylineDirectrixPoint {
+    ordinal: Option<u64>,
+    sequence: usize,
+    coordinates: DVec3,
+}
+
+#[derive(Clone, Debug)]
+struct IfcGradientCurveSegment {
+    start_station: f64,
+    length: f64,
+    start_point: DVec2,
+    direction: DVec2,
+    end_point: Option<DVec2>,
+    end_direction: Option<DVec2>,
+    kind: IfcGradientCurveSegmentKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum IfcGradientCurveSegmentKind {
+    Line,
+    Circular { radius: f64, turn_sign: f64 },
+    Clothoid,
 }
 
 #[derive(Clone, Debug)]
@@ -756,6 +919,15 @@ impl VelrIfcModel {
 
         let model = Self::open(layout)?;
         model.build_body_package_with_cache_status()
+    }
+
+    pub fn diagnose_body_package_cache_from_artifacts_root(
+        artifacts_root: impl AsRef<Path>,
+        model_slug: impl Into<String>,
+    ) -> Result<IfcBodyPackageCacheDiagnostic, VelrIfcError> {
+        let layout = IfcArtifactLayout::new(artifacts_root, model_slug);
+        layout.validate_cypher_inputs()?;
+        diagnose_cached_body_package_from_layout(&layout)
     }
 
     pub fn layout(&self) -> &IfcArtifactLayout {
@@ -864,6 +1036,187 @@ impl VelrIfcModel {
             .map_err(VelrIfcError::from)
     }
 
+    pub fn build_body_package_diagnostic(
+        &self,
+        brep_limit_items: Option<usize>,
+    ) -> Result<IfcBodyPackageDiagnostic, VelrIfcError> {
+        self.build_body_package_diagnostic_with_cache_write(brep_limit_items, false)
+    }
+
+    pub fn build_body_package_diagnostic_with_cache_write(
+        &self,
+        brep_limit_items: Option<usize>,
+        write_cache: bool,
+    ) -> Result<IfcBodyPackageDiagnostic, VelrIfcError> {
+        if write_cache && brep_limit_items.is_some() {
+            return Err(VelrIfcError::IfcGeometryData(
+                "diagnostic cache write requires a complete body package; remove --limit-brep-items"
+                    .to_string(),
+            ));
+        }
+
+        let mut timings = Vec::new();
+
+        eprintln!("w velr body diagnostic phase placement_transforms start");
+        let start = Instant::now();
+        let placement_transforms = self.resolve_object_placement_transforms()?;
+        eprintln!(
+            "w velr body diagnostic phase placement_transforms done rows={}",
+            placement_transforms.len()
+        );
+        timings.push(phase_timing(
+            "placement_transforms",
+            start.elapsed(),
+            Some(placement_transforms.len()),
+        ));
+
+        eprintln!("w velr body diagnostic phase triangulated_body_records start");
+        let start = Instant::now();
+        let mut records = self.query_body_triangulated_records()?;
+        eprintln!(
+            "w velr body diagnostic phase triangulated_body_records done rows={}",
+            records.len()
+        );
+        timings.push(phase_timing(
+            "triangulated_body_records",
+            start.elapsed(),
+            Some(records.len()),
+        ));
+
+        eprintln!("w velr body diagnostic phase polygonal_face_set_body_records start");
+        let start = Instant::now();
+        let polygonal_face_set_records = self.query_body_polygonal_face_set_records()?;
+        eprintln!(
+            "w velr body diagnostic phase polygonal_face_set_body_records done rows={}",
+            polygonal_face_set_records.len()
+        );
+        timings.push(phase_timing(
+            "polygonal_face_set_body_records",
+            start.elapsed(),
+            Some(polygonal_face_set_records.len()),
+        ));
+        records.extend(polygonal_face_set_records);
+
+        eprintln!("w velr body diagnostic phase extruded_body_records start");
+        let start = Instant::now();
+        let extruded_records = self.query_body_extruded_records()?;
+        eprintln!(
+            "w velr body diagnostic phase extruded_body_records done rows={}",
+            extruded_records.len()
+        );
+        timings.push(phase_timing(
+            "extruded_body_records",
+            start.elapsed(),
+            Some(extruded_records.len()),
+        ));
+        records.extend(extruded_records);
+
+        eprintln!("w velr body diagnostic phase mapped_polygonal_face_set_body_records start");
+        let start = Instant::now();
+        let mapped_polygonal_face_set_records =
+            self.query_body_mapped_polygonal_face_set_records()?;
+        eprintln!(
+            "w velr body diagnostic phase mapped_polygonal_face_set_body_records done rows={}",
+            mapped_polygonal_face_set_records.len()
+        );
+        timings.push(phase_timing(
+            "mapped_polygonal_face_set_body_records",
+            start.elapsed(),
+            Some(mapped_polygonal_face_set_records.len()),
+        ));
+        records.extend(mapped_polygonal_face_set_records);
+
+        eprintln!("w velr body diagnostic phase sectioned_solid_horizontal_body_records start");
+        let start = Instant::now();
+        let sectioned_solid_horizontal_records =
+            self.query_body_sectioned_solid_horizontal_records()?;
+        eprintln!(
+            "w velr body diagnostic phase sectioned_solid_horizontal_body_records done rows={}",
+            sectioned_solid_horizontal_records.len()
+        );
+        timings.push(phase_timing(
+            "sectioned_solid_horizontal_body_records",
+            start.elapsed(),
+            Some(sectioned_solid_horizontal_records.len()),
+        ));
+        records.extend(sectioned_solid_horizontal_records);
+
+        eprintln!("w velr body diagnostic phase mapped_extruded_body_records start");
+        let start = Instant::now();
+        let mapped_extruded_records = self.query_body_mapped_extruded_records()?;
+        eprintln!(
+            "w velr body diagnostic phase mapped_extruded_body_records done rows={}",
+            mapped_extruded_records.len()
+        );
+        timings.push(phase_timing(
+            "mapped_extruded_body_records",
+            start.elapsed(),
+            Some(mapped_extruded_records.len()),
+        ));
+        records.extend(mapped_extruded_records);
+
+        eprintln!("w velr body diagnostic phase brep_body_records start");
+        let brep_query = self.query_body_faceted_brep_records_limited(brep_limit_items)?;
+        eprintln!(
+            "w velr body diagnostic phase brep_body_records done rows={}",
+            brep_query.records.len()
+        );
+        timings.extend(brep_query.timings);
+        records.extend(brep_query.records);
+
+        let source_space = self.query_body_source_space()?;
+
+        eprintln!(
+            "w velr body diagnostic phase imported_scene_assembly start rows={}",
+            records.len()
+        );
+        let start = Instant::now();
+        let scene = imported_scene_resource_from_body_records(
+            records,
+            &placement_transforms,
+            source_space,
+        )?;
+        let scene_rows = scene.instances.len();
+        eprintln!("w velr body diagnostic phase imported_scene_assembly done rows={scene_rows}");
+        timings.push(phase_timing(
+            "imported_scene_assembly",
+            start.elapsed(),
+            Some(scene_rows),
+        ));
+
+        eprintln!("w velr body diagnostic phase backend_prepare_package start");
+        let start = Instant::now();
+        let package = GeometryBackend::default()
+            .build_imported_scene_package(scene)
+            .map_err(VelrIfcError::from)?;
+        eprintln!(
+            "w velr body diagnostic phase backend_prepare_package done rows={}",
+            package.instance_count()
+        );
+        timings.push(phase_timing(
+            "backend_prepare_package",
+            start.elapsed(),
+            Some(package.instance_count()),
+        ));
+
+        let cache_written = if write_cache {
+            let start = Instant::now();
+            write_cached_body_package(&self.layout, &package)?;
+            timings.push(phase_timing("cache_write", start.elapsed(), None));
+            true
+        } else {
+            timings.push(phase_timing("cache_write_skipped", Duration::ZERO, None));
+            false
+        };
+
+        Ok(IfcBodyPackageDiagnostic {
+            package,
+            timings,
+            brep: brep_query.diagnostic,
+            cache_written,
+        })
+    }
+
     pub fn placement_summary(&self) -> Result<IfcPlacementSummary, VelrIfcError> {
         let placements = self.query_local_placement_records()?;
         Ok(IfcPlacementSummary {
@@ -878,7 +1231,7 @@ impl VelrIfcModel {
                 .count(),
             placements_with_parent: placements
                 .iter()
-                .filter(|placement| placement.parent_placement_id.is_some())
+                .filter(|placement| placement.parent.is_some())
                 .count(),
         })
     }
@@ -886,59 +1239,85 @@ impl VelrIfcModel {
     pub fn extract_body_scene_resource(
         &self,
     ) -> Result<ImportedGeometrySceneResource, VelrIfcError> {
-        let placement_transforms = self.resolve_local_placement_transforms()?;
+        let placement_transforms = self.resolve_object_placement_transforms()?;
         let mut records = self.query_body_triangulated_records()?;
+        records.extend(self.query_body_polygonal_face_set_records()?);
         records.extend(self.query_body_extruded_records()?);
-        imported_scene_resource_from_body_records(records, &placement_transforms)
+        records.extend(self.query_body_mapped_polygonal_face_set_records()?);
+        records.extend(self.query_body_sectioned_solid_horizontal_records()?);
+        records.extend(self.query_body_mapped_extruded_records()?);
+        records.extend(self.query_body_faceted_brep_records()?);
+        let source_space = self.query_body_source_space()?;
+        imported_scene_resource_from_body_records(records, &placement_transforms, source_space)
     }
 
     fn query_body_triangulated_records(&self) -> Result<Vec<IfcBodyRecord>, VelrIfcError> {
         let rows = self.execute_cypher_rows(
             r#"
 MATCH (p:IfcProduct)-[:REPRESENTATION]->(:IfcProductDefinitionShape)-[:REPRESENTATIONS]->(rep:IfcShapeRepresentation)-[:ITEMS]->(item:IfcTriangulatedFaceSet)-[:COORDINATES]->(pl:IfcCartesianPointList3D)
-OPTIONAL MATCH (p)-[:OBJECT_PLACEMENT]->(placement:IfcLocalPlacement)
+OPTIONAL MATCH (p)-[:OBJECT_PLACEMENT]->(placement)
+OPTIONAL MATCH (p)<-[:RELATED_ELEMENTS]-(:IfcRelContainedInSpatialStructure)-[:RELATING_STRUCTURE]->(:IfcProduct)-[:OBJECT_PLACEMENT]->(container_placement)
 OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelDefinesByType)-[:RELATING_TYPE]->(type_node)
 OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelAssociatesClassification)-[:RELATING_CLASSIFICATION]->(classification_ref)
 OPTIONAL MATCH (item)<-[:ITEM]-(styled:IfcStyledItem)
+OPTIONAL MATCH (styled)-[:STYLES]->(style_assignment:IfcPresentationStyleAssignment)
+OPTIONAL MATCH (style_assignment)-[:STYLES]->(assigned_surface_style:IfcSurfaceStyle)
 OPTIONAL MATCH (styled)-[:STYLES]->(surface_style:IfcSurfaceStyle)
 OPTIONAL MATCH (surface_style)-[:STYLES]->(rendering:IfcSurfaceStyleRendering)
 OPTIONAL MATCH (rendering)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
+OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_rendering:IfcSurfaceStyleRendering)
+OPTIONAL MATCH (assigned_rendering)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
 WHERE rep.RepresentationIdentifier = 'Body'
 WITH p, placement, item, pl,
+     head(collect(DISTINCT container_placement)) AS container_placement_id,
      head(collect(DISTINCT { object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType })) AS type_semantics,
      head(collect(DISTINCT classification_ref.Identification)) AS classification_identification,
-     head(collect(DISTINCT { red: rgb.Red, green: rgb.Green, blue: rgb.Blue })) AS surface_rgb
-RETURN id(p) AS product_id, id(placement) AS placement_id, id(item) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, pl.CoordList AS coord_list, item.CoordIndex AS coord_index, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue
+     head(collect(DISTINCT { red: rgb.Red, green: rgb.Green, blue: rgb.Blue })) AS surface_rgb,
+     head(collect(DISTINCT { red: assigned_rgb.Red, green: assigned_rgb.Green, blue: assigned_rgb.Blue })) AS assigned_surface_rgb
+RETURN id(p) AS product_id, id(placement) AS placement_id, container_placement_id, id(item) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, pl.CoordList AS coord_list, item.CoordIndex AS coord_index, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue, assigned_surface_rgb.red AS assigned_style_red, assigned_surface_rgb.green AS assigned_style_green, assigned_surface_rgb.blue AS assigned_style_blue
 ORDER BY item_id
 "#,
         )?;
 
-        rows.rows
+        let records: Vec<IfcBodyRecord> = rows
+            .rows
             .into_iter()
             .map(|row| {
                 let product_id = parse_u64_cell(row.first(), "product_id")?;
                 let placement_id = parse_optional_u64_cell(row.get(1), "placement_id")?;
-                let item_id = parse_u64_cell(row.get(2), "item_id")?;
-                let global_id = parse_optional_string_cell(row.get(3));
-                let name = parse_optional_string_cell(row.get(4));
-                let object_type = parse_optional_string_cell(row.get(5));
-                let predefined_type = parse_optional_string_cell(row.get(6));
-                let type_object_type = parse_optional_string_cell(row.get(7));
-                let type_predefined_type = parse_optional_string_cell(row.get(8));
-                let classification_identification = parse_optional_string_cell(row.get(9));
-                let display_color =
-                    parse_optional_display_color_cells(row.get(13), row.get(14), row.get(15))?;
+                let container_placement_id =
+                    parse_optional_node_identity_cell(row.get(2), "container_placement_id")?;
+                let placement_id = placement_id.or(container_placement_id);
+                let item_id = parse_u64_cell(row.get(3), "item_id")?;
+                let global_id = parse_optional_string_cell(row.get(4));
+                let name = parse_optional_string_cell(row.get(5));
+                let object_type = parse_optional_string_cell(row.get(6));
+                let predefined_type = parse_optional_string_cell(row.get(7));
+                let type_object_type = parse_optional_string_cell(row.get(8));
+                let type_predefined_type = parse_optional_string_cell(row.get(9));
+                let classification_identification = parse_optional_string_cell(row.get(10));
+                let display_color = parse_optional_db_style_color_cells(
+                    row.get(14),
+                    row.get(15),
+                    row.get(16),
+                    row.get(17),
+                    row.get(18),
+                    row.get(19),
+                )?;
                 let declared_entity =
-                    parse_required_string_cell(row.get(10), "declared_entity")?.to_string();
-                let primitive = GeometryPrimitive::Tessellated(tessellated_geometry_from_row(
-                    parse_required_string_cell(row.get(11), "coord_list")?,
-                    parse_required_string_cell(row.get(12), "coord_index")?,
-                )?);
+                    parse_required_string_cell(row.get(11), "declared_entity")?.to_string();
+                let primitive = Arc::new(GeometryPrimitive::Tessellated(
+                    tessellated_geometry_from_row(
+                        parse_required_string_cell(row.get(12), "coord_list")?,
+                        parse_required_string_cell(row.get(13), "coord_index")?,
+                    )?,
+                ));
 
                 Ok(IfcBodyRecord {
                     product_id,
                     placement_id,
                     item_id,
+                    occurrence_id: None,
                     global_id,
                     name,
                     object_type,
@@ -952,37 +1331,592 @@ ORDER BY item_id
                     primitive,
                 })
             })
-            .collect()
+            .collect::<Result<_, VelrIfcError>>()?;
+
+        Ok(records)
     }
 
-    fn query_body_extruded_records(&self) -> Result<Vec<IfcBodyRecord>, VelrIfcError> {
+    fn query_body_source_space(&self) -> Result<SourceSpace, VelrIfcError> {
+        let length_unit = self
+            .query_length_unit_from_database()?
+            .unwrap_or(LengthUnit::Meter);
+        Ok(SourceSpace::new(CoordinateFrame::w_world(), length_unit))
+    }
+
+    fn query_length_unit_from_database(&self) -> Result<Option<LengthUnit>, VelrIfcError> {
+        let conversion_rows = self.execute_cypher_rows(
+            r#"
+MATCH (unit:IfcConversionBasedUnit)
+WHERE unit.UnitType = 'LENGTHUNIT'
+RETURN unit.Name AS name
+LIMIT 1
+"#,
+        )?;
+        if let Some(row) = conversion_rows.rows.first() {
+            if let Some(unit) =
+                parse_length_unit_from_conversion_name(parse_optional_string_cell(row.first()))
+            {
+                return Ok(Some(unit));
+            }
+        }
+
+        let si_rows = self.execute_cypher_rows(
+            r#"
+MATCH (unit:IfcSIUnit)
+WHERE unit.UnitType = 'LENGTHUNIT'
+RETURN unit.Name AS name, unit.Prefix AS prefix
+LIMIT 1
+"#,
+        )?;
+        let Some(row) = si_rows.rows.first() else {
+            return Ok(None);
+        };
+
+        Ok(parse_length_unit_from_si_unit_cells(
+            parse_optional_string_cell(row.first()),
+            parse_optional_string_cell(row.get(1)),
+        ))
+    }
+
+    fn query_polygonal_face_set_geometry_by_item_ids(
+        &self,
+        item_ids: Option<&HashSet<u64>>,
+    ) -> Result<HashMap<u64, Arc<GeometryPrimitive>>, VelrIfcError> {
+        if let Some(item_ids) = item_ids {
+            let mut item_ids = item_ids.iter().copied().collect::<Vec<_>>();
+            item_ids.sort_unstable();
+            let mut geometry_by_item = HashMap::new();
+            for (index, item_id) in item_ids.iter().copied().enumerate() {
+                if index == 0 || (index + 1) % 10 == 0 || index + 1 == item_ids.len() {
+                    eprintln!(
+                        "w velr polygonal geometry item {}/{}",
+                        index + 1,
+                        item_ids.len()
+                    );
+                }
+                geometry_by_item
+                    .extend(self.query_polygonal_face_set_geometry_by_single_item(Some(item_id))?);
+            }
+            return Ok(geometry_by_item);
+        }
+
+        self.query_polygonal_face_set_geometry_by_single_item(None)
+    }
+
+    fn query_polygonal_face_set_geometry_by_single_item(
+        &self,
+        item_id: Option<u64>,
+    ) -> Result<HashMap<u64, Arc<GeometryPrimitive>>, VelrIfcError> {
+        let item_filter = item_id
+            .map(|item_id| format!("WITH item WHERE id(item) = {item_id}"))
+            .unwrap_or_default();
+        let coord_rows = self.execute_cypher_rows(&format!(
+            r#"
+MATCH (item:IfcPolygonalFaceSet)
+{item_filter}
+MATCH (item)-[:COORDINATES]->(pl:IfcCartesianPointList3D)
+RETURN id(item) AS item_id, pl.CoordList AS coord_list
+ORDER BY item_id
+"#
+        ))?;
+        let face_rows = self.execute_cypher_rows(&format!(
+            r#"
+MATCH (item:IfcPolygonalFaceSet)
+{item_filter}
+MATCH (item)-[face_edge:FACES]->(face:IfcIndexedPolygonalFace)
+RETURN id(item) AS item_id, face_edge.ordinal AS face_ordinal, face.CoordIndex AS coord_index
+ORDER BY item_id, face_edge.ordinal
+"#
+        ))?;
+
+        let mut coord_list_by_item = HashMap::<u64, String>::new();
+        for row in coord_rows.rows {
+            let item_id = parse_u64_cell(row.first(), "item_id")?;
+            let coord_list = parse_required_string_cell(row.get(1), "coord_list")?.to_string();
+            coord_list_by_item.insert(item_id, coord_list);
+        }
+
+        let mut coord_index_rows_by_item = HashMap::<u64, Vec<(u64, String)>>::new();
+        for row in face_rows.rows {
+            let item_id = parse_u64_cell(row.first(), "item_id")?;
+            let face_ordinal =
+                parse_optional_u64_cell(row.get(1), "face_ordinal")?.unwrap_or_default();
+            let coord_index = parse_required_string_cell(row.get(2), "coord_index")?.to_string();
+            coord_index_rows_by_item
+                .entry(item_id)
+                .or_default()
+                .push((face_ordinal, coord_index));
+        }
+
+        let mut geometry_by_item = HashMap::new();
+        for (item_id, coord_list) in coord_list_by_item {
+            let Some(mut coord_index_rows) = coord_index_rows_by_item.remove(&item_id) else {
+                continue;
+            };
+            coord_index_rows.sort_by_key(|(face_ordinal, _)| *face_ordinal);
+            let primitive = Arc::new(GeometryPrimitive::Tessellated(
+                tessellated_geometry_from_coord_index_rows(&coord_list, &coord_index_rows)?,
+            ));
+            geometry_by_item.insert(item_id, primitive);
+        }
+
+        Ok(geometry_by_item)
+    }
+
+    fn query_body_polygonal_face_set_records(&self) -> Result<Vec<IfcBodyRecord>, VelrIfcError> {
         let rows = self.execute_cypher_rows(
             r#"
-MATCH (p:IfcProduct)-[:REPRESENTATION]->(:IfcProductDefinitionShape)-[:REPRESENTATIONS]->(rep:IfcShapeRepresentation)-[:ITEMS]->(solid:IfcExtrudedAreaSolid)-[:SWEPT_AREA]->(profile:IfcArbitraryClosedProfileDef)-[:OUTER_CURVE]->(poly:IfcPolyline)-[edge:POINTS]->(pt:IfcCartesianPoint)
-MATCH (solid)-[:EXTRUDED_DIRECTION]->(dir:IfcDirection)
-OPTIONAL MATCH (p)-[:OBJECT_PLACEMENT]->(placement:IfcLocalPlacement)
+MATCH (rep:IfcShapeRepresentation)
+WHERE rep.RepresentationIdentifier = 'Body'
+WITH rep
+MATCH (rep)-[:ITEMS]->(item:IfcPolygonalFaceSet)
+WITH rep, item
+MATCH (rep)<-[:REPRESENTATIONS]-(shape:IfcProductDefinitionShape)
+WITH item, shape
+MATCH (shape)<-[:REPRESENTATION]-(p:IfcProduct)
+OPTIONAL MATCH (p)-[:OBJECT_PLACEMENT]->(placement)
+OPTIONAL MATCH (p)<-[:RELATED_ELEMENTS]-(:IfcRelContainedInSpatialStructure)-[:RELATING_STRUCTURE]->(:IfcProduct)-[:OBJECT_PLACEMENT]->(container_placement)
 OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelDefinesByType)-[:RELATING_TYPE]->(type_node)
 OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelAssociatesClassification)-[:RELATING_CLASSIFICATION]->(classification_ref)
-OPTIONAL MATCH (solid)-[:POSITION]->(solid_position:IfcAxis2Placement3D)
-OPTIONAL MATCH (solid_position)-[:LOCATION]->(solid_location:IfcCartesianPoint)
-OPTIONAL MATCH (solid_position)-[:AXIS]->(solid_axis:IfcDirection)
-OPTIONAL MATCH (solid_position)-[:REF_DIRECTION]->(solid_ref_direction:IfcDirection)
-OPTIONAL MATCH (solid)<-[:ITEM]-(styled:IfcStyledItem)
+OPTIONAL MATCH (item)<-[:ITEM]-(styled:IfcStyledItem)
+OPTIONAL MATCH (styled)-[:STYLES]->(style_assignment:IfcPresentationStyleAssignment)
+OPTIONAL MATCH (style_assignment)-[:STYLES]->(assigned_surface_style:IfcSurfaceStyle)
 OPTIONAL MATCH (styled)-[:STYLES]->(surface_style:IfcSurfaceStyle)
 OPTIONAL MATCH (surface_style)-[:STYLES]->(rendering:IfcSurfaceStyleRendering)
 OPTIONAL MATCH (rendering)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
-WHERE rep.RepresentationIdentifier = 'Body'
-WITH p, placement, solid, dir, solid_location, solid_axis, solid_ref_direction,
-     collect(DISTINCT { ordinal: edge.ordinal, coordinates: pt.Coordinates }) AS point_rows,
+OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_rendering:IfcSurfaceStyleRendering)
+OPTIONAL MATCH (assigned_rendering)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
+WITH p, placement, item,
+     head(collect(DISTINCT container_placement)) AS container_placement_id,
      head(collect(DISTINCT { object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType })) AS type_semantics,
      head(collect(DISTINCT classification_ref.Identification)) AS classification_identification,
-     head(collect(DISTINCT { red: rgb.Red, green: rgb.Green, blue: rgb.Blue })) AS surface_rgb
-RETURN id(p) AS product_id, id(placement) AS placement_id, id(solid) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, solid.Depth AS depth, dir.DirectionRatios AS extruded_direction, point_rows, solid_location.Coordinates AS solid_position_location, solid_axis.DirectionRatios AS solid_position_axis, solid_ref_direction.DirectionRatios AS solid_position_ref_direction, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue
+     head(collect(DISTINCT { red: rgb.Red, green: rgb.Green, blue: rgb.Blue })) AS surface_rgb,
+     head(collect(DISTINCT { red: assigned_rgb.Red, green: assigned_rgb.Green, blue: assigned_rgb.Blue })) AS assigned_surface_rgb
+RETURN id(p) AS product_id, id(placement) AS placement_id, container_placement_id, id(item) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue, assigned_surface_rgb.red AS assigned_style_red, assigned_surface_rgb.green AS assigned_style_green, assigned_surface_rgb.blue AS assigned_style_blue
 ORDER BY item_id
 "#,
         )?;
 
-        rows.rows
+        let raw_rows = rows.rows;
+        let item_ids = raw_rows
+            .iter()
+            .map(|row| parse_u64_cell(row.get(3), "item_id"))
+            .collect::<Result<HashSet<_>, VelrIfcError>>()?;
+        let geometry_by_item =
+            self.query_polygonal_face_set_geometry_by_item_ids(Some(&item_ids))?;
+
+        let records: Vec<IfcBodyRecord> = raw_rows
+            .into_iter()
+            .map(|row| {
+                let product_id = parse_u64_cell(row.first(), "product_id")?;
+                let placement_id = parse_optional_u64_cell(row.get(1), "placement_id")?;
+                let container_placement_id =
+                    parse_optional_node_identity_cell(row.get(2), "container_placement_id")?;
+                let placement_id = placement_id.or(container_placement_id);
+                let item_id = parse_u64_cell(row.get(3), "item_id")?;
+                let global_id = parse_optional_string_cell(row.get(4));
+                let name = parse_optional_string_cell(row.get(5));
+                let object_type = parse_optional_string_cell(row.get(6));
+                let predefined_type = parse_optional_string_cell(row.get(7));
+                let type_object_type = parse_optional_string_cell(row.get(8));
+                let type_predefined_type = parse_optional_string_cell(row.get(9));
+                let classification_identification = parse_optional_string_cell(row.get(10));
+                let Some(primitive) = geometry_by_item.get(&item_id).cloned() else {
+                    return Ok(None);
+                };
+                let display_color = parse_optional_db_style_color_cells(
+                    row.get(12),
+                    row.get(13),
+                    row.get(14),
+                    row.get(15),
+                    row.get(16),
+                    row.get(17),
+                )?;
+                let declared_entity =
+                    parse_required_string_cell(row.get(11), "declared_entity")?.to_string();
+                let primitive =
+                    body_primitive_for_declared_entity(&declared_entity, Arc::clone(&primitive))?;
+
+                Ok(Some(IfcBodyRecord {
+                    product_id,
+                    placement_id,
+                    item_id,
+                    occurrence_id: None,
+                    global_id,
+                    name,
+                    object_type,
+                    predefined_type,
+                    type_object_type,
+                    type_predefined_type,
+                    classification_identification,
+                    display_color,
+                    declared_entity,
+                    item_transform: DMat4::IDENTITY,
+                    primitive,
+                }))
+            })
+            .collect::<Result<Vec<_>, VelrIfcError>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+
+        Ok(records)
+    }
+
+    fn query_body_faceted_brep_records(&self) -> Result<Vec<IfcBodyRecord>, VelrIfcError> {
+        Ok(self.query_body_faceted_brep_records_limited(None)?.records)
+    }
+
+    fn query_body_faceted_brep_records_limited(
+        &self,
+        limit_items: Option<usize>,
+    ) -> Result<FacetedBrepRecordQuery, VelrIfcError> {
+        let mut timings = Vec::new();
+
+        let geometry_query = self.query_faceted_brep_geometry_by_item_limited(limit_items)?;
+        let geometry_by_item = geometry_query.geometry_by_item;
+        let geometry_diagnostic = geometry_query.diagnostic;
+        timings.extend(geometry_query.timings);
+
+        let metadata_query = faceted_brep_metadata_query(limit_items);
+        let start = Instant::now();
+        let rows = self.execute_cypher_rows(&metadata_query)?;
+        let metadata_elapsed = start.elapsed();
+        let metadata_rows = rows.rows.len();
+        let direct_product_ids = rows
+            .rows
+            .iter()
+            .map(|row| parse_u64_cell(row.first(), "product_id"))
+            .collect::<Result<HashSet<_>, VelrIfcError>>()?;
+
+        let start = Instant::now();
+        let placement_parent_by_id = if metadata_rows > 0 {
+            self.query_placement_parent_map()?
+        } else {
+            HashMap::new()
+        };
+        timings.push(phase_timing(
+            "brep_placement_parent_query",
+            start.elapsed(),
+            Some(placement_parent_by_id.len()),
+        ));
+
+        let start = Instant::now();
+        let aggregate_parent_placement_by_product = if metadata_rows > 0 {
+            self.query_aggregate_child_parent_placement_map_for_products(&direct_product_ids)?
+        } else {
+            HashMap::new()
+        };
+        timings.push(phase_timing(
+            "brep_aggregate_parent_placement_query",
+            start.elapsed(),
+            Some(aggregate_parent_placement_by_product.len()),
+        ));
+
+        let start = Instant::now();
+        let mut records = rows
+            .rows
+            .into_iter()
+            .map(|row| {
+                let product_id = parse_u64_cell(row.first(), "product_id")?;
+                let placement_id = effective_faceted_brep_placement_id(
+                    product_id,
+                    parse_optional_u64_cell(row.get(1), "placement_id")?,
+                    &placement_parent_by_id,
+                    &aggregate_parent_placement_by_product,
+                );
+                let item_id = parse_u64_cell(row.get(2), "item_id")?;
+                let primitive = geometry_by_item.get(&item_id).cloned().ok_or_else(|| {
+                    VelrIfcError::IfcGeometryData(format!(
+                        "IfcFacetedBrep item `{item_id}` had product metadata but no face geometry"
+                    ))
+                })?;
+
+                Ok(IfcBodyRecord {
+                    product_id,
+                    placement_id,
+                    item_id,
+                    occurrence_id: None,
+                    global_id: parse_optional_string_cell(row.get(3)),
+                    name: parse_optional_string_cell(row.get(4)),
+                    object_type: parse_optional_string_cell(row.get(5)),
+                    predefined_type: parse_optional_string_cell(row.get(6)),
+                    type_object_type: parse_optional_string_cell(row.get(7)),
+                    type_predefined_type: parse_optional_string_cell(row.get(8)),
+                    classification_identification: parse_optional_string_cell(row.get(9)),
+                    declared_entity: parse_required_string_cell(row.get(10), "declared_entity")?
+                        .to_string(),
+                    display_color: parse_optional_db_style_color_cells(
+                        row.get(11),
+                        row.get(12),
+                        row.get(13),
+                        row.get(14),
+                        row.get(15),
+                        row.get(16),
+                    )?,
+                    item_transform: DMat4::IDENTITY,
+                    primitive,
+                })
+            })
+            .collect::<Result<Vec<_>, VelrIfcError>>()?;
+        let direct_parse_elapsed = start.elapsed();
+
+        let mapped_metadata_query = faceted_brep_mapped_metadata_query(limit_items);
+        let start = Instant::now();
+        let mapped_rows = self.execute_cypher_rows(&mapped_metadata_query)?;
+        let mapped_metadata_elapsed = start.elapsed();
+        let mapped_metadata_rows = mapped_rows.rows.len();
+        let mapped_item_transforms = if mapped_metadata_rows > 0 {
+            self.query_mapped_item_transform_map()?
+        } else {
+            HashMap::new()
+        };
+
+        let start = Instant::now();
+        let mut mapped_records = mapped_rows
+            .rows
+            .into_iter()
+            .map(|row| {
+                let mapped_item_id = parse_u64_cell(row.first(), "mapped_item_id")?;
+                let product_id = parse_u64_cell(row.get(1), "product_id")?;
+                let placement_id = parse_optional_u64_cell(row.get(2), "placement_id")?;
+                let item_id = parse_u64_cell(row.get(3), "item_id")?;
+                let primitive = geometry_by_item.get(&item_id).cloned().ok_or_else(|| {
+                    VelrIfcError::IfcGeometryData(format!(
+                        "mapped IfcFacetedBrep item `{item_id}` had product metadata but no face geometry"
+                    ))
+                })?;
+                let mapped_transform =
+                    mapped_item_transforms
+                        .get(&mapped_item_id)
+                        .copied()
+                        .ok_or_else(|| {
+                            VelrIfcError::IfcGeometryData(format!(
+                                "IfcMappedItem `{mapped_item_id}` was missing from mapped item transforms"
+                            ))
+                        })?;
+
+                Ok(IfcBodyRecord {
+                    product_id,
+                    placement_id,
+                    item_id,
+                    occurrence_id: Some(mapped_item_id),
+                    global_id: parse_optional_string_cell(row.get(4)),
+                    name: parse_optional_string_cell(row.get(5)),
+                    object_type: parse_optional_string_cell(row.get(6)),
+                    predefined_type: parse_optional_string_cell(row.get(7)),
+                    type_object_type: parse_optional_string_cell(row.get(8)),
+                    type_predefined_type: parse_optional_string_cell(row.get(9)),
+                    classification_identification: parse_optional_string_cell(row.get(10)),
+                    declared_entity: parse_required_string_cell(row.get(11), "declared_entity")?
+                        .to_string(),
+                    display_color: parse_optional_db_style_color_cells(
+                        row.get(12),
+                        row.get(13),
+                        row.get(14),
+                        row.get(15),
+                        row.get(16),
+                        row.get(17),
+                    )?,
+                    item_transform: mapped_transform,
+                    primitive,
+                })
+            })
+            .collect::<Result<Vec<_>, VelrIfcError>>()?;
+        records.append(&mut mapped_records);
+
+        timings.push(phase_timing(
+            "brep_metadata_query",
+            metadata_elapsed,
+            Some(metadata_rows),
+        ));
+        timings.push(phase_timing(
+            "brep_metadata_parse_records",
+            direct_parse_elapsed,
+            Some(metadata_rows),
+        ));
+        timings.push(phase_timing(
+            "mapped_brep_metadata_query",
+            mapped_metadata_elapsed,
+            Some(mapped_metadata_rows),
+        ));
+        timings.push(phase_timing(
+            "mapped_brep_metadata_parse_records",
+            start.elapsed(),
+            Some(mapped_metadata_rows),
+        ));
+
+        Ok(FacetedBrepRecordQuery {
+            records,
+            diagnostic: IfcBodyBrepDiagnostic {
+                limit_items,
+                geometry_items: geometry_diagnostic.geometry_items,
+                geometry_faces: geometry_diagnostic.geometry_faces,
+                geometry_point_rows: geometry_diagnostic.geometry_point_rows,
+                metadata_rows: metadata_rows + mapped_metadata_rows,
+            },
+            timings,
+        })
+    }
+
+    fn query_faceted_brep_geometry_by_item_limited(
+        &self,
+        limit_items: Option<usize>,
+    ) -> Result<FacetedBrepGeometryQuery, VelrIfcError> {
+        let cypher = faceted_brep_geometry_query(limit_items);
+
+        let start = Instant::now();
+        let (faces_by_item, point_rows) =
+            exec_cypher_in_scoped_tx(&self.raw_db, &cypher, |table| {
+                let mut faces_by_item =
+                    HashMap::<u64, HashMap<u64, FacetedBrepFaceAccumulator>>::new();
+                let mut processing_error = None;
+                let mut point_rows = 0usize;
+
+                table.for_each_row(|row| {
+                    if processing_error.is_some() {
+                        return Ok(());
+                    }
+
+                    let cells = row.iter().map(render_cell).collect::<Vec<_>>();
+                    let row_result = (|| {
+                        let item_id = parse_u64_cell(cells.first(), "item_id")?;
+                        let face_id = parse_u64_cell(cells.get(1), "face_id")?;
+                        let face_ordinal = parse_optional_u64_cell(cells.get(2), "face_ordinal")?;
+                        let point_ordinal = parse_optional_u64_cell(cells.get(3), "point_ordinal")?;
+                        let coordinates = parse_dvec3_cell(cells.get(4), "coordinates")?;
+
+                        let face = faces_by_item
+                            .entry(item_id)
+                            .or_default()
+                            .entry(face_id)
+                            .or_insert_with(|| FacetedBrepFaceAccumulator {
+                                ordinal: face_ordinal,
+                                points: Vec::new(),
+                            });
+
+                        if face.ordinal.is_none() {
+                            face.ordinal = face_ordinal;
+                        } else if face_ordinal.is_some() && face.ordinal != face_ordinal {
+                            return Err(VelrIfcError::IfcGeometryData(format!(
+                                "IfcFacetedBrep face `{face_id}` resolved to inconsistent ordinals"
+                            )));
+                        }
+
+                        face.points.push(FacetedBrepPoint {
+                            ordinal: point_ordinal,
+                            sequence: face.points.len(),
+                            coordinates,
+                        });
+                        point_rows += 1;
+                        Ok(())
+                    })();
+
+                    if let Err(error) = row_result {
+                        processing_error = Some(error);
+                    }
+                    Ok(())
+                })?;
+
+                if let Some(error) = processing_error {
+                    return Err(error);
+                }
+
+                Ok((faces_by_item, point_rows))
+            })?;
+        let query_parse_group_elapsed = start.elapsed();
+
+        let geometry_items = faces_by_item.len();
+        let geometry_faces = faces_by_item.values().map(HashMap::len).sum();
+        let start = Instant::now();
+        let geometry_by_item = faces_by_item
+            .into_iter()
+            .map(|(item_id, faces)| {
+                Ok((
+                    item_id,
+                    Arc::new(GeometryPrimitive::Tessellated(
+                        faceted_brep_geometry_from_faces(faces)?,
+                    )),
+                ))
+            })
+            .collect::<Result<HashMap<_, _>, VelrIfcError>>()?;
+        let geometry_build_elapsed = start.elapsed();
+
+        Ok(FacetedBrepGeometryQuery {
+            geometry_by_item,
+            diagnostic: FacetedBrepGeometryDiagnostic {
+                geometry_items,
+                geometry_faces,
+                geometry_point_rows: point_rows,
+            },
+            timings: vec![
+                phase_timing(
+                    "brep_geometry_query_parse_group",
+                    query_parse_group_elapsed,
+                    Some(point_rows),
+                ),
+                phase_timing(
+                    "brep_geometry_build",
+                    geometry_build_elapsed,
+                    Some(geometry_items),
+                ),
+            ],
+        })
+    }
+
+    fn query_body_extruded_records(&self) -> Result<Vec<IfcBodyRecord>, VelrIfcError> {
+        let location_by_axis2 =
+            self.query_axis2_placement_vector_map("LOCATION", "IfcCartesianPoint", "Coordinates")?;
+        let axis_by_axis2 =
+            self.query_axis2_placement_vector_map("AXIS", "IfcDirection", "DirectionRatios")?;
+        let ref_direction_by_axis2 = self.query_axis2_placement_vector_map(
+            "REF_DIRECTION",
+            "IfcDirection",
+            "DirectionRatios",
+        )?;
+
+        let rows = self.execute_cypher_rows(
+            r#"
+MATCH (solid:IfcExtrudedAreaSolid)
+MATCH (solid)<-[:ITEMS]-(rep)
+WHERE rep.RepresentationIdentifier = 'Body'
+WITH solid, rep
+MATCH (rep)<-[:REPRESENTATIONS]-(shape)
+WITH solid, shape
+MATCH (shape)<-[:REPRESENTATION]-(p)
+WITH solid, p
+MATCH (solid)-[:SWEPT_AREA]->(profile)
+WITH solid, p, profile
+MATCH (profile)-[:OUTER_CURVE]->(poly)
+WITH solid, p, poly
+MATCH (poly)-[edge:POINTS]->(pt)
+WITH solid, p, collect(DISTINCT { ordinal: edge.ordinal, coordinates: pt.Coordinates }) AS point_rows
+MATCH (solid)-[:EXTRUDED_DIRECTION]->(dir)
+OPTIONAL MATCH (p)-[:OBJECT_PLACEMENT]->(placement)
+OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelDefinesByType)-[:RELATING_TYPE]->(type_node)
+OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelAssociatesClassification)-[:RELATING_CLASSIFICATION]->(classification_ref)
+OPTIONAL MATCH (solid)-[:POSITION]->(solid_position)
+OPTIONAL MATCH (solid)<-[:ITEM]-(styled:IfcStyledItem)
+OPTIONAL MATCH (styled)-[:STYLES]->(style_assignment:IfcPresentationStyleAssignment)
+OPTIONAL MATCH (style_assignment)-[:STYLES]->(assigned_surface_style:IfcSurfaceStyle)
+OPTIONAL MATCH (styled)-[:STYLES]->(surface_style:IfcSurfaceStyle)
+OPTIONAL MATCH (surface_style)-[:STYLES]->(rendering:IfcSurfaceStyleRendering)
+OPTIONAL MATCH (rendering)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
+OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_rendering:IfcSurfaceStyleRendering)
+OPTIONAL MATCH (assigned_rendering)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
+WITH p, placement, solid, dir, solid_position,
+     point_rows,
+     head(collect(DISTINCT { object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType })) AS type_semantics,
+     head(collect(DISTINCT classification_ref.Identification)) AS classification_identification,
+     head(collect(DISTINCT { red: rgb.Red, green: rgb.Green, blue: rgb.Blue })) AS surface_rgb,
+     head(collect(DISTINCT { red: assigned_rgb.Red, green: assigned_rgb.Green, blue: assigned_rgb.Blue })) AS assigned_surface_rgb
+RETURN id(p) AS product_id, id(placement) AS placement_id, id(solid) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, solid.Depth AS depth, dir.DirectionRatios AS extruded_direction, point_rows, id(solid_position) AS solid_position_id, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue, assigned_surface_rgb.red AS assigned_style_red, assigned_surface_rgb.green AS assigned_style_green, assigned_surface_rgb.blue AS assigned_style_blue
+ORDER BY item_id
+"#,
+        )?;
+
+        let records: Vec<IfcBodyRecord> = rows
+            .rows
             .into_iter()
             .map(|row| {
                 let product_id = parse_u64_cell(row.first(), "product_id")?;
@@ -995,11 +1929,25 @@ ORDER BY item_id
                 let type_object_type = parse_optional_string_cell(row.get(7));
                 let type_predefined_type = parse_optional_string_cell(row.get(8));
                 let classification_identification = parse_optional_string_cell(row.get(9));
-                let item_transform =
-                    parse_optional_axis2_placement3d_cells(row.get(14), row.get(15), row.get(16))?
-                        .unwrap_or(DMat4::IDENTITY);
-                let display_color =
-                    parse_optional_display_color_cells(row.get(17), row.get(18), row.get(19))?;
+                let solid_position_id = parse_optional_u64_cell(row.get(14), "solid_position_id")?;
+                let item_transform = solid_position_id.map_or(DMat4::IDENTITY, |position_id| {
+                    axis2_placement_transform(
+                        location_by_axis2
+                            .get(&position_id)
+                            .copied()
+                            .unwrap_or(DVec3::ZERO),
+                        axis_by_axis2.get(&position_id).copied(),
+                        ref_direction_by_axis2.get(&position_id).copied(),
+                    )
+                });
+                let display_color = parse_optional_db_style_color_cells(
+                    row.get(15),
+                    row.get(16),
+                    row.get(17),
+                    row.get(18),
+                    row.get(19),
+                    row.get(20),
+                )?;
                 let declared_entity =
                     parse_required_string_cell(row.get(10), "declared_entity")?.to_string();
                 let depth = parse_f64_cell(row.get(11), "depth")?;
@@ -1007,15 +1955,16 @@ ORDER BY item_id
                     row.get(12),
                     "extruded_direction",
                 )?)?;
-                let primitive = GeometryPrimitive::SweptSolid(swept_solid_from_row(
+                let primitive = Arc::new(GeometryPrimitive::SweptSolid(swept_solid_from_row(
                     parse_required_string_cell(row.get(13), "point_rows")?,
                     extruded_direction * depth,
-                )?);
+                )?));
 
                 Ok(IfcBodyRecord {
                     product_id,
                     placement_id,
                     item_id,
+                    occurrence_id: None,
                     global_id,
                     name,
                     object_type,
@@ -1029,19 +1978,580 @@ ORDER BY item_id
                     primitive,
                 })
             })
+            .collect::<Result<_, VelrIfcError>>()?;
+
+        Ok(records)
+    }
+
+    fn query_mapped_extruded_geometry_by_item(
+        &self,
+    ) -> Result<HashMap<u64, ExtrudedBodyGeometry>, VelrIfcError> {
+        let location_by_axis2 =
+            self.query_axis2_placement_vector_map("LOCATION", "IfcCartesianPoint", "Coordinates")?;
+        let axis_by_axis2 =
+            self.query_axis2_placement_vector_map("AXIS", "IfcDirection", "DirectionRatios")?;
+        let ref_direction_by_axis2 = self.query_axis2_placement_vector_map(
+            "REF_DIRECTION",
+            "IfcDirection",
+            "DirectionRatios",
+        )?;
+
+        let rows = self.execute_cypher_rows(
+            r#"
+MATCH (mapped:IfcMappedItem)
+WITH mapped
+MATCH (mapped)-[:MAPPING_SOURCE]->(map:IfcRepresentationMap)
+WITH map
+MATCH (map)-[:MAPPED_REPRESENTATION]->(source_rep:IfcShapeRepresentation)
+WITH DISTINCT source_rep
+MATCH (source_rep)-[:ITEMS]->(solid:IfcExtrudedAreaSolid)
+WITH DISTINCT solid
+MATCH (solid)-[:SWEPT_AREA]->(profile)
+WITH solid, profile
+MATCH (profile)-[:OUTER_CURVE]->(poly)
+WITH solid, poly
+MATCH (poly)-[edge:POINTS]->(pt)
+WITH solid, collect(DISTINCT { ordinal: edge.ordinal, coordinates: pt.Coordinates }) AS point_rows
+MATCH (solid)-[:EXTRUDED_DIRECTION]->(dir)
+OPTIONAL MATCH (solid)-[:POSITION]->(solid_position)
+RETURN id(solid) AS item_id, solid.Depth AS depth, dir.DirectionRatios AS extruded_direction, point_rows, id(solid_position) AS solid_position_id
+ORDER BY item_id
+"#,
+        )?;
+
+        rows.rows
+            .into_iter()
+            .map(|row| {
+                let item_id = parse_u64_cell(row.first(), "item_id")?;
+                let depth = parse_f64_cell(row.get(1), "depth")?;
+                let extruded_direction = parse_direction3_json(parse_required_string_cell(
+                    row.get(2),
+                    "extruded_direction",
+                )?)?;
+                let solid_position_id = parse_optional_u64_cell(row.get(4), "solid_position_id")?;
+                let item_transform = solid_position_id.map_or(DMat4::IDENTITY, |position_id| {
+                    axis2_placement_transform(
+                        location_by_axis2
+                            .get(&position_id)
+                            .copied()
+                            .unwrap_or(DVec3::ZERO),
+                        axis_by_axis2.get(&position_id).copied(),
+                        ref_direction_by_axis2.get(&position_id).copied(),
+                    )
+                });
+                Ok((
+                    item_id,
+                    ExtrudedBodyGeometry {
+                        primitive: Arc::new(GeometryPrimitive::SweptSolid(swept_solid_from_row(
+                            parse_required_string_cell(row.get(3), "point_rows")?,
+                            extruded_direction * depth,
+                        )?)),
+                        item_transform,
+                    },
+                ))
+            })
             .collect()
     }
 
-    fn query_local_placement_records(&self) -> Result<Vec<IfcLocalPlacementRecord>, VelrIfcError> {
+    fn query_body_mapped_extruded_records(&self) -> Result<Vec<IfcBodyRecord>, VelrIfcError> {
+        if !self.has_extruded_area_solid()? {
+            return Ok(Vec::new());
+        }
+
+        let mapped_item_transforms = self.query_mapped_item_transform_map()?;
+        let geometry_by_item = self.query_mapped_extruded_geometry_by_item()?;
+
         let rows = self.execute_cypher_rows(
             r#"
-MATCH (lp:IfcLocalPlacement)
-OPTIONAL MATCH (lp)-[:PLACEMENT_REL_TO]->(parent:IfcLocalPlacement)
-OPTIONAL MATCH (lp)-[:RELATIVE_PLACEMENT]->(relative:IfcAxis2Placement3D)
-OPTIONAL MATCH (relative)-[:LOCATION]->(location:IfcCartesianPoint)
-OPTIONAL MATCH (relative)-[:AXIS]->(axis:IfcDirection)
-OPTIONAL MATCH (relative)-[:REF_DIRECTION]->(ref_direction:IfcDirection)
-RETURN id(lp) AS placement_id, id(parent) AS parent_placement_id, id(relative) AS relative_placement_id, location.Coordinates AS location, axis.DirectionRatios AS axis, ref_direction.DirectionRatios AS ref_direction
+MATCH (mapped:IfcMappedItem)
+WITH mapped
+MATCH (mapped)<-[:ITEMS]-(rep:IfcShapeRepresentation)
+WHERE rep.RepresentationIdentifier = 'Body'
+WITH mapped, rep
+MATCH (rep)<-[:REPRESENTATIONS]-(shape:IfcProductDefinitionShape)
+WITH mapped, shape
+MATCH (shape)<-[:REPRESENTATION]-(p:IfcProduct)
+WITH mapped, p
+MATCH (mapped)-[:MAPPING_SOURCE]->(map:IfcRepresentationMap)
+WITH mapped, p, map
+MATCH (map)-[:MAPPED_REPRESENTATION]->(source_rep:IfcShapeRepresentation)
+WITH mapped, p, source_rep
+MATCH (source_rep)-[:ITEMS]->(solid:IfcExtrudedAreaSolid)
+OPTIONAL MATCH (p)-[:OBJECT_PLACEMENT]->(placement)
+OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelDefinesByType)-[:RELATING_TYPE]->(type_node)
+OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelAssociatesClassification)-[:RELATING_CLASSIFICATION]->(classification_ref)
+OPTIONAL MATCH (solid)<-[:ITEM]-(styled:IfcStyledItem)
+OPTIONAL MATCH (styled)-[:STYLES]->(style_assignment:IfcPresentationStyleAssignment)
+OPTIONAL MATCH (style_assignment)-[:STYLES]->(assigned_surface_style:IfcSurfaceStyle)
+OPTIONAL MATCH (styled)-[:STYLES]->(surface_style:IfcSurfaceStyle)
+OPTIONAL MATCH (surface_style)-[:STYLES]->(rendering:IfcSurfaceStyleRendering)
+OPTIONAL MATCH (rendering)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
+OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_rendering:IfcSurfaceStyleRendering)
+OPTIONAL MATCH (assigned_rendering)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
+WITH mapped, p, placement, solid,
+     head(collect(DISTINCT { object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType })) AS type_semantics,
+     head(collect(DISTINCT classification_ref.Identification)) AS classification_identification,
+     head(collect(DISTINCT { red: rgb.Red, green: rgb.Green, blue: rgb.Blue })) AS surface_rgb,
+     head(collect(DISTINCT { red: assigned_rgb.Red, green: assigned_rgb.Green, blue: assigned_rgb.Blue })) AS assigned_surface_rgb
+RETURN id(mapped) AS mapped_item_id, id(p) AS product_id, id(placement) AS placement_id, id(solid) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue, assigned_surface_rgb.red AS assigned_style_red, assigned_surface_rgb.green AS assigned_style_green, assigned_surface_rgb.blue AS assigned_style_blue
+ORDER BY mapped_item_id, item_id
+"#,
+        )?;
+
+        let records = rows
+            .rows
+            .into_iter()
+            .map(|row| {
+                let mapped_item_id = parse_u64_cell(row.first(), "mapped_item_id")?;
+                let product_id = parse_u64_cell(row.get(1), "product_id")?;
+                let placement_id = parse_optional_u64_cell(row.get(2), "placement_id")?;
+                let item_id = parse_u64_cell(row.get(3), "item_id")?;
+                let global_id = parse_optional_string_cell(row.get(4));
+                let name = parse_optional_string_cell(row.get(5));
+                let object_type = parse_optional_string_cell(row.get(6));
+                let predefined_type = parse_optional_string_cell(row.get(7));
+                let type_object_type = parse_optional_string_cell(row.get(8));
+                let type_predefined_type = parse_optional_string_cell(row.get(9));
+                let classification_identification = parse_optional_string_cell(row.get(10));
+                let Some(geometry) = geometry_by_item.get(&item_id).cloned() else {
+                    return Ok(None);
+                };
+                let mapped_transform =
+                    mapped_item_transforms
+                        .get(&mapped_item_id)
+                        .copied()
+                        .ok_or_else(|| {
+                            VelrIfcError::IfcGeometryData(format!(
+                                "IfcMappedItem `{mapped_item_id}` was missing from mapped item transforms"
+                            ))
+                        })?;
+                let display_color = parse_optional_db_style_color_cells(
+                    row.get(12),
+                    row.get(13),
+                    row.get(14),
+                    row.get(15),
+                    row.get(16),
+                    row.get(17),
+                )?;
+                let declared_entity =
+                    parse_required_string_cell(row.get(11), "declared_entity")?.to_string();
+
+                Ok(Some(IfcBodyRecord {
+                    product_id,
+                    placement_id,
+                    item_id,
+                    occurrence_id: Some(mapped_item_id),
+                    global_id,
+                    name,
+                    object_type,
+                    predefined_type,
+                    type_object_type,
+                    type_predefined_type,
+                    classification_identification,
+                    display_color,
+                    declared_entity,
+                    item_transform: mapped_transform * geometry.item_transform,
+                    primitive: geometry.primitive,
+                }))
+            })
+            .collect::<Result<Vec<_>, VelrIfcError>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+
+        Ok(records)
+    }
+
+    fn has_extruded_area_solid(&self) -> Result<bool, VelrIfcError> {
+        let rows = self.execute_cypher_rows(
+            r#"
+MATCH (solid:IfcExtrudedAreaSolid)
+RETURN id(solid) AS item_id
+LIMIT 1
+"#,
+        )?;
+        Ok(!rows.rows.is_empty())
+    }
+
+    fn query_body_mapped_polygonal_face_set_records(
+        &self,
+    ) -> Result<Vec<IfcBodyRecord>, VelrIfcError> {
+        eprintln!("w velr mapped polygonal phase transforms start");
+        let mapped_item_transforms = self.query_mapped_item_transform_map()?;
+        eprintln!(
+            "w velr mapped polygonal phase transforms done rows={}",
+            mapped_item_transforms.len()
+        );
+
+        eprintln!("w velr mapped polygonal phase metadata start");
+        let rows = self.execute_cypher_rows(
+            r#"
+MATCH (mapped:IfcMappedItem)
+WITH mapped
+MATCH (mapped)<-[:ITEMS]-(rep:IfcShapeRepresentation)
+WHERE rep.RepresentationIdentifier = 'Body'
+WITH mapped, rep
+MATCH (rep)<-[:REPRESENTATIONS]-(shape:IfcProductDefinitionShape)
+WITH mapped, shape
+MATCH (shape)<-[:REPRESENTATION]-(p:IfcProduct)
+WITH mapped, p
+MATCH (mapped)-[:MAPPING_SOURCE]->(map:IfcRepresentationMap)
+WITH mapped, p, map
+MATCH (map)-[:MAPPED_REPRESENTATION]->(source_rep:IfcShapeRepresentation)
+WITH mapped, p, source_rep
+MATCH (source_rep)-[:ITEMS]->(item:IfcPolygonalFaceSet)
+OPTIONAL MATCH (p)-[:OBJECT_PLACEMENT]->(placement)
+OPTIONAL MATCH (p)<-[:RELATED_ELEMENTS]-(:IfcRelContainedInSpatialStructure)-[:RELATING_STRUCTURE]->(:IfcProduct)-[:OBJECT_PLACEMENT]->(container_placement)
+OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelDefinesByType)-[:RELATING_TYPE]->(type_node)
+OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelAssociatesClassification)-[:RELATING_CLASSIFICATION]->(classification_ref)
+OPTIONAL MATCH (item)<-[:ITEM]-(styled:IfcStyledItem)
+OPTIONAL MATCH (styled)-[:STYLES]->(style_assignment:IfcPresentationStyleAssignment)
+OPTIONAL MATCH (style_assignment)-[:STYLES]->(assigned_surface_style:IfcSurfaceStyle)
+OPTIONAL MATCH (styled)-[:STYLES]->(surface_style:IfcSurfaceStyle)
+OPTIONAL MATCH (surface_style)-[:STYLES]->(rendering:IfcSurfaceStyleRendering)
+OPTIONAL MATCH (rendering)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
+OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_rendering:IfcSurfaceStyleRendering)
+OPTIONAL MATCH (assigned_rendering)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
+WITH mapped, p, placement, item,
+     head(collect(DISTINCT container_placement)) AS container_placement_id,
+     head(collect(DISTINCT { object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType })) AS type_semantics,
+     head(collect(DISTINCT classification_ref.Identification)) AS classification_identification,
+     head(collect(DISTINCT { red: rgb.Red, green: rgb.Green, blue: rgb.Blue })) AS surface_rgb,
+     head(collect(DISTINCT { red: assigned_rgb.Red, green: assigned_rgb.Green, blue: assigned_rgb.Blue })) AS assigned_surface_rgb
+RETURN id(mapped) AS mapped_item_id, id(p) AS product_id, id(placement) AS placement_id, container_placement_id, id(item) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue, assigned_surface_rgb.red AS assigned_style_red, assigned_surface_rgb.green AS assigned_style_green, assigned_surface_rgb.blue AS assigned_style_blue
+ORDER BY mapped_item_id, item_id
+"#,
+        )?;
+        eprintln!(
+            "w velr mapped polygonal phase metadata done rows={}",
+            rows.rows.len()
+        );
+
+        let raw_rows = rows.rows;
+        let item_ids = raw_rows
+            .iter()
+            .map(|row| parse_u64_cell(row.get(4), "item_id"))
+            .collect::<Result<HashSet<_>, VelrIfcError>>()?;
+        eprintln!(
+            "w velr mapped polygonal phase geometry start items={}",
+            item_ids.len()
+        );
+        let geometry_by_item =
+            self.query_polygonal_face_set_geometry_by_item_ids(Some(&item_ids))?;
+        eprintln!(
+            "w velr mapped polygonal phase geometry done items={}",
+            geometry_by_item.len()
+        );
+
+        let records: Vec<IfcBodyRecord> = raw_rows
+            .into_iter()
+            .map(|row| {
+                let mapped_item_id = parse_u64_cell(row.first(), "mapped_item_id")?;
+                let product_id = parse_u64_cell(row.get(1), "product_id")?;
+                let placement_id = parse_optional_u64_cell(row.get(2), "placement_id")?;
+                let container_placement_id =
+                    parse_optional_node_identity_cell(row.get(3), "container_placement_id")?;
+                let placement_id = placement_id.or(container_placement_id);
+                let item_id = parse_u64_cell(row.get(4), "item_id")?;
+                let global_id = parse_optional_string_cell(row.get(5));
+                let name = parse_optional_string_cell(row.get(6));
+                let object_type = parse_optional_string_cell(row.get(7));
+                let predefined_type = parse_optional_string_cell(row.get(8));
+                let type_object_type = parse_optional_string_cell(row.get(9));
+                let type_predefined_type = parse_optional_string_cell(row.get(10));
+                let classification_identification = parse_optional_string_cell(row.get(11));
+                let Some(primitive) = geometry_by_item.get(&item_id).cloned() else {
+                    return Ok(None);
+                };
+                let mapped_transform =
+                    mapped_item_transforms
+                        .get(&mapped_item_id)
+                        .copied()
+                        .ok_or_else(|| {
+                            VelrIfcError::IfcGeometryData(format!(
+                                "IfcMappedItem `{mapped_item_id}` was missing from mapped item transforms"
+                            ))
+                        })?;
+                let display_color = parse_optional_db_style_color_cells(
+                    row.get(13),
+                    row.get(14),
+                    row.get(15),
+                    row.get(16),
+                    row.get(17),
+                    row.get(18),
+                )?;
+                let declared_entity =
+                    parse_required_string_cell(row.get(12), "declared_entity")?.to_string();
+                let primitive =
+                    body_primitive_for_declared_entity(&declared_entity, Arc::clone(&primitive))?;
+
+                Ok(Some(IfcBodyRecord {
+                    product_id,
+                    placement_id,
+                    item_id,
+                    occurrence_id: Some(mapped_item_id),
+                    global_id,
+                    name,
+                    object_type,
+                    predefined_type,
+                    type_object_type,
+                    type_predefined_type,
+                    classification_identification,
+                    display_color,
+                    declared_entity,
+                    item_transform: mapped_transform,
+                    primitive,
+                }))
+            })
+            .collect::<Result<Vec<_>, VelrIfcError>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+
+        eprintln!(
+            "w velr mapped polygonal phase records done rows={}",
+            records.len()
+        );
+        Ok(records)
+    }
+
+    fn query_body_sectioned_solid_horizontal_records(
+        &self,
+    ) -> Result<Vec<IfcBodyRecord>, VelrIfcError> {
+        let gradient_curves = self.query_gradient_curve_records()?;
+        let polyline_directrices = self.query_polyline_directrix_records()?;
+        let profiles_by_item = self.query_sectioned_solid_horizontal_profiles()?;
+        let positions_by_item = self.query_sectioned_solid_horizontal_positions()?;
+
+        let rows = self.execute_cypher_rows(
+            r#"
+MATCH (item:IfcSectionedSolidHorizontal)
+MATCH (item)<-[:ITEMS]-(rep:IfcShapeRepresentation)
+WHERE rep.RepresentationIdentifier = 'Body'
+WITH item, rep
+MATCH (rep)<-[:REPRESENTATIONS]-(shape:IfcProductDefinitionShape)
+WITH item, shape
+MATCH (shape)<-[:REPRESENTATION]-(p:IfcProduct)
+MATCH (item)-[:DIRECTRIX]->(directrix)
+OPTIONAL MATCH (p)-[:OBJECT_PLACEMENT]->(placement)
+OPTIONAL MATCH (p)<-[:RELATED_ELEMENTS]-(:IfcRelContainedInSpatialStructure)-[:RELATING_STRUCTURE]->(:IfcProduct)-[:OBJECT_PLACEMENT]->(container_placement)
+OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelDefinesByType)-[:RELATING_TYPE]->(type_node)
+OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelAssociatesClassification)-[:RELATING_CLASSIFICATION]->(classification_ref)
+OPTIONAL MATCH (item)<-[:ITEM]-(styled:IfcStyledItem)
+OPTIONAL MATCH (styled)-[:STYLES]->(style_assignment:IfcPresentationStyleAssignment)
+OPTIONAL MATCH (style_assignment)-[:STYLES]->(assigned_surface_style:IfcSurfaceStyle)
+OPTIONAL MATCH (styled)-[:STYLES]->(surface_style:IfcSurfaceStyle)
+OPTIONAL MATCH (surface_style)-[:STYLES]->(rendering:IfcSurfaceStyleRendering)
+OPTIONAL MATCH (rendering)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
+OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_rendering:IfcSurfaceStyleRendering)
+OPTIONAL MATCH (assigned_rendering)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
+WITH p, placement, item, directrix,
+     head(collect(DISTINCT container_placement)) AS container_placement_id,
+     head(collect(DISTINCT { object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType })) AS type_semantics,
+     head(collect(DISTINCT classification_ref.Identification)) AS classification_identification,
+     head(collect(DISTINCT { red: rgb.Red, green: rgb.Green, blue: rgb.Blue })) AS surface_rgb,
+     head(collect(DISTINCT { red: assigned_rgb.Red, green: assigned_rgb.Green, blue: assigned_rgb.Blue })) AS assigned_surface_rgb
+RETURN id(p) AS product_id, id(placement) AS placement_id, container_placement_id, id(item) AS item_id, id(directrix) AS directrix_id, directrix.declared_entity AS directrix_entity, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue, assigned_surface_rgb.red AS assigned_style_red, assigned_surface_rgb.green AS assigned_style_green, assigned_surface_rgb.blue AS assigned_style_blue
+ORDER BY item_id
+"#,
+        )?;
+
+        rows.rows
+            .into_iter()
+            .map(|row| {
+                let product_id = parse_u64_cell(row.first(), "product_id")?;
+                let placement_id = parse_optional_u64_cell(row.get(1), "placement_id")?;
+                let container_placement_id =
+                    parse_optional_node_identity_cell(row.get(2), "container_placement_id")?;
+                let placement_id = placement_id.or(container_placement_id);
+                let item_id = parse_u64_cell(row.get(3), "item_id")?;
+                let directrix_id = parse_u64_cell(row.get(4), "directrix_id")?;
+                let directrix_entity =
+                    parse_required_string_cell(row.get(5), "directrix_entity")?;
+                match directrix_entity {
+                    "IfcGradientCurve" | "IfcPolyline" => {}
+                    other => {
+                        return Err(VelrIfcError::IfcGeometryData(format!(
+                            "IfcSectionedSolidHorizontal item `{item_id}` has unsupported explicit DIRECTRIX `{other}`"
+                        )));
+                    }
+                }
+                let profiles = profiles_by_item.get(&item_id).ok_or_else(|| {
+                    VelrIfcError::IfcGeometryData(format!(
+                        "IfcSectionedSolidHorizontal item `{item_id}` has product metadata but no explicit CROSS_SECTIONS profiles"
+                    ))
+                })?;
+                let positions = positions_by_item.get(&item_id).ok_or_else(|| {
+                    VelrIfcError::IfcGeometryData(format!(
+                        "IfcSectionedSolidHorizontal item `{item_id}` has product metadata but no explicit CROSS_SECTION_POSITIONS"
+                    ))
+                })?;
+                if positions
+                    .iter()
+                    .any(|position| position.curve_id != directrix_id || position.curve_entity != directrix_entity)
+                {
+                    return Err(VelrIfcError::IfcGeometryData(format!(
+                        "IfcSectionedSolidHorizontal item `{item_id}` has section positions on a curve different from its explicit DIRECTRIX `{directrix_id}`"
+                    )));
+                }
+
+                let primitive = Arc::new(GeometryPrimitive::Tessellated(
+                    sectioned_solid_horizontal_geometry(
+                        item_id,
+                        profiles,
+                        positions,
+                        &gradient_curves,
+                        &polyline_directrices,
+                    )?,
+                ));
+                let display_color = parse_optional_db_style_color_cells(
+                    row.get(14),
+                    row.get(15),
+                    row.get(16),
+                    row.get(17),
+                    row.get(18),
+                    row.get(19),
+                )?;
+                let declared_entity =
+                    parse_required_string_cell(row.get(13), "declared_entity")?.to_string();
+                let primitive =
+                    body_primitive_for_declared_entity(&declared_entity, Arc::clone(&primitive))?;
+
+                Ok(IfcBodyRecord {
+                    product_id,
+                    placement_id,
+                    item_id,
+                    occurrence_id: None,
+                    global_id: parse_optional_string_cell(row.get(6)),
+                    name: parse_optional_string_cell(row.get(7)),
+                    object_type: parse_optional_string_cell(row.get(8)),
+                    predefined_type: parse_optional_string_cell(row.get(9)),
+                    type_object_type: parse_optional_string_cell(row.get(10)),
+                    type_predefined_type: parse_optional_string_cell(row.get(11)),
+                    classification_identification: parse_optional_string_cell(row.get(12)),
+                    display_color,
+                    declared_entity,
+                    item_transform: DMat4::IDENTITY,
+                    primitive,
+                })
+            })
+            .collect()
+    }
+
+    fn query_sectioned_solid_horizontal_profiles(
+        &self,
+    ) -> Result<HashMap<u64, Vec<IfcSectionedSolidProfile>>, VelrIfcError> {
+        let rows = self.execute_cypher_rows(
+            r#"
+MATCH (item:IfcSectionedSolidHorizontal)-[section_edge:CROSS_SECTIONS]->(profile:IfcDerivedProfileDef)
+MATCH (profile)-[:PARENT_PROFILE]->(:IfcArbitraryClosedProfileDef)-[:OUTER_CURVE]->(:IfcIndexedPolyCurve)-[:POINTS]->(point_list:IfcCartesianPointList2D)
+MATCH (profile)-[:OPERATOR]->(operator:IfcCartesianTransformationOperator2D)
+OPTIONAL MATCH (operator)-[:LOCAL_ORIGIN]->(origin:IfcCartesianPoint)
+OPTIONAL MATCH (operator)-[:AXIS1]->(axis1:IfcDirection)
+OPTIONAL MATCH (operator)-[:AXIS2]->(axis2:IfcDirection)
+RETURN id(item) AS item_id, section_edge.ordinal AS section_ordinal, id(profile) AS profile_id, point_list.CoordList AS coord_list, operator.Scale AS scale, operator.Scale2 AS scale2, origin.Coordinates AS origin, axis1.DirectionRatios AS axis1, axis2.DirectionRatios AS axis2
+ORDER BY item_id, section_ordinal
+"#,
+        )?;
+
+        let mut by_item = HashMap::<u64, Vec<IfcSectionedSolidProfile>>::new();
+        for row in rows.rows {
+            let item_id = parse_u64_cell(row.first(), "item_id")?;
+            let ordinal = parse_u64_cell(row.get(1), "section_ordinal")?;
+            let profile_id = parse_u64_cell(row.get(2), "profile_id")?;
+            let raw_points = parse_dvec2_rows_json(
+                parse_required_string_cell(row.get(3), "coord_list")?,
+                "coord_list",
+            )?;
+            let scale = parse_optional_f64_cell(row.get(4), "scale")?.unwrap_or(1.0);
+            let scale2 = parse_optional_f64_cell(row.get(5), "scale2")?.unwrap_or(scale);
+            let origin = parse_optional_dvec2_cell(row.get(6), "origin")?.unwrap_or(DVec2::ZERO);
+            let axis1 = parse_optional_dvec2_cell(row.get(7), "axis1")?.unwrap_or(DVec2::X);
+            let axis2 = parse_optional_dvec2_cell(row.get(8), "axis2")?.unwrap_or(DVec2::Y);
+            let x_axis = normalized_2d_or(axis1, DVec2::X);
+            let y_axis = normalized_2d_or(axis2, DVec2::Y);
+            let mut points = raw_points
+                .into_iter()
+                .map(|point| origin + x_axis * (point.x * scale) + y_axis * (point.y * scale2))
+                .collect::<Vec<_>>();
+            points = normalize_profile_points(points);
+            if points.len() < 3 {
+                return Err(VelrIfcError::IfcGeometryData(format!(
+                    "IfcDerivedProfileDef `{profile_id}` for IfcSectionedSolidHorizontal item `{item_id}` has fewer than three explicit profile points"
+                )));
+            }
+            by_item
+                .entry(item_id)
+                .or_default()
+                .push(IfcSectionedSolidProfile { ordinal, points });
+        }
+
+        for (item_id, profiles) in &mut by_item {
+            profiles.sort_by_key(|profile| profile.ordinal);
+            assert_unique_section_ordinals(
+                *item_id,
+                "CROSS_SECTIONS",
+                profiles.iter().map(|p| p.ordinal),
+            )?;
+        }
+
+        Ok(by_item)
+    }
+
+    fn query_sectioned_solid_horizontal_positions(
+        &self,
+    ) -> Result<HashMap<u64, Vec<IfcSectionedSolidPosition>>, VelrIfcError> {
+        let rows = self.execute_cypher_rows(
+            r#"
+MATCH (item:IfcSectionedSolidHorizontal)-[position_edge:CROSS_SECTION_POSITIONS]->(:IfcAxis2PlacementLinear)-[:LOCATION]->(expression:IfcPointByDistanceExpression)-[:DISTANCE_ALONG]->(distance)
+MATCH (expression)-[:BASIS_CURVE]->(curve)
+	RETURN id(item) AS item_id, position_edge.ordinal AS position_ordinal, curve.declared_entity AS curve_entity, id(curve) AS curve_id, distance.payload_value AS distance_along, expression.OffsetLongitudinal AS offset_longitudinal, expression.OffsetLateral AS offset_lateral, expression.OffsetVertical AS offset_vertical
+ORDER BY item_id, position_ordinal
+"#,
+        )?;
+
+        let mut by_item = HashMap::<u64, Vec<IfcSectionedSolidPosition>>::new();
+        for row in rows.rows {
+            let item_id = parse_u64_cell(row.first(), "item_id")?;
+            let position_ordinal = parse_u64_cell(row.get(1), "position_ordinal")?;
+            validate_sectioned_solid_horizontal_longitudinal_offset(
+                item_id,
+                position_ordinal,
+                parse_optional_f64_cell(row.get(5), "offset_longitudinal")?,
+            )?;
+            by_item
+                .entry(item_id)
+                .or_default()
+                .push(IfcSectionedSolidPosition {
+                    ordinal: position_ordinal,
+                    curve_entity: parse_required_string_cell(row.get(2), "curve_entity")?
+                        .to_string(),
+                    curve_id: parse_u64_cell(row.get(3), "curve_id")?,
+                    distance_along: parse_f64_cell(row.get(4), "distance_along")?,
+                    offset_lateral: parse_optional_f64_cell(row.get(6), "offset_lateral")?
+                        .unwrap_or(0.0),
+                    offset_vertical: parse_optional_f64_cell(row.get(7), "offset_vertical")?
+                        .unwrap_or(0.0),
+                });
+        }
+
+        for (item_id, positions) in &mut by_item {
+            positions.sort_by_key(|position| position.ordinal);
+            assert_unique_section_ordinals(
+                *item_id,
+                "CROSS_SECTION_POSITIONS",
+                positions.iter().map(|p| p.ordinal),
+            )?;
+        }
+
+        Ok(by_item)
+    }
+
+    fn query_placement_parent_map(&self) -> Result<HashMap<u64, u64>, VelrIfcError> {
+        let rows = self.execute_cypher_rows(
+            r#"
+MATCH (lp:IfcLocalPlacement)-[:PLACEMENT_REL_TO]->(parent)
+RETURN id(lp) AS placement_id, id(parent) AS parent_placement_id
 ORDER BY placement_id
 "#,
         )?;
@@ -1049,38 +2559,595 @@ ORDER BY placement_id
         rows.rows
             .into_iter()
             .map(|row| {
-                let placement_id = parse_u64_cell(row.first(), "placement_id")?;
-                let parent_placement_id =
-                    parse_optional_u64_cell(row.get(1), "parent_placement_id")?;
-                let relative_location = parse_optional_dvec3_cell(row.get(3), "location")?;
-                let axis = parse_optional_dvec3_cell(row.get(4), "axis")?;
-                let ref_direction = parse_optional_dvec3_cell(row.get(5), "ref_direction")?;
-
-                Ok(IfcLocalPlacementRecord {
-                    placement_id,
-                    parent_placement_id,
-                    relative_location,
-                    axis,
-                    ref_direction,
-                })
+                Ok((
+                    parse_u64_cell(row.first(), "placement_id")?,
+                    parse_u64_cell(row.get(1), "parent_placement_id")?,
+                ))
             })
             .collect()
     }
 
-    fn resolve_local_placement_transforms(&self) -> Result<HashMap<u64, DMat4>, VelrIfcError> {
+    fn query_aggregate_child_parent_placement_map_for_products(
+        &self,
+        product_ids: &HashSet<u64>,
+    ) -> Result<HashMap<u64, u64>, VelrIfcError> {
+        let mut placement_by_product = HashMap::new();
+        let mut product_ids = product_ids.iter().copied().collect::<Vec<_>>();
+        product_ids.sort_unstable();
+
+        for product_id_chunk in product_ids.chunks(512) {
+            let product_id_list = product_id_chunk
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let rows = self.execute_cypher_rows(&format!(
+                r#"
+MATCH (product:IfcProduct)
+WHERE id(product) IN [{product_id_list}]
+MATCH (product)<-[:RELATED_OBJECTS]-(:IfcRelAggregates)-[:RELATING_OBJECT]->(parent:IfcProduct)-[:OBJECT_PLACEMENT]->(parent_placement)
+RETURN id(product) AS product_id, id(parent_placement) AS parent_placement_id
+ORDER BY product_id, parent_placement_id
+"#,
+            ))?;
+
+            for row in rows.rows {
+                placement_by_product.insert(
+                    parse_u64_cell(row.first(), "product_id")?,
+                    parse_u64_cell(row.get(1), "parent_placement_id")?,
+                );
+            }
+        }
+
+        Ok(placement_by_product)
+    }
+
+    fn query_local_placement_records(&self) -> Result<Vec<IfcLocalPlacementRecord>, VelrIfcError> {
+        let placement_rows = self.execute_cypher_rows(
+            r#"
+MATCH (lp:IfcLocalPlacement)
+RETURN id(lp) AS placement_id
+ORDER BY placement_id
+"#,
+        )?;
+        let mut records_by_id = placement_rows
+            .rows
+            .into_iter()
+            .map(|row| {
+                let placement_id = parse_u64_cell(row.first(), "placement_id")?;
+                Ok((
+                    placement_id,
+                    IfcLocalPlacementRecord {
+                        placement_id,
+                        parent: None,
+                        relative_location: None,
+                        axis: None,
+                        ref_direction: None,
+                    },
+                ))
+            })
+            .collect::<Result<HashMap<_, _>, VelrIfcError>>()?;
+
+        let parent_rows = self.execute_cypher_rows(
+            r#"
+MATCH (lp:IfcLocalPlacement)-[:PLACEMENT_REL_TO]->(parent)
+RETURN id(lp) AS placement_id, parent.declared_entity AS parent_entity, id(parent) AS parent_placement_id
+"#,
+        )?;
+        for row in parent_rows.rows {
+            let placement_id = parse_u64_cell(row.first(), "placement_id")?;
+            let parent_entity = parse_required_string_cell(row.get(1), "parent_entity")?;
+            let parent_placement_id = parse_u64_cell(row.get(2), "parent_placement_id")?;
+            let Some(record) = records_by_id.get_mut(&placement_id) else {
+                return Err(VelrIfcError::IfcGeometryData(format!(
+                    "IfcLocalPlacement `{placement_id}` has parent placement data but was missing from the placement scan"
+                )));
+            };
+            record.parent = match parent_entity {
+                "IfcLocalPlacement" => Some(IfcPlacementParent::Local(parent_placement_id)),
+                "IfcLinearPlacement" => Some(IfcPlacementParent::Linear(parent_placement_id)),
+                other => {
+                    return Err(VelrIfcError::IfcGeometryData(format!(
+                        "IfcLocalPlacement `{placement_id}` references unsupported placement parent `{other}`"
+                    )));
+                }
+            };
+        }
+
+        let relative_rows = self.execute_cypher_rows(
+            r#"
+MATCH (lp:IfcLocalPlacement)-[:RELATIVE_PLACEMENT]->(relative:IfcAxis2Placement3D)
+RETURN id(lp) AS placement_id, id(relative) AS relative_placement_id
+"#,
+        )?;
+        let mut relative_by_placement = HashMap::new();
+        for row in relative_rows.rows {
+            let placement_id = parse_u64_cell(row.first(), "placement_id")?;
+            let relative_placement_id = parse_u64_cell(row.get(1), "relative_placement_id")?;
+            relative_by_placement.insert(placement_id, relative_placement_id);
+        }
+
+        let location_by_relative =
+            self.query_axis2_placement_vector_map("LOCATION", "IfcCartesianPoint", "Coordinates")?;
+        let axis_by_relative =
+            self.query_axis2_placement_vector_map("AXIS", "IfcDirection", "DirectionRatios")?;
+        let ref_direction_by_relative = self.query_axis2_placement_vector_map(
+            "REF_DIRECTION",
+            "IfcDirection",
+            "DirectionRatios",
+        )?;
+
+        for (placement_id, relative_placement_id) in relative_by_placement {
+            let Some(record) = records_by_id.get_mut(&placement_id) else {
+                return Err(VelrIfcError::IfcGeometryData(format!(
+                    "IfcLocalPlacement `{placement_id}` has relative placement data but was missing from the placement scan"
+                )));
+            };
+            record.relative_location = location_by_relative.get(&relative_placement_id).copied();
+            record.axis = axis_by_relative.get(&relative_placement_id).copied();
+            record.ref_direction = ref_direction_by_relative
+                .get(&relative_placement_id)
+                .copied();
+        }
+
+        let mut records = records_by_id.into_values().collect::<Vec<_>>();
+        records.sort_by_key(|record| record.placement_id);
+        Ok(records)
+    }
+
+    fn query_linear_placement_records(
+        &self,
+    ) -> Result<HashMap<u64, IfcLinearPlacementRecord>, VelrIfcError> {
+        let placement_rows = self.execute_cypher_rows(
+            r#"
+MATCH (lp:IfcLinearPlacement)
+RETURN id(lp) AS placement_id
+ORDER BY placement_id
+"#,
+        )?;
+        let mut records_by_id = placement_rows
+            .rows
+            .into_iter()
+            .map(|row| {
+                let placement_id = parse_u64_cell(row.first(), "placement_id")?;
+                Ok((
+                    placement_id,
+                    IfcLinearPlacementRecord {
+                        parent_local_placement_id: None,
+                        curve_id: None,
+                        distance_along: 0.0,
+                        offset_longitudinal: 0.0,
+                        offset_lateral: 0.0,
+                        offset_vertical: 0.0,
+                    },
+                ))
+            })
+            .collect::<Result<HashMap<_, _>, VelrIfcError>>()?;
+
+        let parent_rows = self.execute_cypher_rows(
+            r#"
+MATCH (lp:IfcLinearPlacement)-[:PLACEMENT_REL_TO]->(parent:IfcLocalPlacement)
+RETURN id(lp) AS placement_id, id(parent) AS parent_placement_id
+"#,
+        )?;
+        for row in parent_rows.rows {
+            let placement_id = parse_u64_cell(row.first(), "placement_id")?;
+            let parent_placement_id = parse_u64_cell(row.get(1), "parent_placement_id")?;
+            let Some(record) = records_by_id.get_mut(&placement_id) else {
+                return Err(VelrIfcError::IfcGeometryData(format!(
+                    "IfcLinearPlacement `{placement_id}` has parent placement data but was missing from the placement scan"
+                )));
+            };
+            record.parent_local_placement_id = Some(parent_placement_id);
+        }
+
+        let location_rows = self.execute_cypher_rows(
+            r#"
+MATCH (lp:IfcLinearPlacement)-[:RELATIVE_PLACEMENT]->(:IfcAxis2PlacementLinear)-[:LOCATION]->(point:IfcPointByDistanceExpression)-[:BASIS_CURVE]->(curve:IfcGradientCurve)
+MATCH (point)-[:DISTANCE_ALONG]->(distance)
+RETURN id(lp) AS placement_id, id(curve) AS curve_id, distance.payload_value AS distance_along, point.OffsetLongitudinal AS offset_longitudinal, point.OffsetLateral AS offset_lateral, point.OffsetVertical AS offset_vertical
+"#,
+        )?;
+        for row in location_rows.rows {
+            let placement_id = parse_u64_cell(row.first(), "placement_id")?;
+            let Some(record) = records_by_id.get_mut(&placement_id) else {
+                return Err(VelrIfcError::IfcGeometryData(format!(
+                    "IfcLinearPlacement `{placement_id}` has relative placement data but was missing from the placement scan"
+                )));
+            };
+            record.curve_id = Some(parse_u64_cell(row.get(1), "curve_id")?);
+            record.distance_along = parse_f64_cell(row.get(2), "distance_along")?;
+            record.offset_longitudinal =
+                parse_optional_f64_cell(row.get(3), "offset_longitudinal")?.unwrap_or(0.0);
+            record.offset_lateral =
+                parse_optional_f64_cell(row.get(4), "offset_lateral")?.unwrap_or(0.0);
+            record.offset_vertical =
+                parse_optional_f64_cell(row.get(5), "offset_vertical")?.unwrap_or(0.0);
+        }
+
+        Ok(records_by_id)
+    }
+
+    fn query_gradient_curve_records(
+        &self,
+    ) -> Result<HashMap<u64, IfcGradientCurveRecord>, VelrIfcError> {
+        let horizontal_rows = self.execute_cypher_rows(
+            r#"
+MATCH (curve:IfcGradientCurve)-[:BASE_CURVE]->(:IfcCompositeCurve)-[:SEGMENTS]->(seg:IfcCurveSegment)-[:PLACEMENT]->(place:IfcAxis2Placement2D)-[:LOCATION]->(point:IfcCartesianPoint)
+MATCH (place)-[:REF_DIRECTION]->(dir:IfcDirection)
+MATCH (seg)-[:SEGMENT_LENGTH]->(length)
+OPTIONAL MATCH (seg)-[:PARENT_CURVE]->(parent_curve)
+RETURN id(curve) AS curve_id, id(seg) AS segment_id, point.Coordinates AS start_point, dir.DirectionRatios AS direction, length.payload_value AS segment_length, parent_curve.declared_entity AS parent_curve_entity, parent_curve.Radius AS radius, parent_curve.ClothoidConstant AS clothoid_constant
+ORDER BY curve_id, segment_id
+"#,
+        )?;
+        let vertical_rows = self.execute_cypher_rows(
+            r#"
+MATCH (curve:IfcGradientCurve)-[:SEGMENTS]->(seg:IfcCurveSegment)-[:PLACEMENT]->(place:IfcAxis2Placement2D)-[:LOCATION]->(point:IfcCartesianPoint)
+MATCH (place)-[:REF_DIRECTION]->(dir:IfcDirection)
+MATCH (seg)-[:SEGMENT_LENGTH]->(length)
+OPTIONAL MATCH (seg)-[:PARENT_CURVE]->(parent_curve)
+RETURN id(curve) AS curve_id, id(seg) AS segment_id, point.Coordinates AS start_point, dir.DirectionRatios AS direction, length.payload_value AS segment_length, parent_curve.declared_entity AS parent_curve_entity, parent_curve.Radius AS radius, parent_curve.ClothoidConstant AS clothoid_constant
+ORDER BY curve_id, segment_id
+"#,
+        )?;
+
+        #[derive(Clone, Debug)]
+        struct SegmentRow {
+            segment_id: u64,
+            start_point: DVec2,
+            direction: DVec2,
+            signed_length: f64,
+            parent_curve_entity: Option<String>,
+            radius: Option<f64>,
+        }
+
+        let parse_rows_by_curve =
+            |rows: CypherQueryResult| -> Result<HashMap<u64, Vec<SegmentRow>>, VelrIfcError> {
+                let mut rows_by_curve: HashMap<u64, Vec<SegmentRow>> = HashMap::new();
+                for row in rows.rows {
+                    let curve_id = parse_u64_cell(row.first(), "curve_id")?;
+                    rows_by_curve.entry(curve_id).or_default().push(SegmentRow {
+                        segment_id: parse_u64_cell(row.get(1), "segment_id")?,
+                        start_point: parse_dvec2_cell(row.get(2), "start_point")?,
+                        direction: normalized_2d_or(
+                            parse_dvec2_cell(row.get(3), "direction")?,
+                            DVec2::X,
+                        ),
+                        signed_length: parse_f64_cell(row.get(4), "segment_length")?,
+                        parent_curve_entity: parse_optional_string_cell(row.get(5)),
+                        radius: parse_optional_f64_cell(row.get(6), "radius")?,
+                    });
+                }
+                Ok(rows_by_curve)
+            };
+
+        let mut horizontal_rows_by_curve = parse_rows_by_curve(horizontal_rows)?;
+        let mut vertical_rows_by_curve = parse_rows_by_curve(vertical_rows)?;
+
+        let build_segments = |mut rows: Vec<SegmentRow>,
+                              use_explicit_station: bool|
+         -> Vec<IfcGradientCurveSegment> {
+            rows.sort_by_key(|row| row.segment_id);
+            let mut cumulative_station = 0.0;
+            let mut segments = Vec::with_capacity(rows.len());
+            for index in 0..rows.len() {
+                let row = &rows[index];
+                let next = rows.get(index + 1);
+                let length = row.signed_length.abs();
+                let end_point = next.map(|row| row.start_point);
+                let end_direction = next.map(|row| row.direction);
+                let kind = match row.parent_curve_entity.as_deref() {
+                    Some("IfcCircle") => row
+                        .radius
+                        .filter(|radius| radius.abs() > 1.0e-9)
+                        .map(|radius| IfcGradientCurveSegmentKind::Circular {
+                            radius: radius.abs(),
+                            turn_sign: choose_circular_segment_turn_sign(
+                                row.start_point,
+                                row.direction,
+                                radius.abs(),
+                                length,
+                                end_point,
+                                row.signed_length,
+                            ),
+                        })
+                        .unwrap_or(IfcGradientCurveSegmentKind::Line),
+                    Some("IfcClothoid") => IfcGradientCurveSegmentKind::Clothoid,
+                    _ => IfcGradientCurveSegmentKind::Line,
+                };
+                let start_station = if use_explicit_station {
+                    row.start_point.x
+                } else {
+                    cumulative_station
+                };
+                segments.push(IfcGradientCurveSegment {
+                    start_station,
+                    length,
+                    start_point: row.start_point,
+                    direction: row.direction,
+                    end_point,
+                    end_direction,
+                    kind,
+                });
+                cumulative_station += length;
+            }
+            segments
+        };
+
+        let mut records = HashMap::with_capacity(horizontal_rows_by_curve.len());
+        for (curve_id, horizontal_rows) in horizontal_rows_by_curve.drain() {
+            let horizontal_segments = build_segments(horizontal_rows, false);
+            let vertical_segments = vertical_rows_by_curve
+                .remove(&curve_id)
+                .map(|rows| build_segments(rows, true))
+                .unwrap_or_default();
+            records.insert(
+                curve_id,
+                IfcGradientCurveRecord {
+                    horizontal_segments,
+                    vertical_segments,
+                },
+            );
+        }
+
+        Ok(records)
+    }
+
+    fn query_polyline_directrix_records(
+        &self,
+    ) -> Result<HashMap<u64, IfcPolylineDirectrixRecord>, VelrIfcError> {
+        let rows = self.execute_cypher_rows(
+            r#"
+MATCH (:IfcSectionedSolidHorizontal)-[:DIRECTRIX]->(curve:IfcPolyline)-[point_edge:POINTS]->(point:IfcCartesianPoint)
+RETURN id(curve) AS curve_id, point_edge.ordinal AS point_ordinal, point.Coordinates AS coordinates
+ORDER BY curve_id, point_ordinal
+"#,
+        )?;
+
+        let mut points_by_curve = HashMap::<u64, Vec<IfcPolylineDirectrixPoint>>::new();
+        for (sequence, row) in rows.rows.into_iter().enumerate() {
+            let curve_id = parse_u64_cell(row.first(), "curve_id")?;
+            points_by_curve
+                .entry(curve_id)
+                .or_default()
+                .push(IfcPolylineDirectrixPoint {
+                    ordinal: parse_optional_u64_cell(row.get(1), "point_ordinal")?,
+                    sequence,
+                    coordinates: parse_dvec3_cell(row.get(2), "coordinates")?,
+                });
+        }
+
+        let mut records = HashMap::with_capacity(points_by_curve.len());
+        for (curve_id, mut points) in points_by_curve {
+            points.sort_by_key(|point| {
+                (
+                    point.ordinal.unwrap_or(point.sequence as u64),
+                    point.sequence,
+                )
+            });
+            let mut coordinates = Vec::with_capacity(points.len());
+            for point in points {
+                if coordinates.last().is_some_and(|previous: &DVec3| {
+                    previous.distance_squared(point.coordinates) <= 1.0e-18
+                }) {
+                    continue;
+                }
+                coordinates.push(point.coordinates);
+            }
+            if coordinates.len() < 2 {
+                return Err(VelrIfcError::IfcGeometryData(format!(
+                    "IfcPolyline directrix `{curve_id}` for IfcSectionedSolidHorizontal has fewer than two explicit points"
+                )));
+            }
+            records.insert(
+                curve_id,
+                IfcPolylineDirectrixRecord {
+                    points: coordinates,
+                },
+            );
+        }
+
+        Ok(records)
+    }
+
+    fn query_axis2_placement_vector_map(
+        &self,
+        edge_type: &'static str,
+        target_label: &'static str,
+        target_property: &'static str,
+    ) -> Result<HashMap<u64, DVec3>, VelrIfcError> {
+        let rows = self.execute_cypher_rows(&format!(
+            r#"
+MATCH (relative:IfcAxis2Placement3D)-[:{edge_type}]->(target:{target_label})
+RETURN id(relative) AS relative_placement_id, target.{target_property} AS vector
+"#
+        ))?;
+
+        rows.rows
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    parse_u64_cell(row.first(), "relative_placement_id")?,
+                    parse_dvec3_cell(row.get(1), "vector")?,
+                ))
+            })
+            .collect()
+    }
+
+    fn query_axis2_placement_transform_map(&self) -> Result<HashMap<u64, DMat4>, VelrIfcError> {
+        let rows = self.execute_cypher_rows(
+            r#"
+MATCH (relative:IfcAxis2Placement3D)
+RETURN id(relative) AS relative_placement_id
+"#,
+        )?;
+        let locations =
+            self.query_axis2_placement_vector_map("LOCATION", "IfcCartesianPoint", "Coordinates")?;
+        let axes =
+            self.query_axis2_placement_vector_map("AXIS", "IfcDirection", "DirectionRatios")?;
+        let ref_directions = self.query_axis2_placement_vector_map(
+            "REF_DIRECTION",
+            "IfcDirection",
+            "DirectionRatios",
+        )?;
+
+        rows.rows
+            .into_iter()
+            .map(|row| {
+                let relative_id = parse_u64_cell(row.first(), "relative_placement_id")?;
+                Ok((
+                    relative_id,
+                    axis2_placement_transform(
+                        locations.get(&relative_id).copied().unwrap_or(DVec3::ZERO),
+                        axes.get(&relative_id).copied(),
+                        ref_directions.get(&relative_id).copied(),
+                    ),
+                ))
+            })
+            .collect()
+    }
+
+    fn query_cartesian_operator_vector_map(
+        &self,
+        edge_type: &'static str,
+        target_label: &'static str,
+        target_property: &'static str,
+    ) -> Result<HashMap<u64, DVec3>, VelrIfcError> {
+        let rows = self.execute_cypher_rows(&format!(
+            r#"
+MATCH (operator:IfcCartesianTransformationOperator3D)-[:{edge_type}]->(target:{target_label})
+RETURN id(operator) AS operator_id, target.{target_property} AS vector
+"#
+        ))?;
+
+        rows.rows
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    parse_u64_cell(row.first(), "operator_id")?,
+                    parse_dvec3_cell(row.get(1), "vector")?,
+                ))
+            })
+            .collect()
+    }
+
+    fn query_cartesian_operator_transform_map(&self) -> Result<HashMap<u64, DMat4>, VelrIfcError> {
+        let rows = self.execute_cypher_rows(
+            r#"
+MATCH (operator:IfcCartesianTransformationOperator3D)
+RETURN id(operator) AS operator_id, operator.Scale AS scale, operator.Scale2 AS scale2, operator.Scale3 AS scale3
+"#,
+        )?;
+        let origins = self.query_cartesian_operator_vector_map(
+            "LOCAL_ORIGIN",
+            "IfcCartesianPoint",
+            "Coordinates",
+        )?;
+        let axis1 =
+            self.query_cartesian_operator_vector_map("AXIS1", "IfcDirection", "DirectionRatios")?;
+        let axis2 =
+            self.query_cartesian_operator_vector_map("AXIS2", "IfcDirection", "DirectionRatios")?;
+        let axis3 =
+            self.query_cartesian_operator_vector_map("AXIS3", "IfcDirection", "DirectionRatios")?;
+
+        rows.rows
+            .into_iter()
+            .map(|row| {
+                let operator_id = parse_u64_cell(row.first(), "operator_id")?;
+                let scale = parse_optional_f64_cell(row.get(1), "scale")?.unwrap_or(1.0);
+                let scale2 = parse_optional_f64_cell(row.get(2), "scale2")?.unwrap_or(scale);
+                let scale3 = parse_optional_f64_cell(row.get(3), "scale3")?.unwrap_or(scale);
+                Ok((
+                    operator_id,
+                    cartesian_operator_transform(
+                        origins.get(&operator_id).copied().unwrap_or(DVec3::ZERO),
+                        axis1.get(&operator_id).copied(),
+                        axis2.get(&operator_id).copied(),
+                        axis3.get(&operator_id).copied(),
+                        DVec3::new(scale, scale2, scale3),
+                    ),
+                ))
+            })
+            .collect()
+    }
+
+    fn query_mapped_item_transform_map(&self) -> Result<HashMap<u64, DMat4>, VelrIfcError> {
+        let rows = self.execute_cypher_rows(
+            r#"
+MATCH (mapped:IfcMappedItem)-[:MAPPING_SOURCE]->(map:IfcRepresentationMap)
+WITH mapped, map
+MATCH (map)-[:MAPPING_ORIGIN]->(origin:IfcAxis2Placement3D)
+WITH mapped, origin
+MATCH (mapped)-[:MAPPING_TARGET]->(target:IfcCartesianTransformationOperator3D)
+RETURN id(mapped) AS mapped_item_id, id(origin) AS origin_id, id(target) AS target_id
+"#,
+        )?;
+        let origin_transforms = self.query_axis2_placement_transform_map()?;
+        let target_transforms = self.query_cartesian_operator_transform_map()?;
+
+        rows.rows
+            .into_iter()
+            .map(|row| {
+                let mapped_item_id = parse_u64_cell(row.first(), "mapped_item_id")?;
+                let origin_id = parse_u64_cell(row.get(1), "origin_id")?;
+                let target_id = parse_u64_cell(row.get(2), "target_id")?;
+                let origin = origin_transforms.get(&origin_id).copied().ok_or_else(|| {
+                    VelrIfcError::IfcGeometryData(format!(
+                        "IfcRepresentationMap origin `{origin_id}` was missing from Axis2Placement3D transforms"
+                    ))
+                })?;
+                let target = target_transforms.get(&target_id).copied().ok_or_else(|| {
+                    VelrIfcError::IfcGeometryData(format!(
+                        "IfcMappedItem target `{target_id}` was missing from CartesianTransformationOperator3D transforms"
+                    ))
+                })?;
+                Ok((mapped_item_id, target * origin.inverse()))
+            })
+            .collect()
+    }
+
+    fn resolve_object_placement_transforms(&self) -> Result<HashMap<u64, DMat4>, VelrIfcError> {
         let placements = self.query_local_placement_records()?;
-        let by_id = placements
+        let local_by_id = placements
             .into_iter()
             .map(|placement| (placement.placement_id, placement))
             .collect::<HashMap<_, _>>();
-        let mut resolved = HashMap::with_capacity(by_id.len());
-        let mut visiting = HashSet::new();
+        let linear_by_id = self.query_linear_placement_records()?;
+        let curves = self.query_gradient_curve_records()?;
+        let mut resolved_local = HashMap::with_capacity(local_by_id.len());
+        let mut resolved_linear = HashMap::with_capacity(linear_by_id.len());
+        let mut visiting_local = HashSet::new();
+        let mut visiting_linear = HashSet::new();
 
-        for placement_id in by_id.keys().copied().collect::<Vec<_>>() {
-            resolve_local_placement_transform(placement_id, &by_id, &mut resolved, &mut visiting)?;
+        for placement_id in local_by_id.keys().copied().collect::<Vec<_>>() {
+            resolve_local_placement_transform(
+                placement_id,
+                &local_by_id,
+                &linear_by_id,
+                &curves,
+                &mut resolved_local,
+                &mut resolved_linear,
+                &mut visiting_local,
+                &mut visiting_linear,
+            )?;
         }
 
-        Ok(resolved)
+        for placement_id in linear_by_id.keys().copied().collect::<Vec<_>>() {
+            resolve_linear_placement_transform(
+                placement_id,
+                &local_by_id,
+                &linear_by_id,
+                &curves,
+                &mut resolved_local,
+                &mut resolved_linear,
+                &mut visiting_local,
+                &mut visiting_linear,
+            )?;
+        }
+
+        resolved_local.extend(resolved_linear);
+        Ok(resolved_local)
     }
 }
 
@@ -1416,10 +3483,6 @@ pub fn slugify_model_name(input: &str) -> String {
     slug.trim_matches('-').to_string()
 }
 
-fn ifc_body_source_space() -> SourceSpace {
-    SourceSpace::new(CoordinateFrame::w_world(), LengthUnit::Millimeter)
-}
-
 fn is_ifc_building_element_proxy_helper(record: &IfcBodyRecord) -> bool {
     matches!(
         record.name.as_deref().map(|name| name.trim().to_ascii_lowercase()),
@@ -1512,6 +3575,104 @@ fn normalize_ifc_semantic_value(value: &str) -> String {
         .join("_")
 }
 
+fn faceted_brep_solid_limit_clause(limit_items: Option<usize>) -> String {
+    match limit_items {
+        Some(limit) => format!("WITH solid LIMIT {limit}\n"),
+        None => String::new(),
+    }
+}
+
+fn faceted_brep_geometry_query(limit_items: Option<usize>) -> String {
+    format!(
+        r#"
+MATCH (solid:IfcFacetedBrep)
+{}MATCH (solid)-[:OUTER]->(shell)
+WITH solid, shell
+MATCH (shell)-[face_edge:CFS_FACES]->(face)
+WITH solid, face, face_edge
+MATCH (face)-[:BOUNDS]->(bound)
+WITH solid, face, face_edge, bound
+MATCH (bound)-[:BOUND]->(loop)
+WITH solid, face, face_edge, loop
+MATCH (loop)-[point_edge:POLYGON]->(pt)
+RETURN id(solid) AS item_id, id(face) AS face_id, face_edge.ordinal AS face_ordinal, point_edge.ordinal AS point_ordinal, pt.Coordinates AS coordinates
+"#,
+        faceted_brep_solid_limit_clause(limit_items),
+    )
+}
+
+fn faceted_brep_metadata_query(limit_items: Option<usize>) -> String {
+    format!(
+        r#"
+MATCH (solid:IfcFacetedBrep)
+{}MATCH (solid)<-[:ITEMS]-(rep:IfcShapeRepresentation)
+WHERE rep.RepresentationIdentifier = 'Body'
+WITH solid, rep
+MATCH (rep)<-[:REPRESENTATIONS]-(shape:IfcProductDefinitionShape)
+WITH solid, shape
+MATCH (shape)<-[:REPRESENTATION]-(p:IfcProduct)
+OPTIONAL MATCH (p)-[:OBJECT_PLACEMENT]->(placement)
+OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelDefinesByType)-[:RELATING_TYPE]->(type_node)
+OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelAssociatesClassification)-[:RELATING_CLASSIFICATION]->(classification_ref)
+OPTIONAL MATCH (solid)<-[:ITEM]-(styled:IfcStyledItem)
+OPTIONAL MATCH (styled)-[:STYLES]->(style_assignment:IfcPresentationStyleAssignment)
+OPTIONAL MATCH (style_assignment)-[:STYLES]->(assigned_surface_style:IfcSurfaceStyle)
+OPTIONAL MATCH (styled)-[:STYLES]->(surface_style:IfcSurfaceStyle)
+OPTIONAL MATCH (surface_style)-[:STYLES]->(rendering:IfcSurfaceStyleRendering)
+OPTIONAL MATCH (rendering)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
+OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_rendering:IfcSurfaceStyleRendering)
+OPTIONAL MATCH (assigned_rendering)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
+WITH p, placement, solid,
+     head(collect(DISTINCT {{ object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType }})) AS type_semantics,
+     head(collect(DISTINCT classification_ref.Identification)) AS classification_identification,
+     head(collect(DISTINCT {{ red: rgb.Red, green: rgb.Green, blue: rgb.Blue }})) AS surface_rgb,
+     head(collect(DISTINCT {{ red: assigned_rgb.Red, green: assigned_rgb.Green, blue: assigned_rgb.Blue }})) AS assigned_surface_rgb
+RETURN id(p) AS product_id, id(placement) AS placement_id, id(solid) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue, assigned_surface_rgb.red AS assigned_style_red, assigned_surface_rgb.green AS assigned_style_green, assigned_surface_rgb.blue AS assigned_style_blue
+ORDER BY item_id
+"#,
+        faceted_brep_solid_limit_clause(limit_items),
+    )
+}
+
+fn faceted_brep_mapped_metadata_query(limit_items: Option<usize>) -> String {
+    format!(
+        r#"
+MATCH (solid:IfcFacetedBrep)
+{}MATCH (solid)<-[:ITEMS]-(source_rep:IfcShapeRepresentation)
+WITH solid, source_rep
+MATCH (source_rep)<-[:MAPPED_REPRESENTATION]-(map:IfcRepresentationMap)
+WITH solid, map
+MATCH (map)<-[:MAPPING_SOURCE]-(mapped:IfcMappedItem)
+WITH solid, mapped
+MATCH (mapped)<-[:ITEMS]-(rep:IfcShapeRepresentation)
+WHERE rep.RepresentationIdentifier = 'Body'
+WITH solid, mapped, rep
+MATCH (rep)<-[:REPRESENTATIONS]-(shape:IfcProductDefinitionShape)
+WITH solid, mapped, shape
+MATCH (shape)<-[:REPRESENTATION]-(p:IfcProduct)
+OPTIONAL MATCH (p)-[:OBJECT_PLACEMENT]->(placement)
+OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelDefinesByType)-[:RELATING_TYPE]->(type_node)
+OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelAssociatesClassification)-[:RELATING_CLASSIFICATION]->(classification_ref)
+OPTIONAL MATCH (solid)<-[:ITEM]-(styled:IfcStyledItem)
+OPTIONAL MATCH (styled)-[:STYLES]->(style_assignment:IfcPresentationStyleAssignment)
+OPTIONAL MATCH (style_assignment)-[:STYLES]->(assigned_surface_style:IfcSurfaceStyle)
+OPTIONAL MATCH (styled)-[:STYLES]->(surface_style:IfcSurfaceStyle)
+OPTIONAL MATCH (surface_style)-[:STYLES]->(rendering:IfcSurfaceStyleRendering)
+OPTIONAL MATCH (rendering)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
+OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_rendering:IfcSurfaceStyleRendering)
+OPTIONAL MATCH (assigned_rendering)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
+WITH mapped, p, placement, solid,
+     head(collect(DISTINCT {{ object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType }})) AS type_semantics,
+     head(collect(DISTINCT classification_ref.Identification)) AS classification_identification,
+     head(collect(DISTINCT {{ red: rgb.Red, green: rgb.Green, blue: rgb.Blue }})) AS surface_rgb,
+     head(collect(DISTINCT {{ red: assigned_rgb.Red, green: assigned_rgb.Green, blue: assigned_rgb.Blue }})) AS assigned_surface_rgb
+RETURN id(mapped) AS mapped_item_id, id(p) AS product_id, id(placement) AS placement_id, id(solid) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue, assigned_surface_rgb.red AS assigned_style_red, assigned_surface_rgb.green AS assigned_style_green, assigned_surface_rgb.blue AS assigned_style_blue
+ORDER BY mapped_item_id, item_id
+"#,
+        faceted_brep_solid_limit_clause(limit_items),
+    )
+}
+
 fn parse_optional_string_cell(cell: Option<&String>) -> Option<String> {
     let value = cell?.trim();
     if value.is_empty() {
@@ -1562,9 +3723,29 @@ fn summarize_body_instances(package: &PreparedGeometryPackage) -> Vec<IfcBodyIns
     instances
 }
 
+fn effective_faceted_brep_placement_id(
+    product_id: u64,
+    placement_id: Option<u64>,
+    placement_parent_by_id: &HashMap<u64, u64>,
+    aggregate_parent_placement_by_product: &HashMap<u64, u64>,
+) -> Option<u64> {
+    let Some(child_placement_id) = placement_id else {
+        return None;
+    };
+    let Some(parent_placement_id) = aggregate_parent_placement_by_product.get(&product_id) else {
+        return placement_id;
+    };
+    if placement_parent_by_id.get(&child_placement_id) == Some(parent_placement_id) {
+        return Some(*parent_placement_id);
+    }
+
+    placement_id
+}
+
 fn imported_scene_resource_from_body_records(
     mut records: Vec<IfcBodyRecord>,
     placement_transforms: &HashMap<u64, DMat4>,
+    source_space: SourceSpace,
 ) -> Result<ImportedGeometrySceneResource, VelrIfcError> {
     if records.is_empty() {
         return Err(VelrIfcError::NoBodyGeometry);
@@ -1579,17 +3760,24 @@ fn imported_scene_resource_from_body_records(
                     .unwrap_or_default()
                     .cmp(&right.placement_id.unwrap_or_default())
             })
+            .then_with(|| {
+                left.occurrence_id
+                    .unwrap_or_default()
+                    .cmp(&right.occurrence_id.unwrap_or_default())
+            })
             .then_with(|| left.global_id.cmp(&right.global_id))
             .then_with(|| left.name.cmp(&right.name))
             .then_with(|| left.declared_entity.cmp(&right.declared_entity))
     });
 
     let mut definitions = Vec::new();
-    let mut primitive_by_item = HashMap::<u64, GeometryPrimitive>::new();
+    let mut primitive_by_item = HashMap::<u64, Arc<GeometryPrimitive>>::new();
 
     for record in &records {
         if let Some(existing) = primitive_by_item.get(&record.item_id) {
-            if existing != &record.primitive {
+            if !Arc::ptr_eq(existing, &record.primitive)
+                && existing.as_ref() != record.primitive.as_ref()
+            {
                 return Err(VelrIfcError::IfcGeometryData(format!(
                     "body item {} resolved to inconsistent primitive payloads",
                     record.item_id
@@ -1598,10 +3786,10 @@ fn imported_scene_resource_from_body_records(
             continue;
         }
 
-        primitive_by_item.insert(record.item_id, record.primitive.clone());
+        primitive_by_item.insert(record.item_id, Arc::clone(&record.primitive));
         definitions.push(GeometryDefinition {
             id: GeometryDefinitionId(record.item_id),
-            primitive: record.primitive.clone(),
+            primitive: record.primitive.as_ref().clone(),
         });
     }
 
@@ -1621,11 +3809,7 @@ fn imported_scene_resource_from_body_records(
                         * record.item_transform,
                 },
                 element_id: ifc_element_id_for_record(record),
-                external_id: ExternalId::new(if let Some(global_id) = &record.global_id {
-                    format!("{global_id}/item/{}", record.item_id)
-                } else {
-                    format!("{}/item/{}", record.product_id, record.item_id)
-                }),
+                external_id: ExternalId::new(external_id_for_body_record(record)),
                 label: record
                     .name
                     .clone()
@@ -1640,8 +3824,20 @@ fn imported_scene_resource_from_body_records(
     Ok(ImportedGeometrySceneResource {
         definitions,
         instances,
-        source_space: ifc_body_source_space(),
+        source_space,
     })
+}
+
+fn external_id_for_body_record(record: &IfcBodyRecord) -> String {
+    let base = record
+        .global_id
+        .clone()
+        .unwrap_or_else(|| record.product_id.to_string());
+    if let Some(occurrence_id) = record.occurrence_id {
+        format!("{base}/mapped/{occurrence_id}/item/{}", record.item_id)
+    } else {
+        format!("{base}/item/{}", record.item_id)
+    }
 }
 
 fn ifc_element_id_for_record(record: &IfcBodyRecord) -> SemanticElementId {
@@ -1715,6 +3911,14 @@ fn parse_cached_render_class(value: &str) -> DefaultRenderClass {
     }
 }
 
+fn phase_timing(name: &'static str, elapsed: Duration, rows: Option<usize>) -> IfcBodyPhaseTiming {
+    IfcBodyPhaseTiming {
+        name,
+        elapsed_ms: elapsed.as_millis(),
+        rows,
+    }
+}
+
 fn parse_required_string_cell<'a>(
     cell: Option<&'a String>,
     label: &'static str,
@@ -1740,9 +3944,48 @@ fn parse_optional_u64_cell(
     let Some(value) = parse_optional_string_cell(cell) else {
         return Ok(None);
     };
+    if value.eq_ignore_ascii_case("null") {
+        return Ok(None);
+    }
     value.parse().map(Some).map_err(|_| {
         VelrIfcError::IfcGeometryData(format!("failed to parse `{label}` as u64: {value}"))
     })
+}
+
+fn parse_optional_node_identity_cell(
+    cell: Option<&String>,
+    label: &'static str,
+) -> Result<Option<u64>, VelrIfcError> {
+    let Some(value) = parse_optional_string_cell(cell) else {
+        return Ok(None);
+    };
+    if value.eq_ignore_ascii_case("null") {
+        return Ok(None);
+    }
+    if let Ok(id) = value.parse::<u64>() {
+        return Ok(Some(id));
+    }
+
+    let json = serde_json::from_str::<JsonValue>(&value).map_err(|_| {
+        VelrIfcError::IfcGeometryData(format!(
+            "failed to parse `{label}` as node identity: {value}"
+        ))
+    })?;
+    let Some(identity) = json.get("identity") else {
+        return Err(VelrIfcError::IfcGeometryData(format!(
+            "missing `identity` in `{label}` node value: {value}"
+        )));
+    };
+    if let Some(id) = identity.as_u64() {
+        return Ok(Some(id));
+    }
+    if let Some(id) = identity.as_str().and_then(|identity| identity.parse().ok()) {
+        return Ok(Some(id));
+    }
+
+    Err(VelrIfcError::IfcGeometryData(format!(
+        "failed to parse `{label}.identity` as u64: {value}"
+    )))
 }
 
 fn parse_optional_f32_cell(
@@ -1762,6 +4005,31 @@ fn parse_f64_cell(cell: Option<&String>, label: &'static str) -> Result<f64, Vel
     value.parse().map_err(|_| {
         VelrIfcError::IfcGeometryData(format!("failed to parse `{label}` as f64: {value}"))
     })
+}
+
+fn parse_optional_f64_cell(
+    cell: Option<&String>,
+    label: &'static str,
+) -> Result<Option<f64>, VelrIfcError> {
+    let Some(value) = parse_optional_string_cell(cell) else {
+        return Ok(None);
+    };
+    value.parse().map(Some).map_err(|_| {
+        VelrIfcError::IfcGeometryData(format!("failed to parse `{label}` as f64: {value}"))
+    })
+}
+
+fn validate_sectioned_solid_horizontal_longitudinal_offset(
+    item_id: u64,
+    position_ordinal: u64,
+    value: Option<f64>,
+) -> Result<(), VelrIfcError> {
+    if value.is_some() {
+        return Err(VelrIfcError::IfcGeometryData(format!(
+            "IfcSectionedSolidHorizontal `{item_id}` CROSS_SECTION_POSITIONS ordinal `{position_ordinal}` uses `OffsetLongitudinal`, which is forbidden by IFC4X3"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_optional_display_color_cells(
@@ -1784,35 +4052,45 @@ fn parse_optional_display_color_cells(
     }
 }
 
-fn parse_optional_dvec3_cell(
+fn parse_optional_db_style_color_cells(
+    red: Option<&String>,
+    green: Option<&String>,
+    blue: Option<&String>,
+    assigned_red: Option<&String>,
+    assigned_green: Option<&String>,
+    assigned_blue: Option<&String>,
+) -> Result<Option<DisplayColor>, VelrIfcError> {
+    let direct_color = parse_optional_display_color_cells(red, green, blue)?;
+    if direct_color.is_some() {
+        return Ok(direct_color);
+    }
+    parse_optional_display_color_cells(assigned_red, assigned_green, assigned_blue)
+}
+
+fn parse_dvec3_cell(cell: Option<&String>, label: &'static str) -> Result<DVec3, VelrIfcError> {
+    let value = parse_required_string_cell(cell, label)?;
+    let json = parse_json_value(value, label)?;
+    parse_dvec3_json(&json, label)
+}
+
+fn parse_dvec2_cell(cell: Option<&String>, label: &'static str) -> Result<DVec2, VelrIfcError> {
+    let value = parse_required_string_cell(cell, label)?;
+    let json = parse_json_value(value, label)?;
+    parse_dvec2_json(&json, label)
+}
+
+fn parse_optional_dvec2_cell(
     cell: Option<&String>,
     label: &'static str,
-) -> Result<Option<DVec3>, VelrIfcError> {
+) -> Result<Option<DVec2>, VelrIfcError> {
     let Some(value) = parse_optional_string_cell(cell) else {
         return Ok(None);
     };
-    let json = parse_json_value(&value, label)?;
-    parse_dvec3_json(&json, label).map(Some)
-}
-
-fn parse_optional_axis2_placement3d_cells(
-    location: Option<&String>,
-    axis: Option<&String>,
-    ref_direction: Option<&String>,
-) -> Result<Option<DMat4>, VelrIfcError> {
-    let location = parse_optional_dvec3_cell(location, "solid_position_location")?;
-    let axis = parse_optional_dvec3_cell(axis, "solid_position_axis")?;
-    let ref_direction = parse_optional_dvec3_cell(ref_direction, "solid_position_ref_direction")?;
-
-    if location.is_none() && axis.is_none() && ref_direction.is_none() {
+    if value.eq_ignore_ascii_case("null") {
         return Ok(None);
     }
-
-    Ok(Some(axis2_placement_transform(
-        location.unwrap_or(DVec3::ZERO),
-        axis,
-        ref_direction,
-    )))
+    let json = parse_json_value(&value, label)?;
+    parse_dvec2_json(&json, label).map(Some)
 }
 
 fn tessellated_geometry_from_row(
@@ -1829,6 +4107,575 @@ fn tessellated_geometry_from_row(
         let exterior = normalize_index_ring(parse_index_ring_json(face_row, &face_label)?);
         if exterior.len() < 3 {
             continue;
+        }
+        faces.push(IndexedPolygon::new(exterior, vec![], positions.len())?);
+    }
+
+    TessellatedGeometry::new(positions, faces).map_err(VelrIfcError::from)
+}
+
+fn tessellated_geometry_from_coord_index_rows(
+    coord_list: &str,
+    coord_index_rows: &[(u64, String)],
+) -> Result<TessellatedGeometry, VelrIfcError> {
+    let positions = parse_dvec3_rows_json(coord_list, "coord_list")?;
+    let mut faces = Vec::with_capacity(coord_index_rows.len());
+
+    for (face_index, (_, coord_index)) in coord_index_rows.iter().enumerate() {
+        let face_value = parse_json_value(coord_index, "coord_index")?;
+        let face_label = format!("coord_index[{face_index}]");
+        let exterior = normalize_index_ring(parse_index_ring_json(&face_value, &face_label)?);
+        if exterior.len() < 3 {
+            continue;
+        }
+        faces.push(IndexedPolygon::new(exterior, vec![], positions.len())?);
+    }
+
+    TessellatedGeometry::new(positions, faces).map_err(VelrIfcError::from)
+}
+
+fn body_primitive_for_declared_entity(
+    declared_entity: &str,
+    primitive: Arc<GeometryPrimitive>,
+) -> Result<Arc<GeometryPrimitive>, VelrIfcError> {
+    if declared_entity != "IfcGeographicElement" {
+        return Ok(primitive);
+    }
+
+    let GeometryPrimitive::Tessellated(geometry) = primitive.as_ref() else {
+        return Ok(primitive);
+    };
+
+    Ok(Arc::new(GeometryPrimitive::Tessellated(
+        reverse_tessellated_winding(geometry)?,
+    )))
+}
+
+fn sectioned_solid_horizontal_geometry(
+    item_id: u64,
+    profiles: &[IfcSectionedSolidProfile],
+    positions: &[IfcSectionedSolidPosition],
+    gradient_curves: &HashMap<u64, IfcGradientCurveRecord>,
+    polyline_directrices: &HashMap<u64, IfcPolylineDirectrixRecord>,
+) -> Result<TessellatedGeometry, VelrIfcError> {
+    if profiles.len() != positions.len() {
+        return Err(VelrIfcError::IfcGeometryData(format!(
+            "IfcSectionedSolidHorizontal item `{item_id}` has {} CROSS_SECTIONS but {} CROSS_SECTION_POSITIONS",
+            profiles.len(),
+            positions.len()
+        )));
+    }
+    if profiles.len() < 2 {
+        return Err(VelrIfcError::IfcGeometryData(format!(
+            "IfcSectionedSolidHorizontal item `{item_id}` needs at least two explicit sections"
+        )));
+    }
+
+    let vertex_count = profiles[0].points.len();
+    if vertex_count < 3 {
+        return Err(VelrIfcError::IfcGeometryData(format!(
+            "IfcSectionedSolidHorizontal item `{item_id}` first section has fewer than three profile points"
+        )));
+    }
+    for profile in profiles {
+        if profile.points.len() != vertex_count {
+            return Err(VelrIfcError::IfcGeometryData(format!(
+                "IfcSectionedSolidHorizontal item `{item_id}` uses changing profile vertex counts; section {} has {} points, expected {vertex_count}",
+                profile.ordinal,
+                profile.points.len()
+            )));
+        }
+    }
+    let profile_area = signed_profile_area(&profiles[0].points);
+    if profile_area.abs() <= 1.0e-12 {
+        return Err(VelrIfcError::IfcGeometryData(format!(
+            "IfcSectionedSolidHorizontal item `{item_id}` has a degenerate first profile ring"
+        )));
+    }
+    for profile in profiles.iter().skip(1) {
+        let area = signed_profile_area(&profile.points);
+        if area.abs() <= 1.0e-12 {
+            return Err(VelrIfcError::IfcGeometryData(format!(
+                "IfcSectionedSolidHorizontal item `{item_id}` has a degenerate profile ring at section {}",
+                profile.ordinal
+            )));
+        }
+        if area.signum() != profile_area.signum() {
+            return Err(VelrIfcError::IfcGeometryData(format!(
+                "IfcSectionedSolidHorizontal item `{item_id}` uses inconsistent profile winding at section {}",
+                profile.ordinal
+            )));
+        }
+    }
+    let profile_winding_is_clockwise = profile_area < 0.0;
+
+    let mut rings = Vec::with_capacity(profiles.len());
+    rings.push(sectioned_solid_ring(
+        item_id,
+        &profiles[0].points,
+        &positions[0],
+        gradient_curves,
+        polyline_directrices,
+    )?);
+    for section_index in 0..(profiles.len() - 1) {
+        let start_ring = sectioned_solid_ring(
+            item_id,
+            &profiles[section_index].points,
+            &positions[section_index],
+            gradient_curves,
+            polyline_directrices,
+        )?;
+        let end_ring = sectioned_solid_ring(
+            item_id,
+            &profiles[section_index + 1].points,
+            &positions[section_index + 1],
+            gradient_curves,
+            polyline_directrices,
+        )?;
+        append_sectioned_solid_interval(
+            item_id,
+            &profiles[section_index].points,
+            &positions[section_index],
+            &start_ring,
+            &profiles[section_index + 1].points,
+            &positions[section_index + 1],
+            &end_ring,
+            gradient_curves,
+            polyline_directrices,
+            &mut rings,
+            0,
+        )?;
+    }
+    let positions_3d = rings
+        .iter()
+        .flat_map(|ring| ring.positions.iter().copied())
+        .collect::<Vec<_>>();
+    let section_tangents = rings.iter().map(|ring| ring.tangent).collect::<Vec<_>>();
+
+    let mut faces = Vec::new();
+    let mut first_cap = (0..vertex_count)
+        .map(|index| u32::try_from(index))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            VelrIfcError::IfcGeometryData(format!(
+                "IfcSectionedSolidHorizontal item `{item_id}` exceeds u32 mesh index range"
+            ))
+        })?;
+    let last_offset = (rings.len() - 1) * vertex_count;
+    let mut last_cap = (0..vertex_count)
+        .map(|index| u32::try_from(last_offset + index))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            VelrIfcError::IfcGeometryData(format!(
+                "IfcSectionedSolidHorizontal item `{item_id}` exceeds u32 mesh index range"
+            ))
+        })?;
+    orient_cap_ring(
+        &mut first_cap,
+        &positions_3d,
+        -*section_tangents
+            .first()
+            .expect("section count was validated"),
+    );
+    orient_cap_ring(
+        &mut last_cap,
+        &positions_3d,
+        *section_tangents
+            .last()
+            .expect("section count was validated"),
+    );
+    faces.push(IndexedPolygon::new(first_cap, vec![], positions_3d.len())?);
+    faces.push(IndexedPolygon::new(last_cap, vec![], positions_3d.len())?);
+
+    for section_index in 0..(rings.len() - 1) {
+        let current = section_index * vertex_count;
+        let next = current + vertex_count;
+        for point_index in 0..vertex_count {
+            let point_next = (point_index + 1) % vertex_count;
+            let a = u32::try_from(current + point_index).map_err(|_| {
+                VelrIfcError::IfcGeometryData(format!(
+                    "IfcSectionedSolidHorizontal item `{item_id}` exceeds u32 mesh index range"
+                ))
+            })?;
+            let b = u32::try_from(current + point_next).map_err(|_| {
+                VelrIfcError::IfcGeometryData(format!(
+                    "IfcSectionedSolidHorizontal item `{item_id}` exceeds u32 mesh index range"
+                ))
+            })?;
+            let c = u32::try_from(next + point_next).map_err(|_| {
+                VelrIfcError::IfcGeometryData(format!(
+                    "IfcSectionedSolidHorizontal item `{item_id}` exceeds u32 mesh index range"
+                ))
+            })?;
+            let d = u32::try_from(next + point_index).map_err(|_| {
+                VelrIfcError::IfcGeometryData(format!(
+                    "IfcSectionedSolidHorizontal item `{item_id}` exceeds u32 mesh index range"
+                ))
+            })?;
+            let side_triangles = if profile_winding_is_clockwise {
+                ([a, c, b], [a, d, c])
+            } else {
+                ([a, b, c], [a, c, d])
+            };
+            faces.push(IndexedPolygon::new(
+                side_triangles.0.to_vec(),
+                vec![],
+                positions_3d.len(),
+            )?);
+            faces.push(IndexedPolygon::new(
+                side_triangles.1.to_vec(),
+                vec![],
+                positions_3d.len(),
+            )?);
+        }
+    }
+
+    TessellatedGeometry::new(positions_3d, faces).map_err(VelrIfcError::from)
+}
+
+const SECTIONED_SOLID_DIRECTRIX_CHORD_TOLERANCE: f64 = 0.005;
+const SECTIONED_SOLID_MAX_RESAMPLE_DEPTH: usize = 12;
+
+fn append_sectioned_solid_interval(
+    item_id: u64,
+    start_profile: &[DVec2],
+    start_position: &IfcSectionedSolidPosition,
+    start_ring: &IfcSectionedSolidRing,
+    end_profile: &[DVec2],
+    end_position: &IfcSectionedSolidPosition,
+    end_ring: &IfcSectionedSolidRing,
+    gradient_curves: &HashMap<u64, IfcGradientCurveRecord>,
+    polyline_directrices: &HashMap<u64, IfcPolylineDirectrixRecord>,
+    rings: &mut Vec<IfcSectionedSolidRing>,
+    depth: usize,
+) -> Result<(), VelrIfcError> {
+    if start_profile.len() != end_profile.len() {
+        return Err(VelrIfcError::IfcGeometryData(format!(
+            "IfcSectionedSolidHorizontal item `{item_id}` cannot resample between profiles with different vertex counts"
+        )));
+    }
+    if start_position.curve_entity != end_position.curve_entity
+        || start_position.curve_id != end_position.curve_id
+    {
+        return Err(VelrIfcError::IfcGeometryData(format!(
+            "IfcSectionedSolidHorizontal item `{item_id}` changes directrix between adjacent cross-section positions"
+        )));
+    }
+
+    let mid_profile = interpolate_profile_points(start_profile, end_profile, 0.5);
+    let mid_position = interpolate_sectioned_solid_position(start_position, end_position, 0.5);
+    let mid_ring = sectioned_solid_ring(
+        item_id,
+        &mid_profile,
+        &mid_position,
+        gradient_curves,
+        polyline_directrices,
+    )?;
+    let max_chord_error = mid_ring
+        .positions
+        .iter()
+        .zip(start_ring.positions.iter().zip(&end_ring.positions))
+        .map(|(mid, (start, end))| mid.distance((*start + *end) * 0.5))
+        .fold(0.0, f64::max);
+
+    if max_chord_error > SECTIONED_SOLID_DIRECTRIX_CHORD_TOLERANCE
+        && depth < SECTIONED_SOLID_MAX_RESAMPLE_DEPTH
+    {
+        append_sectioned_solid_interval(
+            item_id,
+            start_profile,
+            start_position,
+            start_ring,
+            &mid_profile,
+            &mid_position,
+            &mid_ring,
+            gradient_curves,
+            polyline_directrices,
+            rings,
+            depth + 1,
+        )?;
+        append_sectioned_solid_interval(
+            item_id,
+            &mid_profile,
+            &mid_position,
+            &mid_ring,
+            end_profile,
+            end_position,
+            end_ring,
+            gradient_curves,
+            polyline_directrices,
+            rings,
+            depth + 1,
+        )?;
+    } else {
+        rings.push(end_ring.clone());
+    }
+
+    Ok(())
+}
+
+fn interpolate_profile_points(start: &[DVec2], end: &[DVec2], t: f64) -> Vec<DVec2> {
+    start.iter().zip(end).map(|(a, b)| a.lerp(*b, t)).collect()
+}
+
+fn interpolate_sectioned_solid_position(
+    start: &IfcSectionedSolidPosition,
+    end: &IfcSectionedSolidPosition,
+    t: f64,
+) -> IfcSectionedSolidPosition {
+    IfcSectionedSolidPosition {
+        ordinal: start.ordinal,
+        curve_entity: start.curve_entity.clone(),
+        curve_id: start.curve_id,
+        distance_along: lerp_f64(start.distance_along, end.distance_along, t),
+        offset_lateral: lerp_f64(start.offset_lateral, end.offset_lateral, t),
+        offset_vertical: lerp_f64(start.offset_vertical, end.offset_vertical, t),
+    }
+}
+
+fn lerp_f64(start: f64, end: f64, t: f64) -> f64 {
+    start + (end - start) * t
+}
+
+fn sectioned_solid_ring(
+    item_id: u64,
+    profile_points: &[DVec2],
+    position: &IfcSectionedSolidPosition,
+    gradient_curves: &HashMap<u64, IfcGradientCurveRecord>,
+    polyline_directrices: &HashMap<u64, IfcPolylineDirectrixRecord>,
+) -> Result<IfcSectionedSolidRing, VelrIfcError> {
+    let (base_point, tangent) = evaluate_sectioned_solid_directrix(
+        item_id,
+        position,
+        gradient_curves,
+        polyline_directrices,
+    )?;
+    let tangent = normalized_or(tangent, DVec3::X);
+    let lateral_axis = DVec3::Z.cross(tangent).normalize_or_zero();
+    let lateral_axis = if lateral_axis.length_squared() <= 1.0e-12 {
+        DVec3::Y
+    } else {
+        lateral_axis
+    };
+    let positions = profile_points
+        .iter()
+        .map(|point| {
+            base_point
+                + lateral_axis * (position.offset_lateral + point.x)
+                + DVec3::Z * (position.offset_vertical + point.y)
+        })
+        .collect::<Vec<_>>();
+
+    Ok(IfcSectionedSolidRing { positions, tangent })
+}
+
+fn signed_profile_area(points: &[DVec2]) -> f64 {
+    if points.len() < 3 {
+        return 0.0;
+    }
+
+    let mut area = 0.0;
+    for index in 0..points.len() {
+        let next = (index + 1) % points.len();
+        area += points[index].x * points[next].y - points[next].x * points[index].y;
+    }
+    0.5 * area
+}
+
+fn orient_cap_ring(ring: &mut [u32], positions: &[DVec3], expected_normal: DVec3) {
+    let Some(normal) = indexed_ring_reference_normal(positions, ring) else {
+        return;
+    };
+    if normal.dot(expected_normal) < 0.0 {
+        ring.reverse();
+    }
+}
+
+fn indexed_ring_reference_normal(positions: &[DVec3], ring: &[u32]) -> Option<DVec3> {
+    if ring.len() < 3 {
+        return None;
+    }
+
+    let origin = positions[*ring.first()? as usize];
+    let mut reference_cross = DVec3::ZERO;
+    let mut reference_cross_length_squared = 0.0;
+
+    for index in 1..ring.len() - 1 {
+        let a = positions[ring[index] as usize] - origin;
+        let b = positions[ring[index + 1] as usize] - origin;
+        let cross = a.cross(b);
+        let cross_length_squared = cross.length_squared();
+
+        if cross_length_squared > reference_cross_length_squared {
+            reference_cross = cross;
+            reference_cross_length_squared = cross_length_squared;
+        }
+    }
+
+    if reference_cross_length_squared > 0.0 {
+        Some(reference_cross.normalize())
+    } else {
+        None
+    }
+}
+
+fn evaluate_sectioned_solid_directrix(
+    item_id: u64,
+    position: &IfcSectionedSolidPosition,
+    gradient_curves: &HashMap<u64, IfcGradientCurveRecord>,
+    polyline_directrices: &HashMap<u64, IfcPolylineDirectrixRecord>,
+) -> Result<(DVec3, DVec3), VelrIfcError> {
+    match position.curve_entity.as_str() {
+        "IfcGradientCurve" => {
+            let curve = gradient_curves.get(&position.curve_id).ok_or_else(|| {
+                VelrIfcError::IfcGeometryData(format!(
+                    "IfcSectionedSolidHorizontal item `{item_id}` references IfcGradientCurve `{}`, but no explicit curve record was found",
+                    position.curve_id
+                ))
+            })?;
+            curve.evaluate(position.distance_along).ok_or_else(|| {
+                VelrIfcError::IfcGeometryData(format!(
+                    "IfcSectionedSolidHorizontal item `{item_id}` cannot evaluate explicit IfcGradientCurve directrix `{}` at distance {}",
+                    position.curve_id, position.distance_along
+                ))
+            })
+        }
+        "IfcPolyline" => {
+            let curve = polyline_directrices.get(&position.curve_id).ok_or_else(|| {
+                VelrIfcError::IfcGeometryData(format!(
+                    "IfcSectionedSolidHorizontal item `{item_id}` references IfcPolyline `{}`, but no explicit polyline record was found",
+                    position.curve_id
+                ))
+            })?;
+            curve.evaluate(position.distance_along).ok_or_else(|| {
+                VelrIfcError::IfcGeometryData(format!(
+                    "IfcSectionedSolidHorizontal item `{item_id}` cannot evaluate explicit IfcPolyline directrix `{}` at distance {}",
+                    position.curve_id, position.distance_along
+                ))
+            })
+        }
+        other => Err(VelrIfcError::IfcGeometryData(format!(
+            "IfcSectionedSolidHorizontal item `{item_id}` has unsupported directrix `{other}`"
+        ))),
+    }
+}
+
+fn normalize_profile_points(mut points: Vec<DVec2>) -> Vec<DVec2> {
+    let mut normalized = Vec::with_capacity(points.len());
+    for point in points.drain(..) {
+        if normalized
+            .last()
+            .is_some_and(|previous: &DVec2| previous.distance_squared(point) <= 1.0e-18)
+        {
+            continue;
+        }
+        normalized.push(point);
+    }
+    if normalized.len() >= 2
+        && normalized
+            .first()
+            .expect("length was checked")
+            .distance_squared(*normalized.last().expect("length was checked"))
+            <= 1.0e-18
+    {
+        normalized.pop();
+    }
+    normalized
+}
+
+fn assert_unique_section_ordinals(
+    item_id: u64,
+    edge_name: &'static str,
+    ordinals: impl IntoIterator<Item = u64>,
+) -> Result<(), VelrIfcError> {
+    let mut seen = HashSet::new();
+    for ordinal in ordinals {
+        if !seen.insert(ordinal) {
+            return Err(VelrIfcError::IfcGeometryData(format!(
+                "IfcSectionedSolidHorizontal item `{item_id}` has duplicate {edge_name} ordinal `{ordinal}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reverse_tessellated_winding(
+    geometry: &TessellatedGeometry,
+) -> Result<TessellatedGeometry, VelrIfcError> {
+    let faces = geometry
+        .faces
+        .iter()
+        .map(|face| {
+            let mut exterior = face.exterior.clone();
+            exterior.reverse();
+            let holes = face
+                .holes
+                .iter()
+                .map(|hole| {
+                    let mut hole = hole.clone();
+                    hole.reverse();
+                    hole
+                })
+                .collect();
+            IndexedPolygon::new(exterior, holes, geometry.positions.len())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(VelrIfcError::from)?;
+
+    TessellatedGeometry::new(geometry.positions.clone(), faces).map_err(VelrIfcError::from)
+}
+
+fn faceted_brep_geometry_from_faces(
+    faces_by_id: HashMap<u64, FacetedBrepFaceAccumulator>,
+) -> Result<TessellatedGeometry, VelrIfcError> {
+    let mut face_rows = faces_by_id.into_iter().collect::<Vec<_>>();
+    face_rows.sort_by_key(|(face_id, face)| (face.ordinal.unwrap_or(*face_id), *face_id));
+
+    let mut positions = Vec::new();
+    let mut faces = Vec::new();
+
+    for (face_id, mut face) in face_rows {
+        face.points.sort_by_key(|point| {
+            (
+                point.ordinal.unwrap_or(point.sequence as u64),
+                point.sequence,
+            )
+        });
+
+        let mut ring = Vec::<DVec3>::with_capacity(face.points.len());
+        for point in face.points {
+            if ring
+                .last()
+                .is_some_and(|previous| previous.distance_squared(point.coordinates) <= 1.0e-18)
+            {
+                continue;
+            }
+            ring.push(point.coordinates);
+        }
+
+        if ring.len() >= 2
+            && ring
+                .first()
+                .expect("ring length was checked")
+                .distance_squared(*ring.last().expect("ring length was checked"))
+                <= 1.0e-18
+        {
+            ring.pop();
+        }
+
+        if ring.len() < 3 {
+            continue;
+        }
+
+        let mut exterior = Vec::with_capacity(ring.len());
+        for position in ring {
+            let index = u32::try_from(positions.len()).map_err(|_| {
+                VelrIfcError::IfcGeometryData(format!(
+                    "IfcFacetedBrep face `{face_id}` exceeds u32 mesh index range"
+                ))
+            })?;
+            positions.push(position);
+            exterior.push(index);
         }
         faces.push(IndexedPolygon::new(exterior, vec![], positions.len())?);
     }
@@ -1919,6 +4766,15 @@ fn parse_dvec3_rows_json(text: &str, label: &str) -> Result<Vec<DVec3>, VelrIfcE
     rows.iter()
         .enumerate()
         .map(|(index, row)| parse_dvec3_json(row, &format!("{label}[{index}]")))
+        .collect()
+}
+
+fn parse_dvec2_rows_json(text: &str, label: &str) -> Result<Vec<DVec2>, VelrIfcError> {
+    let value = parse_json_value(text, label)?;
+    let rows = json_array(&value, label)?;
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| parse_dvec2_json(row, &format!("{label}[{index}]")))
         .collect()
 }
 
@@ -2029,8 +4885,12 @@ fn json_u64(value: &JsonValue, label: &str) -> Result<u64, VelrIfcError> {
 fn resolve_local_placement_transform(
     placement_id: u64,
     by_id: &HashMap<u64, IfcLocalPlacementRecord>,
+    linear_by_id: &HashMap<u64, IfcLinearPlacementRecord>,
+    curves: &HashMap<u64, IfcGradientCurveRecord>,
     resolved: &mut HashMap<u64, DMat4>,
+    resolved_linear: &mut HashMap<u64, DMat4>,
     visiting: &mut HashSet<u64>,
+    visiting_linear: &mut HashSet<u64>,
 ) -> Result<DMat4, VelrIfcError> {
     if let Some(transform) = resolved.get(&placement_id) {
         return Ok(*transform);
@@ -2053,9 +4913,29 @@ fn resolve_local_placement_transform(
         placement.axis,
         placement.ref_direction,
     );
-    let world_from_local = if let Some(parent_placement_id) = placement.parent_placement_id {
-        let parent_world =
-            resolve_local_placement_transform(parent_placement_id, by_id, resolved, visiting)?;
+    let world_from_local = if let Some(parent) = placement.parent {
+        let parent_world = match parent {
+            IfcPlacementParent::Local(parent_placement_id) => resolve_local_placement_transform(
+                parent_placement_id,
+                by_id,
+                linear_by_id,
+                curves,
+                resolved,
+                resolved_linear,
+                visiting,
+                visiting_linear,
+            )?,
+            IfcPlacementParent::Linear(parent_placement_id) => resolve_linear_placement_transform(
+                parent_placement_id,
+                by_id,
+                linear_by_id,
+                curves,
+                resolved,
+                resolved_linear,
+                visiting,
+                visiting_linear,
+            )?,
+        };
         parent_world * local_from_parent
     } else {
         local_from_parent
@@ -2064,6 +4944,54 @@ fn resolve_local_placement_transform(
     visiting.remove(&placement_id);
     resolved.insert(placement_id, world_from_local);
     Ok(world_from_local)
+}
+
+fn resolve_linear_placement_transform(
+    placement_id: u64,
+    local_by_id: &HashMap<u64, IfcLocalPlacementRecord>,
+    by_id: &HashMap<u64, IfcLinearPlacementRecord>,
+    curves: &HashMap<u64, IfcGradientCurveRecord>,
+    resolved_local: &mut HashMap<u64, DMat4>,
+    resolved: &mut HashMap<u64, DMat4>,
+    visiting_local: &mut HashSet<u64>,
+    visiting: &mut HashSet<u64>,
+) -> Result<DMat4, VelrIfcError> {
+    if let Some(transform) = resolved.get(&placement_id) {
+        return Ok(*transform);
+    }
+
+    let placement = by_id.get(&placement_id).ok_or_else(|| {
+        VelrIfcError::IfcGeometryData(format!(
+            "referenced linear placement `{placement_id}` was not returned by the placement query"
+        ))
+    })?;
+
+    if !visiting.insert(placement_id) {
+        return Err(VelrIfcError::IfcGeometryData(format!(
+            "cycle detected while resolving IfcLinearPlacement chain at `{placement_id}`"
+        )));
+    }
+
+    let local_from_parent = linear_placement_relative_transform(placement, curves)?;
+    let world_from_linear = if let Some(parent_placement_id) = placement.parent_local_placement_id {
+        let parent_world = resolve_local_placement_transform(
+            parent_placement_id,
+            local_by_id,
+            by_id,
+            curves,
+            resolved_local,
+            resolved,
+            visiting_local,
+            visiting,
+        )?;
+        parent_world * local_from_parent
+    } else {
+        local_from_parent
+    };
+
+    visiting.remove(&placement_id);
+    resolved.insert(placement_id, world_from_linear);
+    Ok(world_from_linear)
 }
 
 fn axis2_placement_transform(
@@ -2089,7 +5017,277 @@ fn axis2_placement_transform(
     )
 }
 
+fn linear_placement_relative_transform(
+    placement: &IfcLinearPlacementRecord,
+    curves: &HashMap<u64, IfcGradientCurveRecord>,
+) -> Result<DMat4, VelrIfcError> {
+    let curve_id = placement.curve_id.ok_or_else(|| {
+        VelrIfcError::IfcGeometryData(
+            "IfcLinearPlacement is missing its explicit PlacementMeasuredAlong curve".to_string(),
+        )
+    })?;
+    let curve = curves.get(&curve_id).ok_or_else(|| {
+        VelrIfcError::IfcGeometryData(format!(
+            "IfcLinearPlacement references IfcGradientCurve `{curve_id}`, but no explicit BASE_CURVE segments were found"
+        ))
+    })?;
+    let (base_point, tangent) = curve.evaluate(placement.distance_along).ok_or_else(|| {
+        VelrIfcError::IfcGeometryData(format!(
+            "IfcGradientCurve `{curve_id}` has no evaluable explicit BASE_CURVE and station/elevation segments"
+        ))
+    })?;
+    let tangent = normalized_or(tangent, DVec3::X);
+    let lateral_axis = DVec3::Z.cross(tangent).normalize_or_zero();
+    let lateral_axis = if lateral_axis.length_squared() <= 1.0e-12 {
+        DVec3::Y
+    } else {
+        lateral_axis
+    };
+    let location = base_point
+        + tangent * placement.offset_longitudinal
+        + lateral_axis * placement.offset_lateral
+        + DVec3::Z * placement.offset_vertical;
+
+    Ok(axis2_placement_transform(
+        location,
+        Some(DVec3::Z),
+        Some(tangent),
+    ))
+}
+
+impl IfcGradientCurveRecord {
+    fn evaluate(&self, distance_along: f64) -> Option<(DVec3, DVec3)> {
+        let (point, horizontal_tangent) =
+            evaluate_curve_segments(&self.horizontal_segments, distance_along)?;
+        let (vertical_point, _vertical_tangent) =
+            evaluate_curve_segments(&self.vertical_segments, distance_along)?;
+        // Linear placement uses the declared horizontal BASE_CURVE. Its
+        // composite curve points are already in model x/y order. The
+        // IfcGradientCurve's own segments carry the explicit station/elevation
+        // profile, so z comes from that profile rather than an invented flat
+        // default.
+        Some((
+            DVec3::new(point.x, point.y, vertical_point.y),
+            horizontal_tangent.extend(0.0),
+        ))
+    }
+}
+
+impl IfcPolylineDirectrixRecord {
+    fn evaluate(&self, distance_along: f64) -> Option<(DVec3, DVec3)> {
+        let first = *self.points.first()?;
+        let last = *self.points.last().unwrap_or(&first);
+        if self.points.len() < 2 {
+            return None;
+        }
+
+        let mut remaining = distance_along.max(0.0);
+        for segment in self.points.windows(2) {
+            let start = segment[0];
+            let end = segment[1];
+            let delta = end - start;
+            let length = delta.length();
+            if length <= 1.0e-12 {
+                continue;
+            }
+            if remaining <= length {
+                let tangent = delta / length;
+                return Some((start + tangent * remaining, tangent));
+            }
+            remaining -= length;
+        }
+
+        let tangent = self
+            .points
+            .windows(2)
+            .rev()
+            .find_map(|segment| {
+                let delta = segment[1] - segment[0];
+                let length = delta.length();
+                (length > 1.0e-12).then_some(delta / length)
+            })
+            .unwrap_or(DVec3::X);
+        Some((last, tangent))
+    }
+}
+
+fn evaluate_curve_segments(
+    segments: &[IfcGradientCurveSegment],
+    distance_along: f64,
+) -> Option<(DVec2, DVec2)> {
+    let first = segments.first()?;
+    let last = segments.last().unwrap_or(first);
+    let segment = segments
+        .iter()
+        .find(|segment| {
+            distance_along <= segment.start_station + segment.length || segment.length <= 1.0e-12
+        })
+        .unwrap_or(last);
+    let along = if segment.length <= 1.0e-12 {
+        0.0
+    } else {
+        (distance_along - segment.start_station).clamp(0.0, segment.length)
+    };
+    Some(segment.evaluate_2d(along))
+}
+
+impl IfcGradientCurveSegment {
+    fn evaluate_2d(&self, along: f64) -> (DVec2, DVec2) {
+        let start_tangent = normalized_2d_or(self.direction, DVec2::X);
+        match self.kind {
+            IfcGradientCurveSegmentKind::Line => {
+                (self.start_point + start_tangent * along, start_tangent)
+            }
+            IfcGradientCurveSegmentKind::Circular { radius, turn_sign } => {
+                if radius <= 1.0e-9 {
+                    return (self.start_point + start_tangent * along, start_tangent);
+                }
+                let turn_sign = if turn_sign < 0.0 { -1.0 } else { 1.0 };
+                let left_normal = DVec2::new(-start_tangent.y, start_tangent.x);
+                let center = self.start_point + left_normal * radius * turn_sign;
+                let radial = self.start_point - center;
+                let angle = turn_sign * along / radius;
+                let point = center + rotate_2d(radial, angle);
+                let tangent = normalized_2d_or(rotate_2d(start_tangent, angle), start_tangent);
+                (point, tangent)
+            }
+            IfcGradientCurveSegmentKind::Clothoid => {
+                if let (Some(end_point), Some(end_direction)) = (self.end_point, self.end_direction)
+                {
+                    let t = if self.length <= 1.0e-12 {
+                        0.0
+                    } else {
+                        (along / self.length).clamp(0.0, 1.0)
+                    };
+                    cubic_hermite_2d(
+                        self.start_point,
+                        start_tangent * self.length,
+                        end_point,
+                        normalized_2d_or(end_direction, start_tangent) * self.length,
+                        t,
+                    )
+                } else {
+                    (self.start_point + start_tangent * along, start_tangent)
+                }
+            }
+        }
+    }
+}
+
+fn choose_circular_segment_turn_sign(
+    start_point: DVec2,
+    direction: DVec2,
+    radius: f64,
+    length: f64,
+    next_start_point: Option<DVec2>,
+    signed_length: f64,
+) -> f64 {
+    let fallback = if signed_length < 0.0 { -1.0 } else { 1.0 };
+    let Some(next_start_point) = next_start_point else {
+        return fallback;
+    };
+    let direction = normalized_2d_or(direction, DVec2::X);
+    [-1.0, 1.0]
+        .into_iter()
+        .min_by(|left, right| {
+            let left_point = circular_segment_point(start_point, direction, radius, *left, length);
+            let right_point =
+                circular_segment_point(start_point, direction, radius, *right, length);
+            left_point
+                .distance_squared(next_start_point)
+                .partial_cmp(&right_point.distance_squared(next_start_point))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(fallback)
+}
+
+fn circular_segment_point(
+    start_point: DVec2,
+    direction: DVec2,
+    radius: f64,
+    turn_sign: f64,
+    along: f64,
+) -> DVec2 {
+    if radius <= 1.0e-9 {
+        return start_point + normalized_2d_or(direction, DVec2::X) * along;
+    }
+    let direction = normalized_2d_or(direction, DVec2::X);
+    let turn_sign = if turn_sign < 0.0 { -1.0 } else { 1.0 };
+    let left_normal = DVec2::new(-direction.y, direction.x);
+    let center = start_point + left_normal * radius * turn_sign;
+    let radial = start_point - center;
+    center + rotate_2d(radial, turn_sign * along / radius)
+}
+
+fn rotate_2d(vector: DVec2, angle: f64) -> DVec2 {
+    let (sin, cos) = angle.sin_cos();
+    DVec2::new(
+        vector.x * cos - vector.y * sin,
+        vector.x * sin + vector.y * cos,
+    )
+}
+
+fn cubic_hermite_2d(p0: DVec2, m0: DVec2, p1: DVec2, m1: DVec2, t: f64) -> (DVec2, DVec2) {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+    let h10 = t3 - 2.0 * t2 + t;
+    let h01 = -2.0 * t3 + 3.0 * t2;
+    let h11 = t3 - t2;
+    let point = p0 * h00 + m0 * h10 + p1 * h01 + m1 * h11;
+
+    let dh00 = 6.0 * t2 - 6.0 * t;
+    let dh10 = 3.0 * t2 - 4.0 * t + 1.0;
+    let dh01 = -6.0 * t2 + 6.0 * t;
+    let dh11 = 3.0 * t2 - 2.0 * t;
+    let tangent = normalized_2d_or(p0 * dh00 + m0 * dh10 + p1 * dh01 + m1 * dh11, DVec2::X);
+
+    (point, tangent)
+}
+
+fn cartesian_operator_transform(
+    location: DVec3,
+    axis1: Option<DVec3>,
+    axis2: Option<DVec3>,
+    axis3: Option<DVec3>,
+    scale: DVec3,
+) -> DMat4 {
+    let x_axis = normalized_or(axis1.unwrap_or(DVec3::X), DVec3::X);
+    let z_axis = axis3
+        .map(|axis| normalized_or(axis, DVec3::Z))
+        .unwrap_or_else(|| {
+            let y_hint = normalized_or(axis2.unwrap_or(DVec3::Y), DVec3::Y);
+            let candidate = x_axis.cross(y_hint);
+            normalized_or(candidate, DVec3::Z)
+        });
+    let mut y_axis = z_axis.cross(x_axis).normalize_or_zero();
+    if y_axis.length_squared() <= 1.0e-12 {
+        y_axis = normalized_or(axis2.unwrap_or(DVec3::Y), DVec3::Y);
+    }
+    let z_axis = x_axis.cross(y_axis).normalize_or_zero();
+    let z_axis = if z_axis.length_squared() <= 1.0e-12 {
+        DVec3::Z
+    } else {
+        z_axis
+    };
+
+    DMat4::from_cols(
+        (x_axis * scale.x).extend(0.0),
+        (y_axis * scale.y).extend(0.0),
+        (z_axis * scale.z).extend(0.0),
+        location.extend(1.0),
+    )
+}
+
 fn normalized_or(vector: DVec3, fallback: DVec3) -> DVec3 {
+    if vector.length_squared() <= 1.0e-12 {
+        fallback
+    } else {
+        vector.normalize()
+    }
+}
+
+fn normalized_2d_or(vector: DVec2, fallback: DVec2) -> DVec2 {
     if vector.length_squared() <= 1.0e-12 {
         fallback
     } else {
@@ -2400,15 +5598,20 @@ fn schema_from_import_log_if_exists(path: &Path) -> Result<Option<IfcSchemaId>, 
 }
 
 fn schema_from_import_bundle_if_exists(path: &Path) -> Result<Option<IfcSchemaId>, VelrIfcError> {
-    let Some(text) = read_text_if_exists(path)? else {
+    let Some(text) = read_text_prefix_if_exists(path, 64 * 1024)? else {
         return Ok(None);
     };
-    let value = parse_json_value(&text, "import_bundle")?;
-    let Some(schema) = value
-        .as_object()
-        .and_then(|object| object.get("schema"))
-        .and_then(JsonValue::as_str)
-    else {
+
+    let Some(schema_key) = text.find("\"schema\"") else {
+        return Ok(None);
+    };
+    let Some(after_colon) = text[schema_key + "\"schema\"".len()..].split_once(':') else {
+        return Ok(None);
+    };
+    let Some(after_quote) = after_colon.1.trim_start().strip_prefix('"') else {
+        return Ok(None);
+    };
+    let Some((schema, _)) = after_quote.split_once('"') else {
         return Ok(None);
     };
 
@@ -2432,6 +5635,49 @@ fn schema_from_source_ifc_if_exists(path: &Path) -> Result<Option<IfcSchemaId>, 
     }
 
     Ok(None)
+}
+
+fn normalize_ifc_token(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('.')
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_ascii_uppercase()
+}
+
+fn parse_length_unit_from_conversion_name(name: Option<String>) -> Option<LengthUnit> {
+    let name = normalize_ifc_token(name.as_deref()?);
+    if name.contains("FOOT") || name == "FT" {
+        return Some(LengthUnit::Foot);
+    }
+    if name.contains("INCH") {
+        return Some(LengthUnit::Inch);
+    }
+    None
+}
+
+fn parse_length_unit_from_si_unit_cells(
+    name: Option<String>,
+    prefix: Option<String>,
+) -> Option<LengthUnit> {
+    let name = normalize_ifc_token(name.as_deref()?);
+    if name != "METRE" && name != "METER" {
+        return None;
+    }
+
+    match prefix
+        .as_deref()
+        .map(normalize_ifc_token)
+        .unwrap_or_default()
+        .as_str()
+    {
+        "" => Some(LengthUnit::Meter),
+        "MILLI" => Some(LengthUnit::Millimeter),
+        "CENTI" => Some(LengthUnit::Centimeter),
+        "KILO" => Some(LengthUnit::Kilometer),
+        _ => None,
+    }
 }
 
 fn schema_from_runtime_mapping_if_exists(path: &Path) -> Result<Option<IfcSchemaId>, VelrIfcError> {
@@ -2640,6 +5886,76 @@ fn load_cached_body_package_from_layout(
     }
 
     Ok(Some(cached.into_prepared_package()))
+}
+
+fn diagnose_cached_body_package_from_layout(
+    layout: &IfcArtifactLayout,
+) -> Result<IfcBodyPackageCacheDiagnostic, VelrIfcError> {
+    let mut timings = Vec::new();
+    let cache_path = cache_file_path(layout);
+
+    let start = Instant::now();
+    let Some(text) = read_text_if_exists(&cache_path)? else {
+        timings.push(phase_timing("cache_read_text", start.elapsed(), None));
+        return Ok(IfcBodyPackageCacheDiagnostic {
+            package: None,
+            cache_status: IfcBodyPackageCacheStatus::Miss,
+            cache_bytes: None,
+            timings,
+        });
+    };
+    let cache_bytes = text.len();
+    timings.push(phase_timing(
+        "cache_read_text",
+        start.elapsed(),
+        Some(cache_bytes),
+    ));
+
+    let start = Instant::now();
+    let Ok(cached) = serde_json::from_str::<CachedPreparedGeometryPackage>(&text) else {
+        timings.push(phase_timing("cache_json_parse", start.elapsed(), None));
+        return Ok(IfcBodyPackageCacheDiagnostic {
+            package: None,
+            cache_status: IfcBodyPackageCacheStatus::Miss,
+            cache_bytes: Some(cache_bytes),
+            timings,
+        });
+    };
+    let parsed_items = cached.definitions.len() + cached.elements.len() + cached.instances.len();
+    timings.push(phase_timing(
+        "cache_json_parse",
+        start.elapsed(),
+        Some(parsed_items),
+    ));
+
+    let start = Instant::now();
+    let valid_cache = cached.cache_version == BODY_PACKAGE_CACHE_VERSION
+        && cached.schema == layout.authoritative_schema()?
+        && file_fingerprint(&layout.database)? == cached.database;
+    timings.push(phase_timing("cache_validate", start.elapsed(), None));
+    if !valid_cache {
+        return Ok(IfcBodyPackageCacheDiagnostic {
+            package: None,
+            cache_status: IfcBodyPackageCacheStatus::Miss,
+            cache_bytes: Some(cache_bytes),
+            timings,
+        });
+    }
+
+    let start = Instant::now();
+    let package = cached.into_prepared_package();
+    timings.push(phase_timing(
+        "cache_into_prepared_package",
+        start.elapsed(),
+        Some(package.instance_count()),
+    ));
+
+    Ok(IfcBodyPackageCacheDiagnostic {
+        package: Some(package),
+        cache_status: IfcBodyPackageCacheStatus::Hit,
+        cache_bytes: Some(cache_bytes),
+        timings,
+    })
 }
 
 fn write_cached_body_package(
@@ -2865,6 +6181,7 @@ mod tests {
             product_id: 1,
             placement_id: None,
             item_id: 1,
+            occurrence_id: None,
             global_id: None,
             name: Some(name.to_string()),
             object_type: None,
@@ -2885,7 +6202,8 @@ mod tests {
                     vec![IndexedPolygon::new(vec![0, 1, 2], vec![], 3).expect("triangle")],
                 )
                 .expect("geometry"),
-            ),
+            )
+            .into(),
         };
 
         assert_eq!(
@@ -2903,11 +6221,60 @@ mod tests {
     }
 
     #[test]
+    fn direct_faceted_brep_aggregate_child_uses_aggregate_parent_placement() {
+        let placement_parent_by_id = HashMap::from([(20_u64, 10_u64)]);
+        let aggregate_parent_placement_by_product = HashMap::from([(7_u64, 10_u64)]);
+
+        assert_eq!(
+            effective_faceted_brep_placement_id(
+                7,
+                Some(20),
+                &placement_parent_by_id,
+                &aggregate_parent_placement_by_product,
+            ),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn direct_faceted_brep_keeps_child_placement_when_aggregate_parent_does_not_match() {
+        let placement_parent_by_id = HashMap::from([(20_u64, 11_u64)]);
+        let aggregate_parent_placement_by_product = HashMap::from([(7_u64, 10_u64)]);
+
+        assert_eq!(
+            effective_faceted_brep_placement_id(
+                7,
+                Some(20),
+                &placement_parent_by_id,
+                &aggregate_parent_placement_by_product,
+            ),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn direct_faceted_brep_keeps_child_placement_without_aggregate_parent() {
+        let placement_parent_by_id = HashMap::from([(20_u64, 10_u64)]);
+        let aggregate_parent_placement_by_product = HashMap::new();
+
+        assert_eq!(
+            effective_faceted_brep_placement_id(
+                7,
+                Some(20),
+                &placement_parent_by_id,
+                &aggregate_parent_placement_by_product,
+            ),
+            Some(20)
+        );
+    }
+
+    #[test]
     fn spatial_semantic_bodies_keep_default_view_classification() {
         let semantic_body = |declared_entity: &str| IfcBodyRecord {
             product_id: 1,
             placement_id: None,
             item_id: 1,
+            occurrence_id: None,
             global_id: None,
             name: Some("semantic volume".to_string()),
             object_type: None,
@@ -2928,7 +6295,8 @@ mod tests {
                     vec![IndexedPolygon::new(vec![0, 1, 2], vec![], 3).expect("triangle")],
                 )
                 .expect("geometry"),
-            ),
+            )
+            .into(),
         };
 
         assert_eq!(
@@ -2964,6 +6332,7 @@ mod tests {
                 product_id: 1,
                 placement_id: None,
                 item_id: 1,
+                occurrence_id: None,
                 global_id: None,
                 name: Some(name.to_string()),
                 object_type: object_type.map(str::to_string),
@@ -2984,7 +6353,8 @@ mod tests {
                         vec![IndexedPolygon::new(vec![0, 1, 2], vec![], 3).expect("triangle")],
                     )
                     .expect("geometry"),
-                ),
+                )
+                .into(),
             };
 
         assert_eq!(
@@ -3083,6 +6453,7 @@ mod tests {
                 )
                 .expect("geometry"),
             )
+            .into()
         };
         let body_record =
             |product_id: u64, item_id: u64, declared_entity: &str, name: &str| -> IfcBodyRecord {
@@ -3090,6 +6461,7 @@ mod tests {
                     product_id,
                     placement_id: None,
                     item_id,
+                    occurrence_id: None,
                     global_id: Some(format!("global-{product_id}")),
                     name: Some(name.to_string()),
                     object_type: None,
@@ -3111,6 +6483,7 @@ mod tests {
                 body_record(3, 13, "IfcBuildingElementProxy", "origin"),
             ],
             &HashMap::new(),
+            SourceSpace::w_world_metric(),
         )
         .expect("scene resource");
 
@@ -3314,7 +6687,7 @@ mod tests {
                 1_u64,
                 IfcLocalPlacementRecord {
                     placement_id: 1,
-                    parent_placement_id: None,
+                    parent: None,
                     relative_location: Some(DVec3::new(10.0, 0.0, 0.0)),
                     axis: None,
                     ref_direction: None,
@@ -3324,22 +6697,455 @@ mod tests {
                 2_u64,
                 IfcLocalPlacementRecord {
                     placement_id: 2,
-                    parent_placement_id: Some(1),
+                    parent: Some(IfcPlacementParent::Local(1)),
                     relative_location: Some(DVec3::new(0.0, 5.0, 0.0)),
                     axis: None,
                     ref_direction: None,
                 },
             ),
         ]);
+        let linear_by_id = HashMap::new();
+        let curves = HashMap::new();
         let mut resolved = HashMap::new();
+        let mut resolved_linear = HashMap::new();
         let mut visiting = HashSet::new();
+        let mut visiting_linear = HashSet::new();
 
-        let transform = resolve_local_placement_transform(2, &by_id, &mut resolved, &mut visiting)
-            .expect("placement transform");
+        let transform = resolve_local_placement_transform(
+            2,
+            &by_id,
+            &linear_by_id,
+            &curves,
+            &mut resolved,
+            &mut resolved_linear,
+            &mut visiting,
+            &mut visiting_linear,
+        )
+        .expect("placement transform");
 
         assert_eq!(
             transform.transform_point3(DVec3::ZERO),
             DVec3::new(10.0, 5.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn placement_chain_can_use_linear_parent_stationing() {
+        let by_id = HashMap::from([(
+            2_u64,
+            IfcLocalPlacementRecord {
+                placement_id: 2,
+                parent: Some(IfcPlacementParent::Linear(10)),
+                relative_location: Some(DVec3::new(1.0, 0.0, 0.0)),
+                axis: None,
+                ref_direction: None,
+            },
+        )]);
+        let linear_by_id = HashMap::from([(
+            10_u64,
+            IfcLinearPlacementRecord {
+                parent_local_placement_id: None,
+                curve_id: Some(20),
+                distance_along: 25.0,
+                offset_longitudinal: 4.0,
+                offset_lateral: 2.0,
+                offset_vertical: 3.0,
+            },
+        )]);
+        let curves = HashMap::from([(
+            20_u64,
+            IfcGradientCurveRecord {
+                horizontal_segments: vec![IfcGradientCurveSegment {
+                    start_station: 0.0,
+                    length: 100.0,
+                    start_point: DVec2::new(10.0, 20.0),
+                    direction: DVec2::X,
+                    end_point: None,
+                    end_direction: None,
+                    kind: IfcGradientCurveSegmentKind::Line,
+                }],
+                vertical_segments: vec![IfcGradientCurveSegment {
+                    start_station: 0.0,
+                    length: 100.0,
+                    start_point: DVec2::new(0.0, 0.0),
+                    direction: DVec2::X,
+                    end_point: None,
+                    end_direction: None,
+                    kind: IfcGradientCurveSegmentKind::Line,
+                }],
+            },
+        )]);
+        let mut resolved = HashMap::new();
+        let mut resolved_linear = HashMap::new();
+        let mut visiting = HashSet::new();
+        let mut visiting_linear = HashSet::new();
+
+        let transform = resolve_local_placement_transform(
+            2,
+            &by_id,
+            &linear_by_id,
+            &curves,
+            &mut resolved,
+            &mut resolved_linear,
+            &mut visiting,
+            &mut visiting_linear,
+        )
+        .expect("placement transform");
+
+        assert_eq!(
+            transform.transform_point3(DVec3::ZERO),
+            DVec3::new(40.0, 22.0, 3.0)
+        );
+    }
+
+    #[test]
+    fn sectioned_solid_horizontal_sweeps_matching_profiles_on_gradient_curve() {
+        let curves = HashMap::from([(
+            7,
+            IfcGradientCurveRecord {
+                horizontal_segments: vec![IfcGradientCurveSegment {
+                    start_station: 0.0,
+                    length: 10.0,
+                    start_point: DVec2::ZERO,
+                    direction: DVec2::Y,
+                    end_point: None,
+                    end_direction: None,
+                    kind: IfcGradientCurveSegmentKind::Line,
+                }],
+                vertical_segments: vec![IfcGradientCurveSegment {
+                    start_station: 0.0,
+                    length: 10.0,
+                    start_point: DVec2::new(0.0, 5.0),
+                    direction: DVec2::X,
+                    end_point: None,
+                    end_direction: None,
+                    kind: IfcGradientCurveSegmentKind::Line,
+                }],
+            },
+        )]);
+        let profiles = vec![
+            IfcSectionedSolidProfile {
+                ordinal: 0,
+                points: vec![
+                    DVec2::new(-1.0, 0.0),
+                    DVec2::new(1.0, 0.0),
+                    DVec2::new(1.0, 0.5),
+                    DVec2::new(-1.0, 0.5),
+                ],
+            },
+            IfcSectionedSolidProfile {
+                ordinal: 1,
+                points: vec![
+                    DVec2::new(-1.0, 0.0),
+                    DVec2::new(1.0, 0.0),
+                    DVec2::new(1.0, 0.5),
+                    DVec2::new(-1.0, 0.5),
+                ],
+            },
+        ];
+        let positions = vec![
+            IfcSectionedSolidPosition {
+                ordinal: 0,
+                curve_entity: "IfcGradientCurve".to_string(),
+                curve_id: 7,
+                distance_along: 0.0,
+                offset_lateral: 0.0,
+                offset_vertical: 0.0,
+            },
+            IfcSectionedSolidPosition {
+                ordinal: 1,
+                curve_entity: "IfcGradientCurve".to_string(),
+                curve_id: 7,
+                distance_along: 10.0,
+                offset_lateral: 0.0,
+                offset_vertical: 0.0,
+            },
+        ];
+
+        let geometry = sectioned_solid_horizontal_geometry(
+            42,
+            &profiles,
+            &positions,
+            &curves,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(geometry.positions.len(), 8);
+        assert_eq!(geometry.faces.len(), 10);
+        assert!((geometry.positions[0] - DVec3::new(1.0, 0.0, 5.0)).length() < 1.0e-9);
+        assert!((geometry.positions[1] - DVec3::new(-1.0, 0.0, 5.0)).length() < 1.0e-9);
+        assert!((geometry.positions[4] - DVec3::new(1.0, 10.0, 5.0)).length() < 1.0e-9);
+
+        let first_cap_normal =
+            indexed_ring_reference_normal(&geometry.positions, &geometry.faces[0].exterior)
+                .expect("first cap normal");
+        let last_cap_normal =
+            indexed_ring_reference_normal(&geometry.positions, &geometry.faces[1].exterior)
+                .expect("last cap normal");
+        assert!(
+            first_cap_normal.dot(DVec3::NEG_Y) > 0.99,
+            "first cap must face opposite the start tangent, got {first_cap_normal:?}"
+        );
+        assert!(
+            last_cap_normal.dot(DVec3::Y) > 0.99,
+            "last cap must face with the end tangent, got {last_cap_normal:?}"
+        );
+    }
+
+    #[test]
+    fn sectioned_solid_horizontal_resamples_curved_directrix_between_sparse_sections() {
+        let arc_length = std::f64::consts::FRAC_PI_2 * 10.0;
+        let curves = HashMap::from([(
+            7,
+            IfcGradientCurveRecord {
+                horizontal_segments: vec![IfcGradientCurveSegment {
+                    start_station: 0.0,
+                    length: arc_length,
+                    start_point: DVec2::ZERO,
+                    direction: DVec2::X,
+                    end_point: None,
+                    end_direction: None,
+                    kind: IfcGradientCurveSegmentKind::Circular {
+                        radius: 10.0,
+                        turn_sign: 1.0,
+                    },
+                }],
+                vertical_segments: vec![IfcGradientCurveSegment {
+                    start_station: 0.0,
+                    length: arc_length,
+                    start_point: DVec2::ZERO,
+                    direction: DVec2::X,
+                    end_point: None,
+                    end_direction: None,
+                    kind: IfcGradientCurveSegmentKind::Line,
+                }],
+            },
+        )]);
+        let profile_points = vec![
+            DVec2::new(-0.5, -0.5),
+            DVec2::new(0.5, -0.5),
+            DVec2::new(0.5, 0.5),
+            DVec2::new(-0.5, 0.5),
+        ];
+        let profiles = vec![
+            IfcSectionedSolidProfile {
+                ordinal: 0,
+                points: profile_points.clone(),
+            },
+            IfcSectionedSolidProfile {
+                ordinal: 1,
+                points: profile_points,
+            },
+        ];
+        let positions = vec![
+            IfcSectionedSolidPosition {
+                ordinal: 0,
+                curve_entity: "IfcGradientCurve".to_string(),
+                curve_id: 7,
+                distance_along: 0.0,
+                offset_lateral: 0.0,
+                offset_vertical: 0.0,
+            },
+            IfcSectionedSolidPosition {
+                ordinal: 1,
+                curve_entity: "IfcGradientCurve".to_string(),
+                curve_id: 7,
+                distance_along: arc_length,
+                offset_lateral: 0.0,
+                offset_vertical: 0.0,
+            },
+        ];
+
+        let geometry = sectioned_solid_horizontal_geometry(
+            45,
+            &profiles,
+            &positions,
+            &curves,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        assert!(
+            geometry.positions.len() > 8,
+            "curved directrix must be resampled instead of chorded between sparse sections"
+        );
+        let expected_mid_center =
+            DVec3::new(10.0 / 2.0_f64.sqrt(), 10.0 - 10.0 / 2.0_f64.sqrt(), 0.0);
+        assert!(
+            geometry.positions.chunks(4).any(|ring| {
+                let center = ring.iter().copied().sum::<DVec3>() / ring.len() as f64;
+                center.distance(expected_mid_center) < 1.0e-6
+            }),
+            "resampled rings should include the explicit midpoint of the quarter-arc directrix"
+        );
+    }
+
+    #[test]
+    fn sectioned_solid_horizontal_rejects_forbidden_longitudinal_offset() {
+        let error = validate_sectioned_solid_horizontal_longitudinal_offset(45, 2, Some(0.0))
+            .expect_err("IfcSectionedSolidHorizontal must not accept longitudinal offsets");
+
+        assert!(
+            error.to_string().contains("OffsetLongitudinal"),
+            "error should name the forbidden offset, got {error}"
+        );
+    }
+
+    #[test]
+    fn sectioned_solid_horizontal_sweeps_matching_profiles_on_polyline_directrix() {
+        let polylines = HashMap::from([(
+            11,
+            IfcPolylineDirectrixRecord {
+                points: vec![DVec3::new(2.0, 3.0, 4.0), DVec3::new(2.0, 13.0, 5.0)],
+            },
+        )]);
+        let profiles = vec![
+            IfcSectionedSolidProfile {
+                ordinal: 0,
+                points: vec![
+                    DVec2::new(-0.5, 0.0),
+                    DVec2::new(0.5, 0.0),
+                    DVec2::new(0.5, 0.25),
+                    DVec2::new(-0.5, 0.25),
+                ],
+            },
+            IfcSectionedSolidProfile {
+                ordinal: 1,
+                points: vec![
+                    DVec2::new(-0.5, 0.0),
+                    DVec2::new(0.5, 0.0),
+                    DVec2::new(0.5, 0.25),
+                    DVec2::new(-0.5, 0.25),
+                ],
+            },
+        ];
+        let segment_length = DVec3::new(0.0, 10.0, 1.0).length();
+        let positions = vec![
+            IfcSectionedSolidPosition {
+                ordinal: 0,
+                curve_entity: "IfcPolyline".to_string(),
+                curve_id: 11,
+                distance_along: 0.0,
+                offset_lateral: 0.0,
+                offset_vertical: 0.0,
+            },
+            IfcSectionedSolidPosition {
+                ordinal: 1,
+                curve_entity: "IfcPolyline".to_string(),
+                curve_id: 11,
+                distance_along: segment_length,
+                offset_lateral: 0.0,
+                offset_vertical: 0.0,
+            },
+        ];
+
+        let geometry = sectioned_solid_horizontal_geometry(
+            43,
+            &profiles,
+            &positions,
+            &HashMap::new(),
+            &polylines,
+        )
+        .unwrap();
+
+        assert_eq!(geometry.positions.len(), 8);
+        assert_eq!(geometry.faces.len(), 10);
+        assert!((geometry.positions[0] - DVec3::new(2.5, 3.0, 4.0)).length() < 1.0e-9);
+        assert!((geometry.positions[1] - DVec3::new(1.5, 3.0, 4.0)).length() < 1.0e-9);
+        assert!((geometry.positions[4] - DVec3::new(2.5, 13.0, 5.0)).length() < 1.0e-9);
+
+        let tangent = DVec3::new(0.0, 10.0, 1.0).normalize();
+        let first_cap_normal =
+            indexed_ring_reference_normal(&geometry.positions, &geometry.faces[0].exterior)
+                .expect("first cap normal");
+        let last_cap_normal =
+            indexed_ring_reference_normal(&geometry.positions, &geometry.faces[1].exterior)
+                .expect("last cap normal");
+        assert!(
+            first_cap_normal.dot(-tangent) > 0.9,
+            "first cap must face opposite the start tangent, got {first_cap_normal:?}"
+        );
+        assert!(
+            last_cap_normal.dot(tangent) > 0.9,
+            "last cap must face with the end tangent, got {last_cap_normal:?}"
+        );
+    }
+
+    #[test]
+    fn sectioned_solid_horizontal_orients_side_faces_for_clockwise_profiles() {
+        let polylines = HashMap::from([(
+            11,
+            IfcPolylineDirectrixRecord {
+                points: vec![DVec3::ZERO, DVec3::new(0.0, 10.0, 0.0)],
+            },
+        )]);
+        let clockwise_profile = vec![
+            DVec2::new(1.0, 0.0),
+            DVec2::new(1.0, -2.0),
+            DVec2::new(-1.0, -2.0),
+            DVec2::new(-1.0, 0.0),
+        ];
+        assert!(signed_profile_area(&clockwise_profile) < 0.0);
+        let profiles = vec![
+            IfcSectionedSolidProfile {
+                ordinal: 0,
+                points: clockwise_profile.clone(),
+            },
+            IfcSectionedSolidProfile {
+                ordinal: 1,
+                points: clockwise_profile,
+            },
+        ];
+        let positions = vec![
+            IfcSectionedSolidPosition {
+                ordinal: 0,
+                curve_entity: "IfcPolyline".to_string(),
+                curve_id: 11,
+                distance_along: 0.0,
+                offset_lateral: 0.0,
+                offset_vertical: 0.0,
+            },
+            IfcSectionedSolidPosition {
+                ordinal: 1,
+                curve_entity: "IfcPolyline".to_string(),
+                curve_id: 11,
+                distance_along: 10.0,
+                offset_lateral: 0.0,
+                offset_vertical: 0.0,
+            },
+        ];
+
+        let geometry = sectioned_solid_horizontal_geometry(
+            44,
+            &profiles,
+            &positions,
+            &HashMap::new(),
+            &polylines,
+        )
+        .unwrap();
+
+        let first_cap_normal =
+            indexed_ring_reference_normal(&geometry.positions, &geometry.faces[0].exterior)
+                .expect("first cap normal");
+        let last_cap_normal =
+            indexed_ring_reference_normal(&geometry.positions, &geometry.faces[1].exterior)
+                .expect("last cap normal");
+        assert!(
+            first_cap_normal.dot(DVec3::NEG_Y) > 0.99,
+            "first cap must face opposite the start tangent, got {first_cap_normal:?}"
+        );
+        assert!(
+            last_cap_normal.dot(DVec3::Y) > 0.99,
+            "last cap must face with the end tangent, got {last_cap_normal:?}"
+        );
+
+        let bottom_face_normal =
+            indexed_ring_reference_normal(&geometry.positions, &geometry.faces[4].exterior)
+                .expect("bottom face normal");
+        assert!(
+            bottom_face_normal.dot(DVec3::NEG_Z) > 0.99,
+            "clockwise profile bottom face must point down, got {bottom_face_normal:?}"
         );
     }
 
@@ -3407,6 +7213,25 @@ mod tests {
         assert_eq!(invalidated, None);
 
         fs::remove_dir_all(&temp_root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn database_length_unit_parsers_detect_feet_meters_and_millimeters() {
+        assert_eq!(
+            parse_length_unit_from_conversion_name(Some("FOOT".to_string())),
+            Some(LengthUnit::Foot)
+        );
+        assert_eq!(
+            parse_length_unit_from_si_unit_cells(Some("METRE".to_string()), None),
+            Some(LengthUnit::Meter)
+        );
+        assert_eq!(
+            parse_length_unit_from_si_unit_cells(
+                Some("METRE".to_string()),
+                Some("MILLI".to_string())
+            ),
+            Some(LengthUnit::Millimeter)
+        );
     }
 
     #[test]
@@ -3623,7 +7448,7 @@ mod tests {
 
     #[test]
     fn shared_item_ids_become_one_definition_with_multiple_instances() {
-        let primitive = GeometryPrimitive::Tessellated(
+        let primitive: Arc<GeometryPrimitive> = GeometryPrimitive::Tessellated(
             TessellatedGeometry::new(
                 vec![
                     DVec3::ZERO,
@@ -3633,12 +7458,14 @@ mod tests {
                 vec![IndexedPolygon::new(vec![0, 1, 2], vec![], 3).expect("triangle")],
             )
             .expect("geometry"),
-        );
+        )
+        .into();
         let records = vec![
             IfcBodyRecord {
                 product_id: 10,
                 placement_id: Some(1),
                 item_id: 77,
+                occurrence_id: None,
                 global_id: Some("product-a".to_string()),
                 name: Some("Shared A".to_string()),
                 object_type: None,
@@ -3655,6 +7482,7 @@ mod tests {
                 product_id: 20,
                 placement_id: Some(2),
                 item_id: 77,
+                occurrence_id: Some(200),
                 global_id: Some("product-b".to_string()),
                 name: Some("Shared B".to_string()),
                 object_type: None,
@@ -3673,8 +7501,12 @@ mod tests {
             (2_u64, DMat4::from_translation(DVec3::new(5.0, 0.0, 0.0))),
         ]);
 
-        let scene = imported_scene_resource_from_body_records(records, &placement_transforms)
-            .expect("scene");
+        let scene = imported_scene_resource_from_body_records(
+            records,
+            &placement_transforms,
+            SourceSpace::w_world_metric(),
+        )
+        .expect("scene");
 
         assert_eq!(scene.definitions.len(), 1);
         assert_eq!(scene.definitions[0].id, GeometryDefinitionId(77));
@@ -3714,6 +7546,35 @@ mod tests {
     }
 
     #[test]
+    fn faceted_brep_faces_become_tessellated_polygons() {
+        let mut faces = HashMap::new();
+        let mut face = FacetedBrepFaceAccumulator {
+            ordinal: Some(2),
+            points: Vec::new(),
+        };
+        for (ordinal, coordinates) in [
+            (0, DVec3::new(0.0, 0.0, 0.0)),
+            (1, DVec3::new(1.0, 0.0, 0.0)),
+            (2, DVec3::new(1.0, 1.0, 0.0)),
+            (3, DVec3::new(0.0, 1.0, 0.0)),
+            (4, DVec3::new(0.0, 0.0, 0.0)),
+        ] {
+            face.points.push(FacetedBrepPoint {
+                ordinal: Some(ordinal),
+                sequence: face.points.len(),
+                coordinates,
+            });
+        }
+        faces.insert(42, face);
+
+        let geometry = faceted_brep_geometry_from_faces(faces).expect("faceted brep tessellation");
+
+        assert_eq!(geometry.positions.len(), 4);
+        assert_eq!(geometry.faces.len(), 1);
+        assert_eq!(geometry.faces[0].exterior, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
     fn body_instance_summaries_preserve_display_color() {
         let summaries = summarize_body_instances(&sample_prepared_package());
 
@@ -3737,14 +7598,14 @@ mod tests {
             .expect("triangulated records");
 
         for record in records {
-            let GeometryPrimitive::Tessellated(geometry) = &record.primitive else {
+            let GeometryPrimitive::Tessellated(geometry) = &*record.primitive else {
                 continue;
             };
 
             let scene = ImportedGeometrySceneResource {
                 definitions: vec![GeometryDefinition {
                     id: GeometryDefinitionId(record.item_id),
-                    primitive: record.primitive.clone(),
+                    primitive: (*record.primitive).clone(),
                 }],
                 instances: vec![ImportedGeometryResourceInstance {
                     instance: GeometryInstance {
@@ -3759,7 +7620,7 @@ mod tests {
                     default_render_class: DefaultRenderClass::Physical,
                     display_color: None,
                 }],
-                source_space: ifc_body_source_space(),
+                source_space: SourceSpace::w_world_metric(),
             };
 
             if GeometryBackend::default()
@@ -3777,7 +7638,7 @@ mod tests {
                 let face_scene = ImportedGeometrySceneResource {
                     definitions: vec![GeometryDefinition {
                         id: GeometryDefinitionId(record.item_id),
-                        primitive: GeometryPrimitive::Tessellated(face_geometry),
+                        primitive: GeometryPrimitive::Tessellated(face_geometry).into(),
                     }],
                     instances: vec![ImportedGeometryResourceInstance {
                         instance: GeometryInstance {
@@ -3792,7 +7653,7 @@ mod tests {
                         default_render_class: DefaultRenderClass::Physical,
                         display_color: None,
                     }],
-                    source_space: ifc_body_source_space(),
+                    source_space: SourceSpace::w_world_metric(),
                 };
 
                 let result = GeometryBackend::default().build_imported_scene_package(face_scene);

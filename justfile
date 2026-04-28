@@ -123,6 +123,27 @@ web-viewer-build:
     cp crates/cc-w-platform-web/web/index.html crates/cc-w-platform-web/artifacts/viewer/index.html
     echo "web viewer output: crates/cc-w-platform-web/artifacts/viewer/index.html"
 
+web-viewer-build-release:
+    if [[ ! -d crates/cc-w-platform-web/web/node_modules/@xterm/xterm || ! -d crates/cc-w-platform-web/web/node_modules/sigma || ! -d crates/cc-w-platform-web/web/node_modules/graphology || ! -d crates/cc-w-platform-web/web/node_modules/@sigma/edge-curve ]]; then npm ci --prefix crates/cc-w-platform-web/web; fi
+    mkdir -p crates/cc-w-platform-web/artifacts/viewer/pkg
+    mkdir -p crates/cc-w-platform-web/artifacts/viewer/vendor
+    mkdir -p crates/cc-w-platform-web/artifacts/viewer/vendor/sigma
+    mkdir -p crates/cc-w-platform-web/artifacts/viewer/vendor/sigma-edge-curve
+    cargo build --release -p cc-w-platform-web --lib --target wasm32-unknown-unknown
+    wasm-bindgen --target web --no-typescript --out-dir crates/cc-w-platform-web/artifacts/viewer/pkg target/wasm32-unknown-unknown/release/cc_w_platform_web.wasm
+    cp crates/cc-w-platform-web/web/node_modules/@xterm/xterm/css/xterm.css crates/cc-w-platform-web/artifacts/viewer/vendor/xterm.css
+    cp crates/cc-w-platform-web/web/node_modules/@xterm/xterm/lib/xterm.mjs crates/cc-w-platform-web/artifacts/viewer/vendor/xterm.mjs
+    cp crates/cc-w-platform-web/web/node_modules/@xterm/addon-fit/lib/addon-fit.mjs crates/cc-w-platform-web/artifacts/viewer/vendor/addon-fit.mjs
+    cp crates/cc-w-platform-web/web/node_modules/graphology/dist/graphology.umd.min.js crates/cc-w-platform-web/artifacts/viewer/vendor/graphology.js
+    cp crates/cc-w-platform-web/web/node_modules/sigma/dist/sigma.min.js crates/cc-w-platform-web/artifacts/viewer/vendor/sigma.js
+    cp -R crates/cc-w-platform-web/web/node_modules/sigma/dist crates/cc-w-platform-web/artifacts/viewer/vendor/sigma/
+    cp -R crates/cc-w-platform-web/web/node_modules/sigma/rendering crates/cc-w-platform-web/artifacts/viewer/vendor/sigma/
+    cp -R crates/cc-w-platform-web/web/node_modules/sigma/utils crates/cc-w-platform-web/artifacts/viewer/vendor/sigma/
+    cp -R crates/cc-w-platform-web/web/node_modules/@sigma/edge-curve/dist crates/cc-w-platform-web/artifacts/viewer/vendor/sigma-edge-curve/
+    cp crates/cc-w-platform-web/web/vendor/graphology-utils-is-graph.mjs crates/cc-w-platform-web/artifacts/viewer/vendor/graphology-utils-is-graph.mjs
+    cp crates/cc-w-platform-web/web/index.html crates/cc-w-platform-web/artifacts/viewer/index.html
+    echo "release web viewer output: crates/cc-w-platform-web/artifacts/viewer/index.html"
+
 web-viewer:
     just web-viewer-build
     cargo run -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server -- --root crates/cc-w-platform-web/artifacts/viewer --port 8001
@@ -132,9 +153,18 @@ web-viewer-electron-build:
     if [[ ! -d crates/cc-w-platform-web/web/node_modules/electron ]]; then npm ci --prefix crates/cc-w-platform-web/web; fi
     cargo build -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server
 
+web-viewer-electron-build-release:
+    just web-viewer-build-release
+    if [[ ! -d crates/cc-w-platform-web/web/node_modules/electron ]]; then npm ci --prefix crates/cc-w-platform-web/web; fi
+    cargo build --release -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server
+
 web-viewer-electron:
     just web-viewer-electron-build
     npm run electron --prefix crates/cc-w-platform-web/web
+
+web-viewer-electron-release:
+    just web-viewer-electron-build-release
+    CC_W_WEB_SERVER_BINARY="$PWD/target/release/cc-w-platform-web-server" npm run electron --prefix crates/cc-w-platform-web/web
 
 native-viewer resource="demo/pentagon":
     resource_value="{{resource}}"; \
@@ -222,6 +252,36 @@ web-viewer-opencode-electron:
         XDG_CONFIG_HOME="$PWD/.tools/opencode/config" \
         XDG_STATE_HOME="$PWD/.tools/opencode/state" \
         OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
+        CC_W_AGENT_BACKEND=opencode \
+        CC_W_OPENCODE_EXECUTABLE="$PWD/.tools/opencode/bin/opencode" \
+        CC_W_OPENCODE_WORKDIR="$PWD" \
+        CC_W_OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
+        CC_W_OPENCODE_AGENT="$agent_default" \
+        CC_W_OPENCODE_MODEL="$model_default" \
+        CC_W_OPENCODE_DISCOVER_MODELS="${CC_W_OPENCODE_DISCOVER_MODELS:-1}" \
+        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-45000}" \
+        npm run electron --prefix crates/cc-w-platform-web/web
+
+web-viewer-opencode-electron-release:
+    just web-viewer-electron-build-release
+    test -x .tools/opencode/bin/opencode
+    mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
+    # Electron shell around the release-built web viewer and OpenCode-backed server.
+    real_home="$HOME"; \
+    model_default="${CC_W_OPENCODE_MODEL:-openai/gpt-5.4}"; \
+    case "$model_default" in \
+        ollama/gemma4:*) agent_default="${CC_W_OPENCODE_AGENT:-ifc-playbook-cypher-only}" ;; \
+        *) agent_default="${CC_W_OPENCODE_AGENT:-ifc-explorer}" ;; \
+    esac; \
+    env HOME="$PWD/.tools/opencode/home" \
+        CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}" \
+        RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}" \
+        XDG_CACHE_HOME="$PWD/.tools/opencode/cache" \
+        XDG_DATA_HOME="$PWD/.tools/opencode/data" \
+        XDG_CONFIG_HOME="$PWD/.tools/opencode/config" \
+        XDG_STATE_HOME="$PWD/.tools/opencode/state" \
+        OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
+        CC_W_WEB_SERVER_BINARY="$PWD/target/release/cc-w-platform-web-server" \
         CC_W_AGENT_BACKEND=opencode \
         CC_W_OPENCODE_EXECUTABLE="$PWD/.tools/opencode/bin/opencode" \
         CC_W_OPENCODE_WORKDIR="$PWD" \

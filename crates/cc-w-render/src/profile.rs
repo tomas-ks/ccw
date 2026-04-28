@@ -3,34 +3,41 @@ use std::str::FromStr;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RenderProfileId {
     Diffuse,
-    ArchitecturalV1,
-    ArchitecturalV2,
-    ArchitecturalV3,
-    ArchitecturalV4,
     #[default]
     Bim,
+    Architectural,
+    ArchitecturalV1,
+    ArchitecturalV3,
+    ArchitecturalV4,
 }
 
 impl RenderProfileId {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Diffuse => "diffuse",
+            Self::Bim => "bim",
+            Self::Architectural => "architectural",
             Self::ArchitecturalV1 => "architectural-v1",
-            Self::ArchitecturalV2 => "architectural-v2",
             Self::ArchitecturalV3 => "architectural-v3",
             Self::ArchitecturalV4 => "architectural-v4",
-            Self::Bim => "bim",
         }
     }
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Diffuse => "Diffuse",
-            Self::ArchitecturalV1 => "Architectural v1",
-            Self::ArchitecturalV2 => "Architectural v2",
-            Self::ArchitecturalV3 => "Architectural v3",
-            Self::ArchitecturalV4 => "Architectural v4 (AO experiment)",
             Self::Bim => "BIM",
+            Self::Architectural => "Architectural",
+            Self::ArchitecturalV1 => "Architectural v1 (experimental)",
+            Self::ArchitecturalV3 => "Architectural v3 (experimental)",
+            Self::ArchitecturalV4 => "Architectural v4 (AO experiment)",
+        }
+    }
+
+    pub const fn is_experimental(self) -> bool {
+        match self {
+            Self::Diffuse | Self::Bim | Self::Architectural => false,
+            Self::ArchitecturalV1 | Self::ArchitecturalV3 | Self::ArchitecturalV4 => true,
         }
     }
 
@@ -39,6 +46,7 @@ impl RenderProfileId {
             id: self,
             name: self.as_str(),
             label: self.label(),
+            experimental: self.is_experimental(),
         }
     }
 }
@@ -49,11 +57,13 @@ impl FromStr for RenderProfileId {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "diffuse" => Ok(Self::Diffuse),
+            "bim" | "architectural-v2" => Ok(Self::Bim),
+            "architectural" | "architectural-v3-inspection" | "architectural-v3-inspect" => {
+                Ok(Self::Architectural)
+            }
             "architectural-v1" => Ok(Self::ArchitecturalV1),
-            "architectural-v2" => Ok(Self::ArchitecturalV2),
             "architectural-v3" => Ok(Self::ArchitecturalV3),
             "architectural-v4" => Ok(Self::ArchitecturalV4),
-            "bim" | "architectural-v3-inspection" | "architectural-v3-inspect" => Ok(Self::Bim),
             _ => Err(UnknownRenderProfile {
                 requested: value.to_owned(),
             }),
@@ -66,6 +76,7 @@ pub struct RenderProfileDescriptor {
     pub id: RenderProfileId,
     pub name: &'static str,
     pub label: &'static str,
+    pub experimental: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -76,10 +87,10 @@ pub struct UnknownRenderProfile {
 
 const AVAILABLE_RENDER_PROFILES: [RenderProfileDescriptor; 6] = [
     RenderProfileId::Diffuse.descriptor(),
-    RenderProfileId::ArchitecturalV1.descriptor(),
-    RenderProfileId::ArchitecturalV2.descriptor(),
-    RenderProfileId::ArchitecturalV3.descriptor(),
     RenderProfileId::Bim.descriptor(),
+    RenderProfileId::Architectural.descriptor(),
+    RenderProfileId::ArchitecturalV1.descriptor(),
+    RenderProfileId::ArchitecturalV3.descriptor(),
     RenderProfileId::ArchitecturalV4.descriptor(),
 ];
 
@@ -105,15 +116,23 @@ mod tests {
 
     #[test]
     fn unknown_profile_is_rejected() {
-        assert!("architectural".parse::<RenderProfileId>().is_err());
+        assert!(
+            "architectural-v2-inspection"
+                .parse::<RenderProfileId>()
+                .is_err()
+        );
     }
 
     #[test]
-    fn legacy_inspection_profile_names_alias_to_bim() {
+    fn legacy_profile_names_alias_to_new_stable_profiles() {
+        assert_eq!("architectural-v2".parse(), Ok(RenderProfileId::Bim));
         assert_eq!(
             "architectural-v3-inspection".parse(),
-            Ok(RenderProfileId::Bim)
+            Ok(RenderProfileId::Architectural)
         );
-        assert_eq!("architectural-v3-inspect".parse(), Ok(RenderProfileId::Bim));
+        assert_eq!(
+            "architectural-v3-inspect".parse(),
+            Ok(RenderProfileId::Architectural)
+        );
     }
 }

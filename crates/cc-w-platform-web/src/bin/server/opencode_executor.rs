@@ -2,7 +2,7 @@ use super::agent_executor::{
     AgentActionCandidate, AgentBackendTurnRequest, AgentBackendTurnResponse, AgentEntityReference,
     AgentExecutor, AgentGraphMode, AgentProgressSink, AgentQueryPlaybook,
     AgentReadonlyCypherResult, AgentReadonlyCypherRuntime, AgentRelationReference,
-    AgentSchemaContext, AgentTranscriptEvent, NullAgentProgressSink,
+    AgentSchemaContext, AgentTranscriptEvent, InspectionUpdateMode, NullAgentProgressSink,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -290,11 +290,17 @@ pub enum PlannedUiAction {
         semantic_ids: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resource: Option<String>,
+        #[serde(default, skip_serializing_if = "is_default_inspection_mode")]
+        mode: InspectionUpdateMode,
     },
     #[serde(rename = "viewer.frame_visible")]
     ViewerFrameVisible,
     #[serde(rename = "viewer.clear_inspection")]
     ViewerClearInspection,
+}
+
+fn is_default_inspection_mode(mode: &InspectionUpdateMode) -> bool {
+    *mode == InspectionUpdateMode::Replace
 }
 
 #[derive(Debug, Clone)]
@@ -2557,7 +2563,10 @@ fn native_action_candidate_from_tool_call(
             candidate
         }),
         "elements_inspect" => native_semantic_ids_from_input(input).map(|semantic_ids| {
-            let mut candidate = AgentActionCandidate::elements_inspect(semantic_ids);
+            let mut candidate = AgentActionCandidate::elements_inspect_with_mode(
+                semantic_ids,
+                native_inspection_mode_from_input(input),
+            );
             if let Some(resource) = native_resource_from_input(input) {
                 candidate = candidate.with_resource(resource);
             }
@@ -2580,6 +2589,18 @@ fn native_resource_from_input(input: &serde_json::Map<String, Value>) -> Option<
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn native_inspection_mode_from_input(
+    input: &serde_json::Map<String, Value>,
+) -> InspectionUpdateMode {
+    input
+        .get("mode")
+        .or_else(|| input.get("inspection_mode"))
+        .or_else(|| input.get("inspectionMode"))
+        .and_then(Value::as_str)
+        .and_then(parse_inspection_mode)
+        .unwrap_or_default()
 }
 
 fn native_db_node_ids_from_input(input: &serde_json::Map<String, Value>) -> Option<Vec<i64>> {
@@ -2772,8 +2793,9 @@ fn map_planned_ui_action(action: PlannedUiAction) -> AgentActionCandidate {
         PlannedUiAction::ElementsInspect {
             semantic_ids,
             resource,
+            mode,
         } => {
-            let candidate = AgentActionCandidate::elements_inspect(semantic_ids);
+            let candidate = AgentActionCandidate::elements_inspect_with_mode(semantic_ids, mode);
             if let Some(resource) = resource {
                 candidate.with_resource(resource)
             } else {
@@ -3061,7 +3083,7 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
                         { "kind": "graph.set_seeds", "db_node_ids": [123], "resource": "ifc/building-architecture" },
                         { "kind": "properties.show_node", "db_node_id": 123, "resource": "ifc/building-architecture" },
                         { "kind": "elements.select", "semantic_ids": ["2iPwJwpPDCSgMheXwk9cBT"], "resource": "ifc/building-architecture" },
-                        { "kind": "elements.inspect", "semantic_ids": ["2iPwJwpPDCSgMheXwk9cBT"], "resource": "ifc/building-architecture" },
+                        { "kind": "elements.inspect", "semantic_ids": ["2iPwJwpPDCSgMheXwk9cBT"], "resource": "ifc/building-architecture", "mode": "replace" },
                         { "kind": "viewer.frame_visible" }
                     ]
                 }
@@ -3073,6 +3095,7 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
         "Do not invent `request_tools`; use the concrete tools above directly.".to_owned(),
         "Allowed UI actions are only `graph.set_seeds`, `properties.show_node`, `elements.hide`, `elements.show`, `elements.select`, `elements.inspect`, `viewer.frame_visible`, and `viewer.clear_inspection`.".to_owned(),
         "Use exact action payload field names: `db_node_ids` for graph seeds, `db_node_id` for properties.show_node, and `semantic_ids` for element actions.".to_owned(),
+        "`elements.inspect` also accepts `mode`: `replace`, `add`, or `remove`. Use `replace` for a new/only inspection focus, `add` for wording like `add`, `also`, `include`, or `plus`, and `remove` for wording like `remove`, `exclude`, or `subtract`.".to_owned(),
         "When a DB node id comes from a project-wide query result, include its `source_resource` as the UI action `resource`; DB node ids are only meaningful inside one IFC database.".to_owned(),
         "When semantic ids come from project-wide query results, preserve source by either passing `resource` on the element action or using the source-scoped `source_resource::GlobalId` id returned by the tool.".to_owned(),
         "Project-specific repo guidance may be provided through AGENTS.md; follow it when choosing Cypher and UI actions.".to_owned(),
@@ -3089,11 +3112,16 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
         "- If prior history already identified a concrete object with a GlobalId or DB node id, reuse that identifier directly instead of rediscovering the object from scratch.".to_owned(),
         "- Read-only applies to graph/database inspection only. You are allowed to carry out approved viewer actions by returning them in `emit_ui_actions`.".to_owned(),
         "- When the user asks to hide, show, select, inspect, clear inspection, seed the graph, reveal properties, or frame the scene, prefer returning the corresponding validated viewer action instead of refusing on the grounds that this is a planning phase.".to_owned(),
+        "- Treat `show`, `reveal`, or `display` for a concrete element as `elements.show`; do not also seed/open the graph unless the user explicitly asks for relations, graph, neighborhood, or connections.".to_owned(),
         "- If the user says they are done with inspection, thanks you after an inspection, or asks to return to normal rendering, emit `viewer.clear_inspection`.".to_owned(),
+        "- Inspection is stateful: `elements.inspect` with `mode: \"replace\"` replaces the current inspection focus, `mode: \"add\"` preserves the existing focus and adds the returned ids, and `mode: \"remove\"` removes only those ids from the current focus.".to_owned(),
         "- `elements.hide`, `elements.show`, `elements.select`, and `elements.inspect` require renderable semantic ids, usually returned from `GlobalId` / `global_id` columns. In project mode, carry the source IFC resource with those ids.".to_owned(),
         "- If the query only returns DB node ids, use `graph.set_seeds`; do not emit element actions from DB ids alone.".to_owned(),
         "- Learn the general difference between semantic/container nodes and visible/product nodes. Do not rely on one-off entity exceptions alone.".to_owned(),
         "- Treat facility roots, project/site/building/storey nodes, relation nodes, aggregate/group nodes, and many `*Part` subdivision nodes as likely semantic/container candidates until the live graph proves otherwise.".to_owned(),
+        "- In bridge/infrastructure contexts, treat `IfcFooting`, foundation-like products, piers, and abutments contained by `IfcBridgePart` as likely bridge substructure/support elements. Ground that classification in containment/type relations, not names alone.".to_owned(),
+        "- For named bridge requests such as railway/rail/road/girder/arched bridge, first identify the matching `IfcBridge` root by returned name/object type, then anchor descendant/renderable-product queries to that one bridge. Do not use an unfiltered all-bridges descendant query for a specific bridge request.".to_owned(),
+        "- For manhole requests in infrastructure models, check `IfcElementAssembly` / `IfcElementAssemblyType` first. In the sample infra project, sewer manholes are renderable `IfcElementAssembly` products with `GlobalId`; avoid broad unlabeled `MATCH (n)` text scans with `toLower(...)` for this lookup.".to_owned(),
         "- Treat concrete products with their own `GlobalId`, especially when they show placement/representation links or appear as contained products under a container, as stronger candidates for viewer element actions.".to_owned(),
         "- Before emitting a viewer element action for an unfamiliar entity family, do one quick renderability check: inspect the candidate's local relations, decide whether it behaves like a semantic/container node or a visible/product node, and if it looks semantic/container then descend to the contained or aggregated products.".to_owned(),
         "- If a node mostly exposes aggregation, containment, owner history, or other structural/context relations, that is a clue it may be semantic/container rather than the visible thing the user wants to act on.".to_owned(),
@@ -3724,6 +3752,29 @@ fn normalize_ui_action(action: Value) -> Value {
                     normalized.remove("ids");
                 }
             }
+            if matches!(
+                normalized.get("kind").and_then(Value::as_str),
+                Some("elements.inspect")
+            ) {
+                if let Some(mode) =
+                    get_first_value(&normalized, &["mode", "inspection_mode", "inspectionMode"])
+                        .and_then(|value| value.as_str().and_then(parse_inspection_mode))
+                {
+                    normalized.insert(
+                        "mode".to_owned(),
+                        Value::String(
+                            match mode {
+                                InspectionUpdateMode::Replace => "replace",
+                                InspectionUpdateMode::Add => "add",
+                                InspectionUpdateMode::Remove => "remove",
+                            }
+                            .to_owned(),
+                        ),
+                    );
+                    normalized.remove("inspection_mode");
+                    normalized.remove("inspectionMode");
+                }
+            }
         }
         _ => {}
     }
@@ -3759,6 +3810,15 @@ fn normalize_ui_action_kind(kind: &str) -> Option<String> {
         | "viewerClearInspection"
         | "clear_inspection"
         | "clearInspection" => Some("viewer.clear_inspection".to_owned()),
+        _ => None,
+    }
+}
+
+fn parse_inspection_mode(value: &str) -> Option<InspectionUpdateMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "replace" | "set" | "focus" | "only" => Some(InspectionUpdateMode::Replace),
+        "add" | "append" | "include" | "plus" => Some(InspectionUpdateMode::Add),
+        "remove" | "subtract" | "exclude" | "drop" => Some(InspectionUpdateMode::Remove),
         _ => None,
     }
 }
@@ -5744,6 +5804,52 @@ mod tests {
                         resource: None,
                     },
                     PlannedUiAction::ViewerFrameVisible,
+                ]
+            }]
+        );
+    }
+
+    #[test]
+    fn normalize_response_shape_accepts_inspection_update_modes() {
+        let normalized = normalize_response_shape(serde_json::json!({
+            "toolCalls": [
+                {
+                    "kind": "emit_ui_actions",
+                    "actions": [
+                        {
+                            "kind": "elementsInspect",
+                            "semanticIds": ["kitchen-a"],
+                            "sourceResource": "ifc/building-architecture",
+                            "inspectionMode": "include"
+                        },
+                        {
+                            "kind": "elements.inspect",
+                            "ids": ["old-hvac"],
+                            "resource": "ifc/building-hvac",
+                            "mode": "subtract"
+                        }
+                    ]
+                }
+            ]
+        }));
+
+        let response: OpencodeTurnResponse =
+            serde_json::from_value(normalized).expect("normalized response should parse");
+
+        assert_eq!(
+            response.tool_calls,
+            vec![OpencodeToolCall::EmitUiActions {
+                actions: vec![
+                    PlannedUiAction::ElementsInspect {
+                        semantic_ids: vec!["kitchen-a".to_owned()],
+                        resource: Some("ifc/building-architecture".to_owned()),
+                        mode: InspectionUpdateMode::Add,
+                    },
+                    PlannedUiAction::ElementsInspect {
+                        semantic_ids: vec!["old-hvac".to_owned()],
+                        resource: Some("ifc/building-hvac".to_owned()),
+                        mode: InspectionUpdateMode::Remove,
+                    },
                 ]
             }]
         );

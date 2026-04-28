@@ -212,6 +212,30 @@ pub enum AgentTranscriptEventKind {
     Assistant,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum InspectionUpdateMode {
+    Replace,
+    Add,
+    Remove,
+}
+
+impl Default for InspectionUpdateMode {
+    fn default() -> Self {
+        Self::Replace
+    }
+}
+
+impl InspectionUpdateMode {
+    fn order_key(self) -> u8 {
+        match self {
+            Self::Replace => 0,
+            Self::Add => 1,
+            Self::Remove => 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum AgentUiAction {
@@ -250,6 +274,8 @@ pub enum AgentUiAction {
         semantic_ids: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resource: Option<String>,
+        #[serde(default, skip_serializing_if = "is_default_inspection_mode")]
+        mode: InspectionUpdateMode,
     },
     #[serde(rename = "viewer.frame_visible")]
     ViewerFrameVisible,
@@ -265,6 +291,12 @@ pub struct AgentActionCandidate {
     pub db_node_ids: Vec<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspection_mode: Option<InspectionUpdateMode>,
+}
+
+fn is_default_inspection_mode(mode: &InspectionUpdateMode) -> bool {
+    *mode == InspectionUpdateMode::Replace
 }
 
 impl AgentActionCandidate {
@@ -274,6 +306,7 @@ impl AgentActionCandidate {
             semantic_ids: Vec::new(),
             db_node_ids,
             resource: None,
+            inspection_mode: None,
         }
     }
 
@@ -283,6 +316,7 @@ impl AgentActionCandidate {
             semantic_ids,
             db_node_ids: Vec::new(),
             resource: None,
+            inspection_mode: None,
         }
     }
 
@@ -292,6 +326,7 @@ impl AgentActionCandidate {
             semantic_ids,
             db_node_ids: Vec::new(),
             resource: None,
+            inspection_mode: None,
         }
     }
 
@@ -301,15 +336,24 @@ impl AgentActionCandidate {
             semantic_ids,
             db_node_ids: Vec::new(),
             resource: None,
+            inspection_mode: None,
         }
     }
 
     pub fn elements_inspect(semantic_ids: Vec<String>) -> Self {
+        Self::elements_inspect_with_mode(semantic_ids, InspectionUpdateMode::Replace)
+    }
+
+    pub fn elements_inspect_with_mode(
+        semantic_ids: Vec<String>,
+        mode: InspectionUpdateMode,
+    ) -> Self {
         Self {
             kind: "elements.inspect".to_owned(),
             semantic_ids,
             db_node_ids: Vec::new(),
             resource: None,
+            inspection_mode: Some(mode),
         }
     }
 
@@ -319,6 +363,7 @@ impl AgentActionCandidate {
             semantic_ids: Vec::new(),
             db_node_ids: vec![db_node_id],
             resource: None,
+            inspection_mode: None,
         }
     }
 
@@ -328,6 +373,7 @@ impl AgentActionCandidate {
             semantic_ids: Vec::new(),
             db_node_ids: Vec::new(),
             resource: None,
+            inspection_mode: None,
         }
     }
 
@@ -337,6 +383,7 @@ impl AgentActionCandidate {
             semantic_ids: Vec::new(),
             db_node_ids: Vec::new(),
             resource: None,
+            inspection_mode: None,
         }
     }
 
@@ -722,6 +769,7 @@ pub fn validate_agent_action_candidate(
             Ok(AgentUiAction::ElementsInspect {
                 semantic_ids,
                 resource: candidate.resource,
+                mode: candidate.inspection_mode.unwrap_or_default(),
             })
         }
         "viewer.frame_visible" => {
@@ -749,7 +797,8 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
     let mut show_seen = HashSet::new();
     let mut merged_select_groups = Vec::<(Option<String>, Vec<String>)>::new();
     let mut select_seen = HashSet::new();
-    let mut merged_inspect_groups = Vec::<(Option<String>, Vec<String>)>::new();
+    let mut merged_inspect_groups =
+        Vec::<(InspectionUpdateMode, Option<String>, Vec<String>)>::new();
     let mut inspect_seen = HashSet::new();
     let mut latest_properties_node = None::<(i64, Option<String>)>;
     let mut graph_set_seeds_present = false;
@@ -757,7 +806,7 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
     let mut elements_hide_present = false;
     let mut elements_show_present = false;
     let mut elements_select_present = false;
-    let mut elements_inspect_present = false;
+    let mut inspect_modes_present = HashSet::new();
     let mut frame_visible_present = false;
     let mut clear_inspection_present = false;
     let mut order = Vec::new();
@@ -849,15 +898,16 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
             AgentUiAction::ElementsInspect {
                 semantic_ids,
                 resource,
+                mode,
             } => {
-                if !elements_inspect_present {
-                    order.push(5u8);
-                    elements_inspect_present = true;
+                if inspect_modes_present.insert(mode) {
+                    order.push(5u8 + mode.order_key());
                 }
                 for semantic_id in semantic_ids {
-                    push_semantic_action_group(
+                    push_inspection_action_group(
                         &mut merged_inspect_groups,
                         &mut inspect_seen,
+                        mode,
                         resource.clone(),
                         semantic_id,
                     );
@@ -865,13 +915,13 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
             }
             AgentUiAction::ViewerFrameVisible => {
                 if !frame_visible_present {
-                    order.push(6u8);
+                    order.push(8u8);
                     frame_visible_present = true;
                 }
             }
             AgentUiAction::ViewerClearInspection => {
                 if !clear_inspection_present {
-                    order.push(7u8);
+                    order.push(9u8);
                     clear_inspection_present = true;
                 }
             }
@@ -932,10 +982,17 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                     }
                 }
             }
-            5 if merged_inspect_groups.iter().any(|(_, ids)| !ids.is_empty()) => {
+            5..=7 => {
+                let mode = match kind {
+                    5 => InspectionUpdateMode::Replace,
+                    6 => InspectionUpdateMode::Add,
+                    7 => InspectionUpdateMode::Remove,
+                    _ => unreachable!(),
+                };
                 let semantic_ids = merged_inspect_groups
                     .iter()
-                    .flat_map(|(resource, ids)| {
+                    .filter(|(group_mode, _, ids)| *group_mode == mode && !ids.is_empty())
+                    .flat_map(|(_, resource, ids)| {
                         ids.iter().map(move |semantic_id| match resource {
                             Some(resource) if !semantic_id.contains("::") => {
                                 format!("{resource}::{semantic_id}")
@@ -948,11 +1005,12 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                     normalized.push(AgentUiAction::ElementsInspect {
                         semantic_ids,
                         resource: None,
+                        mode,
                     });
                 }
             }
-            6 => normalized.push(AgentUiAction::ViewerFrameVisible),
-            7 => normalized.push(AgentUiAction::ViewerClearInspection),
+            8 => normalized.push(AgentUiAction::ViewerFrameVisible),
+            9 => normalized.push(AgentUiAction::ViewerClearInspection),
             _ => {}
         }
     }
@@ -975,6 +1033,27 @@ fn push_semantic_action_group(
         });
     if seen.insert((resource, semantic_id.clone())) {
         groups[group_index].1.push(semantic_id);
+    }
+}
+
+fn push_inspection_action_group(
+    groups: &mut Vec<(InspectionUpdateMode, Option<String>, Vec<String>)>,
+    seen: &mut HashSet<(InspectionUpdateMode, Option<String>, String)>,
+    mode: InspectionUpdateMode,
+    resource: Option<String>,
+    semantic_id: String,
+) {
+    let group_index = groups
+        .iter()
+        .position(|(existing_mode, existing_resource, _)| {
+            *existing_mode == mode && existing_resource == &resource
+        })
+        .unwrap_or_else(|| {
+            groups.push((mode, resource.clone(), Vec::new()));
+            groups.len() - 1
+        });
+    if seen.insert((mode, resource, semantic_id.clone())) {
+        groups[group_index].2.push(semantic_id);
     }
 }
 
@@ -1060,8 +1139,9 @@ mod tests {
         AgentActionCandidate, AgentBackendTurnRequest, AgentBackendTurnResponse,
         AgentEntityReference, AgentExecutor, AgentGraphMode, AgentNeighborGraph,
         AgentNodePropertiesResult, AgentNodeSummary, AgentQueryPlaybook, AgentReadonlyCypherResult,
-        AgentRelationReference, AgentSchemaContext, AgentUiAction, NullAgentProgressSink,
-        StubAgentExecutor, validate_agent_action_candidates, validate_agent_readonly_cypher,
+        AgentRelationReference, AgentSchemaContext, AgentUiAction, InspectionUpdateMode,
+        NullAgentProgressSink, StubAgentExecutor, validate_agent_action_candidates,
+        validate_agent_readonly_cypher,
     };
     use std::collections::BTreeMap;
 
@@ -1164,6 +1244,7 @@ mod tests {
             semantic_ids: Vec::new(),
             db_node_ids: Vec::new(),
             resource: None,
+            inspection_mode: None,
         }])
         .unwrap_err();
 
@@ -1206,6 +1287,7 @@ mod tests {
                 AgentUiAction::ElementsInspect {
                     semantic_ids: vec!["ifc/building-hvac::C".to_owned()],
                     resource: None,
+                    mode: InspectionUpdateMode::Replace,
                 },
                 AgentUiAction::ViewerFrameVisible,
                 AgentUiAction::ViewerClearInspection,
@@ -1312,7 +1394,41 @@ mod tests {
                     "ifc/building-architecture::arch-a".to_owned(),
                 ],
                 resource: None,
+                mode: InspectionUpdateMode::Replace,
             }]
+        );
+    }
+
+    #[test]
+    fn agent_action_validation_preserves_inspection_update_modes() {
+        let actions = validate_agent_action_candidates(vec![
+            AgentActionCandidate::elements_inspect_with_mode(
+                vec!["kitchen".to_owned()],
+                InspectionUpdateMode::Add,
+            )
+            .with_resource("ifc/building-architecture"),
+            AgentActionCandidate::elements_inspect_with_mode(
+                vec!["old-hvac".to_owned()],
+                InspectionUpdateMode::Remove,
+            )
+            .with_resource("ifc/building-hvac"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            actions,
+            vec![
+                AgentUiAction::ElementsInspect {
+                    semantic_ids: vec!["ifc/building-architecture::kitchen".to_owned()],
+                    resource: None,
+                    mode: InspectionUpdateMode::Add,
+                },
+                AgentUiAction::ElementsInspect {
+                    semantic_ids: vec!["ifc/building-hvac::old-hvac".to_owned()],
+                    resource: None,
+                    mode: InspectionUpdateMode::Remove,
+                },
+            ]
         );
     }
 

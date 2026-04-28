@@ -1036,11 +1036,16 @@ struct OrbitCameraController {
     far_plane: f64,
 }
 
+const MAX_ORBIT_PITCH_RADIANS: f64 = 1.48;
+
 impl OrbitCameraController {
     fn from_camera(camera: Camera) -> Self {
         let offset = camera.eye - camera.target;
         let radius = offset.length().max(0.25);
-        let pitch_radians = (offset.z / radius).clamp(-1.0, 1.0).asin();
+        let pitch_radians = (offset.z / radius)
+            .clamp(-1.0, 1.0)
+            .asin()
+            .clamp(-MAX_ORBIT_PITCH_RADIANS, MAX_ORBIT_PITCH_RADIANS);
         let yaw_radians = offset.x.atan2(-offset.y);
 
         Self {
@@ -1074,11 +1079,10 @@ impl OrbitCameraController {
 
     fn orbit_by_pixels(&mut self, dx: f32, dy: f32) {
         const ORBIT_SENSITIVITY: f64 = 0.01;
-        const MAX_PITCH: f64 = 1.52;
 
         self.yaw_radians -= f64::from(dx) * ORBIT_SENSITIVITY;
-        self.pitch_radians =
-            (self.pitch_radians + (f64::from(dy) * ORBIT_SENSITIVITY)).clamp(-MAX_PITCH, MAX_PITCH);
+        self.pitch_radians = (self.pitch_radians + (f64::from(dy) * ORBIT_SENSITIVITY))
+            .clamp(-MAX_ORBIT_PITCH_RADIANS, MAX_ORBIT_PITCH_RADIANS);
     }
 
     fn zoom_by_wheel(&mut self, delta_y: f32) {
@@ -1198,7 +1202,7 @@ fn draw_native_toolbar(
                 ui.label(RichText::new("Profile").strong());
                 ComboBox::from_id_salt("render-profile-picker")
                     .selected_text(selected_render_profile.label())
-                    .width(150.0)
+                    .width(220.0)
                     .show_ui(ui, |ui| {
                         for profile in render_profiles {
                             ui.selectable_value(selected_render_profile, profile.id, profile.label);
@@ -1668,6 +1672,27 @@ mod tests {
 
         assert_eq!(orbited.target, camera.target);
         assert!(orbited.eye.distance(camera.eye) > 0.1);
+    }
+
+    #[test]
+    fn orbit_controller_clamps_pitch_below_pole() {
+        let camera = Camera {
+            eye: DVec3::new(0.0, 0.0, 100.0),
+            target: DVec3::ZERO,
+            up: WORLD_UP,
+            vertical_fov_degrees: 45.0,
+            near_plane: 0.1,
+            far_plane: 500.0,
+        };
+        let mut orbit = OrbitCameraController::from_camera(camera);
+
+        assert!((orbit.pitch_radians - MAX_ORBIT_PITCH_RADIANS).abs() < f64::EPSILON);
+
+        orbit.orbit_by_pixels(0.0, 100_000.0);
+        assert!((orbit.pitch_radians - MAX_ORBIT_PITCH_RADIANS).abs() < f64::EPSILON);
+
+        orbit.orbit_by_pixels(0.0, -200_000.0);
+        assert!((orbit.pitch_radians + MAX_ORBIT_PITCH_RADIANS).abs() < f64::EPSILON);
     }
 
     #[test]

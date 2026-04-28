@@ -572,8 +572,17 @@ fn common_query_playbooks() -> BTreeMap<String, Vec<String>> {
         (
             "bridge_to_products".to_owned(),
             vec![
-                "MATCH (bridge:IfcBridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) RETURN DISTINCT prod.GlobalId AS global_id LIMIT 200".to_owned(),
-                "MATCH (bridge:IfcBridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)--(:IfcRelAggregates)-->(subpart:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) RETURN DISTINCT prod.GlobalId AS global_id LIMIT 200".to_owned(),
+                "MATCH (bridge:IfcBridge) RETURN id(bridge) AS bridge_node_id, bridge.Name AS name, bridge.ObjectType AS object_type LIMIT 24".to_owned(),
+                "MATCH (bridge:IfcBridge) WHERE id(bridge) = <bridge_node_id> MATCH (bridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) RETURN DISTINCT prod.GlobalId AS global_id LIMIT 200".to_owned(),
+                "MATCH (bridge:IfcBridge) WHERE id(bridge) = <bridge_node_id> MATCH (bridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)--(:IfcRelAggregates)-->(subpart:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) RETURN DISTINCT prod.GlobalId AS global_id LIMIT 200".to_owned(),
+            ],
+        ),
+        (
+            "manhole_assemblies".to_owned(),
+            vec![
+                "MATCH (n:IfcElementAssembly) RETURN id(n) AS node_id, n.GlobalId AS global_id, n.Name AS name, n.ObjectType AS object_type LIMIT 40".to_owned(),
+                "MATCH (n:IfcElementAssembly) WHERE n.Name CONTAINS 'manhole' RETURN id(n) AS node_id, n.GlobalId AS global_id, n.Name AS name, n.ObjectType AS object_type LIMIT 40".to_owned(),
+                "MATCH (n:IfcElementAssembly)--(:IfcRelDefinesByType)--(t:IfcElementAssemblyType) WHERE t.Name CONTAINS 'manhole' RETURN DISTINCT id(n) AS node_id, n.GlobalId AS global_id, n.Name AS name, n.ObjectType AS object_type LIMIT 40".to_owned(),
             ],
         ),
         (
@@ -587,6 +596,38 @@ fn common_query_playbooks() -> BTreeMap<String, Vec<String>> {
 
 fn common_query_playbook_assets() -> BTreeMap<String, AgentQueryPlaybookAsset> {
     BTreeMap::from([
+        (
+            "manhole_assembly_discovery".to_owned(),
+            AgentQueryPlaybookAsset {
+                summary: "Find sewer manholes modeled as renderable IfcElementAssembly accessory assemblies, then use their GlobalId values for viewer actions.".to_owned(),
+                when_to_use: vec![
+                    "show the manhole".to_owned(),
+                    "find the manhole".to_owned(),
+                    "inspect the manhole".to_owned(),
+                    "show me the sewer manhole".to_owned(),
+                    "utility access chamber".to_owned(),
+                ],
+                recommended_patterns: vec![
+                    "MATCH (n:IfcElementAssembly) RETURN id(n) AS node_id, n.GlobalId AS global_id, n.Name AS name, n.ObjectType AS object_type LIMIT 40".to_owned(),
+                    "MATCH (n:IfcElementAssembly) WHERE n.Name CONTAINS 'manhole' RETURN id(n) AS node_id, n.GlobalId AS global_id, n.Name AS name, n.ObjectType AS object_type LIMIT 40".to_owned(),
+                    "MATCH (n:IfcElementAssembly)--(:IfcRelDefinesByType)--(t:IfcElementAssemblyType) WHERE t.Name CONTAINS 'manhole' RETURN DISTINCT id(n) AS node_id, n.GlobalId AS global_id, n.Name AS name, n.ObjectType AS object_type LIMIT 40".to_owned(),
+                ],
+                related_entities: vec![
+                    "IfcElementAssembly".to_owned(),
+                    "IfcElementAssemblyType".to_owned(),
+                    "IfcRelDefinesByType".to_owned(),
+                ],
+                cautions: vec![
+                    "In the infrastructure sample, sewer manholes are renderable IfcElementAssembly products rather than IfcDistributionChamberElement nodes.".to_owned(),
+                    "Prefer the label-first IfcElementAssembly query before broad text scans.".to_owned(),
+                    "Avoid broad `MATCH (n)` text filters with `toLower(...)` for this lookup; this runtime can produce noisy false positives on unlabeled scans.".to_owned(),
+                ],
+                avoid_patterns: vec![
+                    "Starting with a project-wide `MATCH (n) WHERE toLower(n.Name) CONTAINS 'manhole'` scan.".to_owned(),
+                    "Assuming manholes must be IfcDistributionChamberElement before checking IfcElementAssembly.".to_owned(),
+                ],
+            },
+        ),
         (
             "model_overview".to_owned(),
             AgentQueryPlaybookAsset {
@@ -766,24 +807,33 @@ fn common_query_playbook_assets() -> BTreeMap<String, AgentQueryPlaybookAsset> {
                     "hide the rail bridge".to_owned(),
                     "show the bridge".to_owned(),
                     "find renderable bridge products".to_owned(),
+                    "explain bridge footings or foundations".to_owned(),
+                    "inspect bridge substructure".to_owned(),
                 ],
                 recommended_patterns: vec![
-                    "MATCH (bridge:IfcBridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) RETURN DISTINCT prod.GlobalId AS global_id LIMIT 200".to_owned(),
-                    "MATCH (bridge:IfcBridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)--(:IfcRelAggregates)-->(subpart:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) RETURN DISTINCT prod.GlobalId AS global_id LIMIT 200".to_owned(),
-                    "MATCH (bridge:IfcBridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) RETURN DISTINCT id(prod) AS node_id LIMIT 24".to_owned(),
+                    "MATCH (bridge:IfcBridge) RETURN id(bridge) AS bridge_node_id, bridge.Name AS name, bridge.ObjectType AS object_type, bridge.PredefinedType AS predefined_type LIMIT 24".to_owned(),
+                    "MATCH (bridge:IfcBridge) WHERE id(bridge) = <bridge_node_id> MATCH (bridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) RETURN DISTINCT prod.GlobalId AS global_id LIMIT 200".to_owned(),
+                    "MATCH (bridge:IfcBridge) WHERE id(bridge) = <bridge_node_id> MATCH (bridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)--(:IfcRelAggregates)-->(subpart:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) RETURN DISTINCT prod.GlobalId AS global_id LIMIT 200".to_owned(),
+                    "MATCH (bridge:IfcBridge) WHERE id(bridge) = <bridge_node_id> MATCH (bridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) RETURN DISTINCT id(prod) AS node_id LIMIT 24".to_owned(),
+                    "MATCH (bridge:IfcBridge) WHERE id(bridge) = <bridge_node_id> MATCH (bridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(footing:IfcFooting) RETURN DISTINCT id(footing) AS node_id, footing.Name AS name, footing.GlobalId AS global_id LIMIT 24".to_owned(),
+                    "MATCH (bridge:IfcBridge) WHERE id(bridge) = <bridge_node_id> MATCH (bridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)--(:IfcRelAggregates)-->(subpart:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(footing:IfcFooting) RETURN DISTINCT id(footing) AS node_id, footing.Name AS name, footing.GlobalId AS global_id LIMIT 24".to_owned(),
                 ],
                 related_entities: vec![
                     "IfcBridge".to_owned(),
                     "IfcBridgePart".to_owned(),
+                    "IfcFooting".to_owned(),
                     "IfcRelAggregates".to_owned(),
                     "IfcRelContainedInSpatialStructure".to_owned(),
                 ],
                 cautions: vec![
                     "IfcBridge and IfcBridgePart are often semantic containers; viewer element actions usually need the contained product descendants' GlobalId values.".to_owned(),
+                    "When the user names a specific bridge such as rail/railway/road/girder/arched, first identify the matching IfcBridge root by returned name/object type, then anchor descendant queries with that bridge_node_id.".to_owned(),
                     "If the first bridge-part containment query only covers some of the visible structure, check one more aggregate hop for nested parts such as piers.".to_owned(),
+                    "In bridge contexts, IfcFooting/foundation products contained by bridge parts are likely substructure/support elements; say that as a relation-grounded inference, not a name-only fact.".to_owned(),
                 ],
                 avoid_patterns: vec![
                     "Trying to hide IfcBridgePart ids directly with element actions.".to_owned(),
+                    "Using an unfiltered `MATCH (bridge:IfcBridge)` descendant query when the user asked for a specific rail, road, arched, or girder bridge.".to_owned(),
                 ],
             },
         ),
@@ -1025,7 +1075,7 @@ fn common_entity_reference_assets() -> BTreeMap<String, AgentEntityReferenceAsse
         (
             "IfcBridgePart".to_owned(),
             AgentEntityReferenceAsset {
-                summary: "Bridge subdivision/container node. In infrastructure models it often sits between the bridge root and the visible columns, walls, members, fill, and other products.".to_owned(),
+                summary: "Bridge subdivision/container node. In infrastructure models it often sits between the bridge root and visible deck, superstructure, substructure/support, footing, pier, abutment, fill, and other products.".to_owned(),
                 common_relations: vec![
                     "IfcRelAggregates".to_owned(),
                     "IfcRelContainedInSpatialStructure".to_owned(),
@@ -1036,6 +1086,47 @@ fn common_entity_reference_assets() -> BTreeMap<String, AgentEntityReferenceAsse
                 ],
                 cautions: vec![
                     "IfcBridgePart is often still semantic/spatial structure. For viewer actions, prefer the contained descendant products' GlobalId values.".to_owned(),
+                    "When a contained product is IfcFooting or a foundation/pier/abutment-like product, treat it as likely bridge substructure/support and verify through containment/type relations.".to_owned(),
+                ],
+            },
+        ),
+        (
+            "IfcFooting".to_owned(),
+            AgentEntityReferenceAsset {
+                summary: "Foundation product. In bridge/infrastructure models, footings contained by IfcBridgePart commonly represent bridge substructure/support rather than unrelated site geometry.".to_owned(),
+                common_relations: vec![
+                    "IfcRelContainedInSpatialStructure".to_owned(),
+                    "IfcRelDefinesByType".to_owned(),
+                    "IfcRelAssociatesMaterial".to_owned(),
+                ],
+                query_patterns: vec![
+                    "MATCH (footing:IfcFooting) RETURN id(footing) AS node_id, footing.Name AS name, footing.GlobalId AS global_id LIMIT 24".to_owned(),
+                    "MATCH (part:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(footing:IfcFooting) RETURN DISTINCT id(footing) AS node_id, footing.Name AS name, footing.GlobalId AS global_id LIMIT 24".to_owned(),
+                    "MATCH (bridge:IfcBridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(footing:IfcFooting) RETURN DISTINCT id(footing) AS node_id, footing.Name AS name, footing.GlobalId AS global_id LIMIT 24".to_owned(),
+                ],
+                cautions: vec![
+                    "Do not classify a footing as bridge substructure from the name alone; ground it in containment under IfcBridge/IfcBridgePart or nearby type/material relations.".to_owned(),
+                    "IfcFooting is usually renderable if it has a GlobalId and product representation, but still inspect local relations before issuing viewer actions.".to_owned(),
+                ],
+            },
+        ),
+        (
+            "IfcElementAssembly".to_owned(),
+            AgentEntityReferenceAsset {
+                summary: "Product assembly such as a signal assembly, accessory assembly, or other grouped infrastructure/building product. In the infrastructure sample, sewer manholes are modeled as renderable IfcElementAssembly products.".to_owned(),
+                common_relations: vec![
+                    "IfcRelDefinesByType".to_owned(),
+                    "IfcRelContainedInSpatialStructure".to_owned(),
+                    "IfcRelAssociatesMaterial".to_owned(),
+                ],
+                query_patterns: vec![
+                    "MATCH (assembly:IfcElementAssembly) RETURN id(assembly) AS node_id, assembly.Name AS name, assembly.ObjectType AS object_type, assembly.GlobalId AS global_id LIMIT 24".to_owned(),
+                    "MATCH (assembly:IfcElementAssembly) WHERE assembly.Name CONTAINS 'manhole' RETURN id(assembly) AS node_id, assembly.Name AS name, assembly.ObjectType AS object_type, assembly.GlobalId AS global_id LIMIT 24".to_owned(),
+                    "MATCH (assembly:IfcElementAssembly)--(:IfcRelDefinesByType)--(t:IfcElementAssemblyType) WHERE t.Name CONTAINS 'manhole' RETURN DISTINCT id(assembly) AS node_id, assembly.Name AS name, assembly.ObjectType AS object_type, assembly.GlobalId AS global_id LIMIT 24".to_owned(),
+                ],
+                cautions: vec![
+                    "Do not assume manholes must be IfcDistributionChamberElement; check IfcElementAssembly and its type first in the sample infrastructure models.".to_owned(),
+                    "IfcElementAssembly can be directly renderable when it has a GlobalId and prepared geometry; use that GlobalId for viewer actions.".to_owned(),
                 ],
             },
         ),
@@ -1102,6 +1193,46 @@ mod tests {
     }
 
     #[test]
+    fn entity_lookup_hints_bridge_footings_are_substructure() {
+        let references = load_entity_references(
+            Path::new("/tmp/no-assets-here"),
+            &IfcSchemaId::Ifc4x3Add2,
+            &[String::from("IfcFooting")],
+        )
+        .expect("entity references should load");
+
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].entity_name, "IfcFooting");
+        assert!(references[0].summary.contains("bridge substructure"));
+        assert!(
+            references[0]
+                .cautions
+                .iter()
+                .any(|caution| { caution.contains("containment under IfcBridge/IfcBridgePart") })
+        );
+    }
+
+    #[test]
+    fn entity_lookup_hints_manhole_assemblies() {
+        let references = load_entity_references(
+            Path::new("/tmp/no-assets-here"),
+            &IfcSchemaId::Ifc4x3Add2,
+            &[String::from("IfcElementAssembly")],
+        )
+        .expect("entity references should load");
+
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].entity_name, "IfcElementAssembly");
+        assert!(references[0].summary.contains("sewer manholes"));
+        assert!(
+            references[0]
+                .query_patterns
+                .iter()
+                .any(|pattern| pattern.contains("Name CONTAINS 'manhole'"))
+        );
+    }
+
+    #[test]
     fn query_playbooks_match_goal_and_entities() {
         let playbooks = load_query_playbooks(
             Path::new("/tmp/no-assets-here"),
@@ -1127,6 +1258,63 @@ mod tests {
 
         assert!(!playbooks.is_empty());
         assert_eq!(playbooks[0].playbook_name, "bridge_renderable_descendants");
+        assert!(
+            playbooks[0].recommended_patterns[0].contains("bridge_node_id"),
+            "specific bridge requests should first identify the bridge root"
+        );
+        assert!(
+            playbooks[0]
+                .recommended_patterns
+                .iter()
+                .any(|pattern| pattern.contains("WHERE id(bridge) = <bridge_node_id>")),
+            "bridge descendants should be anchored to the selected bridge root"
+        );
+    }
+
+    #[test]
+    fn query_playbooks_match_bridge_footing_substructure_goal() {
+        let playbooks = load_query_playbooks(
+            Path::new("/tmp/no-assets-here"),
+            &IfcSchemaId::Ifc4x3Add2,
+            "are these bridge footings part of the substructure",
+            &[String::from("IfcFooting")],
+        )
+        .expect("query playbooks should load");
+
+        assert!(!playbooks.is_empty());
+        assert_eq!(playbooks[0].playbook_name, "bridge_renderable_descendants");
+        assert!(
+            playbooks[0]
+                .recommended_patterns
+                .iter()
+                .any(|pattern| pattern.contains("footing:IfcFooting"))
+        );
+    }
+
+    #[test]
+    fn query_playbooks_match_manhole_goal() {
+        let playbooks = load_query_playbooks(
+            Path::new("/tmp/no-assets-here"),
+            &IfcSchemaId::Ifc4x3Add2,
+            "show me the manhole",
+            &[],
+        )
+        .expect("query playbooks should load");
+
+        assert!(!playbooks.is_empty());
+        assert_eq!(playbooks[0].playbook_name, "manhole_assembly_discovery");
+        assert!(
+            playbooks[0]
+                .recommended_patterns
+                .iter()
+                .any(|pattern| pattern.contains("MATCH (n:IfcElementAssembly)"))
+        );
+        assert!(
+            playbooks[0]
+                .avoid_patterns
+                .iter()
+                .any(|pattern| pattern.contains("toLower"))
+        );
     }
 
     #[test]

@@ -402,7 +402,14 @@ impl RuntimeSceneState {
     }
 
     pub fn missing_stream_plan_for_visible_elements(&self) -> GeometryStreamPlan {
-        let plan = self.stream_plan_for_visible_elements();
+        self.missing_stream_plan_for_elements(self.visible_element_ids().iter())
+    }
+
+    pub fn missing_stream_plan_for_elements<'a, I>(&self, ids: I) -> GeometryStreamPlan
+    where
+        I: IntoIterator<Item = &'a SemanticElementId>,
+    {
+        let plan = self.stream_plan_for_elements(ids);
         GeometryStreamPlan {
             instance_ids: plan
                 .instance_ids
@@ -653,13 +660,13 @@ impl RuntimeSceneState {
     where
         I: IntoIterator<Item = &'a SemanticElementId>,
     {
+        let requested = ids.into_iter().cloned().collect::<HashSet<_>>();
         let mut changed = 0;
-        for id in ids {
-            let Some(indexed) = self.elements_by_id.get_mut(id) else {
-                continue;
-            };
-            if !indexed.state.selected {
-                indexed.state.selected = true;
+
+        for (id, indexed) in &mut self.elements_by_id {
+            let should_select = requested.contains(id);
+            if indexed.state.selected != should_select {
+                indexed.state.selected = should_select;
                 changed += 1;
             }
         }
@@ -709,6 +716,38 @@ impl RuntimeSceneState {
             if indexed.state.inspected != inspected {
                 indexed.state.inspected = inspected;
                 changed += 1;
+            }
+        }
+        changed
+    }
+
+    pub fn add_inspection_focus<'a, I>(&mut self, ids: I) -> usize
+    where
+        I: IntoIterator<Item = &'a SemanticElementId>,
+    {
+        let mut changed = 0;
+        for id in ids {
+            if let Some(indexed) = self.elements_by_id.get_mut(id) {
+                if !indexed.state.inspected {
+                    indexed.state.inspected = true;
+                    changed += 1;
+                }
+            }
+        }
+        changed
+    }
+
+    pub fn remove_inspection_focus<'a, I>(&mut self, ids: I) -> usize
+    where
+        I: IntoIterator<Item = &'a SemanticElementId>,
+    {
+        let mut changed = 0;
+        for id in ids {
+            if let Some(indexed) = self.elements_by_id.get_mut(id) {
+                if indexed.state.inspected {
+                    indexed.state.inspected = false;
+                    changed += 1;
+                }
             }
         }
         changed
@@ -2424,6 +2463,32 @@ mod tests {
     }
 
     #[test]
+    fn runtime_scene_inspection_focus_can_be_added_and_removed() {
+        let left_id = SemanticElementId::new("synthetic/mapped/left");
+        let right_id = SemanticElementId::new("synthetic/mapped/right");
+        let mut runtime_scene = RuntimeSceneState::from_prepared_package(mapped_triangle_package(
+            "Synthetic Mapped Triangle",
+            "synthetic/mapped/left",
+        ))
+        .expect("scene");
+
+        assert_eq!(runtime_scene.set_inspection_focus([&left_id]), 1);
+        assert_eq!(runtime_scene.add_inspection_focus([&right_id]), 1);
+        assert_eq!(
+            runtime_scene.inspected_element_ids(),
+            vec![left_id.clone(), right_id.clone()]
+        );
+
+        assert_eq!(runtime_scene.add_inspection_focus([&right_id]), 0);
+        assert_eq!(runtime_scene.remove_inspection_focus([&left_id]), 1);
+        assert_eq!(
+            runtime_scene.inspected_element_ids(),
+            vec![right_id.clone()]
+        );
+        assert_eq!(runtime_scene.remove_inspection_focus([&left_id]), 0);
+    }
+
+    #[test]
     fn runtime_scene_tracks_selection_and_frame_bounds_by_element() {
         let left_id = SemanticElementId::new("synthetic/mapped/left");
         let right_id = SemanticElementId::new("synthetic/mapped/right");
@@ -2445,6 +2510,21 @@ mod tests {
         assert!(framed.max.x > 3.4);
         assert_eq!(runtime_scene.clear_selection(), 2);
         assert!(runtime_scene.selected_element_ids().is_empty());
+    }
+
+    #[test]
+    fn runtime_scene_selection_replaces_previous_selection() {
+        let left_id = SemanticElementId::new("synthetic/mapped/left");
+        let right_id = SemanticElementId::new("synthetic/mapped/right");
+        let mut runtime_scene = RuntimeSceneState::from_prepared_package(mapped_triangle_package(
+            "Synthetic Mapped Triangle",
+            "synthetic/mapped/left",
+        ))
+        .expect("scene");
+
+        assert_eq!(runtime_scene.select_elements([&left_id]), 1);
+        assert_eq!(runtime_scene.select_elements([&right_id]), 2);
+        assert_eq!(runtime_scene.selected_element_ids(), vec![right_id]);
     }
 
     #[test]

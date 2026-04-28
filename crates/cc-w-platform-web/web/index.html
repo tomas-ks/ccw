@@ -1629,6 +1629,7 @@
         viewer_default_element_ids,
         viewer_frame_visible,
         viewer_hide_elements,
+        viewer_add_inspection_elements,
         viewer_clear_inspection,
         viewer_inspect_elements,
         viewer_inspected_element_ids,
@@ -1640,6 +1641,7 @@
         viewer_resource_catalog_json,
         viewer_reset_all_visibility,
         viewer_reset_element_visibility,
+        viewer_remove_inspection_elements,
         viewer_select_elements,
         viewer_selected_element_ids,
         viewer_set_clear_color,
@@ -2153,6 +2155,16 @@
         const parseRenderProfiles = (json) => JSON.parse(json);
         const currentViewerElementIds = (ids, options = {}) =>
           semanticIdsForViewerResource(ids, viewer_current_resource(), options);
+        const normalizeInspectionMode = (mode) => {
+          const value = String(mode || "replace").trim().toLowerCase();
+          if (["add", "append", "include", "plus"].includes(value)) {
+            return "add";
+          }
+          if (["remove", "subtract", "exclude", "drop"].includes(value)) {
+            return "remove";
+          }
+          return "replace";
+        };
         const setViewModeAsync = async (mode) => {
           return parseViewState(await viewer_set_view_mode(mode));
         };
@@ -2247,8 +2259,21 @@
           },
           select: (ids, options = {}) => viewer_select_elements(currentViewerElementIds(ids, options)),
           clearSelection: () => viewer_clear_selection(),
-          inspect: (ids, options = {}) =>
-            viewer_inspect_elements(currentViewerElementIds(ids, options)),
+          inspect: (ids, options = {}) => {
+            const elementIds = currentViewerElementIds(ids, options);
+            const mode = normalizeInspectionMode(options.mode);
+            if (mode === "add") {
+              return viewer_add_inspection_elements(elementIds);
+            }
+            if (mode === "remove") {
+              return viewer_remove_inspection_elements(elementIds);
+            }
+            return viewer_inspect_elements(elementIds);
+          },
+          addInspection: (ids, options = {}) =>
+            api.inspect(ids, { ...options, mode: "add" }),
+          removeInspection: (ids, options = {}) =>
+            api.inspect(ids, { ...options, mode: "remove" }),
           clearInspection: () => viewer_clear_inspection(),
           pickAt: pickAtSoon,
           pickRect: pickRectSoon,
@@ -2435,13 +2460,10 @@
         if (!isIfcResource(resource)) {
           return null;
         }
-        if (resource.startsWith("ifc/building-")) {
-          return "project/building";
-        }
-        if (resource.startsWith("ifc/infra-")) {
-          return "project/infra";
-        }
-        return null;
+        return (
+          resourceCatalogState.projects.find((project) => project.members.includes(resource))
+            ?.resource || null
+        );
       }
 
       function resourcePickerHasOption(resource) {
@@ -6835,6 +6857,8 @@
           show: (ids, options = {}) => viewer.show(ids, options),
           select: (ids, options = {}) => viewer.select(ids, options),
           inspect: (ids, options = {}) => viewer.inspect(ids, options),
+          addInspection: (ids, options = {}) => viewer.addInspection(ids, options),
+          removeInspection: (ids, options = {}) => viewer.removeInspection(ids, options),
           resetVisibility: (ids, options = {}) =>
             Array.isArray(ids) ? viewer.resetVisibility(ids, options) : viewer.resetAllVisibility(),
           clearSelection: () => viewer.clearSelection(),
@@ -6857,9 +6881,9 @@
             viewer.select(ids, { sourceResource: resource });
             return ids;
           },
-          inspectQuery: async (cypher, resource = currentQueryResource()) => {
+          inspectQuery: async (cypher, resource = currentQueryResource(), options = {}) => {
             const ids = await api.queryIds(cypher, resource);
-            viewer.inspect(ids, { sourceResource: resource });
+            viewer.inspect(ids, { ...options, sourceResource: resource });
             return ids;
           },
         };
@@ -7564,7 +7588,10 @@
           if (!semanticIds.length) {
             return null;
           }
-          viewer.inspect(semanticIds, { sourceResource: agentActionResource(action, viewer) });
+          viewer.inspect(semanticIds, {
+            sourceResource: agentActionResource(action, viewer),
+            mode: tryGetFirst(action, ["mode", "inspection_mode", "inspectionMode"]) || "replace",
+          });
           return "elements.inspect";
         }
 
@@ -8503,7 +8530,7 @@
           screenId: "repl-screen",
           hostId: "repl-terminal",
           introLines: [
-            'resource(), profile(), profiles(), setProfile(name), referenceGridVisible(), setReferenceGridVisible(true), theme(), setTheme("light"), allView(), defaultView(), viewState(), state(), pickAt(x,y), pickRect(x0,y0,x1,y1), query(...), ids(...), hide([...]), show([...]), select([...]), inspect([...]), clearInspection(), graph.reset(...), frame()',
+            'resource(), profile(), profiles(), setProfile(name), referenceGridVisible(), setReferenceGridVisible(true), theme(), setTheme("light"), allView(), defaultView(), viewState(), state(), pickAt(x,y), pickRect(x0,y0,x1,y1), query(...), ids(...), hide([...]), show([...]), select([...]), inspect([...]), addInspection([...]), removeInspection([...]), clearInspection(), graph.reset(...), frame()',
             'Example: graph.reset("MATCH (p:IfcProject) RETURN id(p) AS node_id LIMIT 1");',
             'Example: var walls = ids("MATCH (w:IfcWall) RETURN w.GlobalId AS global_id LIMIT 8"); hide(walls);',
             "Enter runs. Up/Down walks history. Ctrl+C clears the line.",
@@ -8514,7 +8541,7 @@
               "api",
               "window",
               "document",
-              `"use strict"; const { viewer, graph, resource, profile, profiles, setProfile, referenceGridVisible, setReferenceGridVisible, toggleReferenceGrid, theme, setTheme, viewState, state, setViewMode, defaultView, allView, setViewModeAsync, defaultViewAsync, allViewAsync, pickAt, pickRect, pickAtAsync, pickRectAsync, listIds, visibleIds, selectedIds, inspectedIds, selectedInstanceIds, query, queryIds, ids, hide, show, select, inspect, resetVisibility, clearSelection, clearInspection, frame, frameVisible, hideQuery, showQuery, selectQuery, inspectQuery } = api; return (async () => { ${rewritten} })();`
+              `"use strict"; const { viewer, graph, resource, profile, profiles, setProfile, referenceGridVisible, setReferenceGridVisible, toggleReferenceGrid, theme, setTheme, viewState, state, setViewMode, defaultView, allView, setViewModeAsync, defaultViewAsync, allViewAsync, pickAt, pickRect, pickAtAsync, pickRectAsync, listIds, visibleIds, selectedIds, inspectedIds, selectedInstanceIds, query, queryIds, ids, hide, show, select, inspect, addInspection, removeInspection, resetVisibility, clearSelection, clearInspection, frame, frameVisible, hideQuery, showQuery, selectQuery, inspectQuery } = api; return (async () => { ${rewritten} })();`
             );
             return fn(replApi, window, document);
           },

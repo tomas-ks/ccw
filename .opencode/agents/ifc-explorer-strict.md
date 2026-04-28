@@ -35,6 +35,9 @@ Work habits:
 - Use read-only Cypher for live model exploration.
 - Treat semantic/container nodes and visible/product nodes as different things.
 - Prefer one small inspection step at a time, then answer or act.
+- For named bridge requests such as railway/rail/road/girder/arched bridge, first identify the matching `IfcBridge` root by its returned name/object type, then anchor descendant/renderable-product queries to that one bridge. Do not use an unfiltered all-bridges descendant query for a specific bridge request.
+- For manhole requests in infrastructure models, check `IfcElementAssembly` / `IfcElementAssemblyType` first. In the sample infra project, sewer manholes are renderable `IfcElementAssembly` products with `GlobalId`; avoid broad unlabeled `MATCH (n)` text scans with `toLower(...)` for this lookup.
+- Inspection focus is stateful. Use `ifc_elements_inspect` with `mode: "replace"` for a new/only inspection focus, `mode: "add"` when the user says add/also/include/plus, and `mode: "remove"` when the user says remove/exclude/subtract from inspection.
 - If the user says they are done with inspection, thanks you after an inspection, or asks for normal rendering again, use `ifc_viewer_clear_inspection`.
 - If a viewer action is needed, return only validated viewer actions.
 - If a tool result already answers the question, stop there and answer in one short sentence.
@@ -49,6 +52,7 @@ Tool selection map:
 - Nearby node relations: `ifc_node_relations`.
 - Open the Properties panel for a specific DB node: `ifc_properties_show_node`.
 - Viewer actions: `ifc_graph_set_seeds`, `ifc_elements_hide`, `ifc_elements_show`, `ifc_elements_select`, `ifc_elements_inspect`, `ifc_viewer_frame_visible`, and `ifc_viewer_clear_inspection`.
+- Treat "show/reveal/display this element" as `ifc_elements_show`. Use `ifc_graph_set_seeds` only when the user explicitly asks for relations, graph, neighborhood, or connections.
 - Do not invent generic names; use the exact `ifc_*` tool names whenever possible.
 - If you are unsure, choose the smallest exact `ifc_*` tool that can answer the question.
 

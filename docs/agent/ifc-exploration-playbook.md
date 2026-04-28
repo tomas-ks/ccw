@@ -186,7 +186,13 @@ In infrastructure models, bridge exploration is often better understood as:
 - one or more `IfcBridgePart` subdivision/container nodes
 - visible products hanging off those parts through `IfcRelContainedInSpatialStructure`
 
+Bridge support/substructure language:
+- `IfcFooting`, foundation-like products, piers, and abutments under a bridge part are strong bridge substructure/support signals
+- explain that classification from the live containment/type relations, not from a display name alone
+
 If "hide the rail bridge" does nothing:
+- first list `IfcBridge` roots and choose the one whose name/object type matches rail/railway/road/girder/arched wording
+- anchor follow-up descendant queries to that chosen bridge root; do not descend from every `IfcBridge` when the user asked for one specific bridge
 - inspect `IfcRelAggregates` to find the bridge parts
 - inspect `IfcRelContainedInSpatialStructure` from those parts to find visible products
 - if the first bridge-part containment step only covers part of the bridge, descend one more aggregate hop for nested parts such as piers
@@ -229,7 +235,17 @@ LIMIT 32
 ### Hide products contained by bridge parts
 
 ```cypher
-MATCH (bridge:IfcBridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod)
+MATCH (bridge:IfcBridge)
+RETURN id(bridge) AS bridge_node_id, bridge.Name AS name, bridge.ObjectType AS object_type
+LIMIT 24
+```
+
+Then choose the bridge root that matches the user wording and anchor the product query:
+
+```cypher
+MATCH (bridge:IfcBridge)
+WHERE id(bridge) = <bridge_node_id>
+MATCH (bridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod)
 RETURN DISTINCT prod.GlobalId AS global_id
 LIMIT 200
 ```
@@ -237,10 +253,46 @@ LIMIT 200
 ### Hide products contained by nested bridge parts
 
 ```cypher
-MATCH (bridge:IfcBridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)--(:IfcRelAggregates)-->(subpart:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod)
+MATCH (bridge:IfcBridge)
+WHERE id(bridge) = <bridge_node_id>
+MATCH (bridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)--(:IfcRelAggregates)-->(subpart:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod)
 RETURN DISTINCT prod.GlobalId AS global_id
 LIMIT 200
 ```
+
+### Show sewer manholes
+
+In the infrastructure sample project, sewer manholes are modeled as renderable
+`IfcElementAssembly` products, not as `IfcDistributionChamberElement` nodes.
+Use label-first assembly queries before broad text scans.
+
+```cypher
+MATCH (n:IfcElementAssembly)
+RETURN id(n) AS node_id, n.GlobalId AS global_id, n.Name AS name, n.ObjectType AS object_type
+LIMIT 40
+```
+
+Then narrow if needed:
+
+```cypher
+MATCH (n:IfcElementAssembly)
+WHERE n.Name CONTAINS 'manhole'
+RETURN id(n) AS node_id, n.GlobalId AS global_id, n.Name AS name, n.ObjectType AS object_type
+LIMIT 40
+```
+
+If the type relation is useful:
+
+```cypher
+MATCH (n:IfcElementAssembly)--(:IfcRelDefinesByType)--(t:IfcElementAssemblyType)
+WHERE t.Name CONTAINS 'manhole'
+RETURN DISTINCT id(n) AS node_id, n.GlobalId AS global_id, n.Name AS name, n.ObjectType AS object_type
+LIMIT 40
+```
+
+Avoid starting this lookup with broad `MATCH (n)` plus `toLower(...)` text
+filters; those scans can become noisy in this runtime and return many
+non-renderable helpers.
 
 ### Bounded descendant discovery
 

@@ -11,6 +11,14 @@ This project is an IFC-focused renderer and semantic exploration tool. The 3D vi
 - Prefer small, focused queries over broad scans.
 - Assume this Cypher runtime prefers simple patterns. Start simple and only add complexity if the simpler query genuinely leaves the question unanswered.
 
+## Import and rendering data integrity
+
+- Never invent IFC data, placement, topology, geometry, units, colors, or semantic facts to make an import or render "look right".
+- Do not paper over missing or unsupported import/rendering data with silent fallbacks, hardcoded offsets, guessed transforms, name-based geometry fixes, synthetic defaults, or alternate query paths that change the meaning of the source data.
+- If required import/rendering data is missing from the database or cannot be resolved from explicit IFC graph facts, fail loudly, mark the item unsupported, or surface a diagnostic. Do not substitute origin placement, identity transforms, guessed curve axes, guessed relationship topology, or inferred geometry.
+- Renderer presentation defaults are allowed only as explicit visual policy, such as a default material color when no color exists. They must not be treated as imported source facts or used to infer missing IFC data.
+- When debugging geometry alignment, prefer proving the correct path from the imported graph, schema, and known IFC relationships. If evidence is insufficient, stop and report the missing edge/fact rather than guessing.
+
 ## Schema-aware exploration
 
 - Use schema-specific context before guessing how an entity or relationship works.
@@ -29,6 +37,7 @@ This project is an IFC-focused renderer and semantic exploration tool. The 3D vi
 - `properties.show_node` expects exactly one DB node id and is useful when you want the Properties tab to open on a node you are discussing.
 - `elements.hide`, `elements.show`, `elements.select`, and `elements.inspect` expect renderable semantic ids, typically returned from `GlobalId` / `global_id`.
 - `viewer.clear_inspection` expects no ids and clears the current inspection focus.
+- Treat "show/reveal/display this element" as a 3D viewer action. Only seed/open the graph when the user explicitly asks for relations, graph, neighborhood, or connections.
 - Do not wrap `id(...)` in `toString(...)`; when you need graph ids, return raw numeric ids as `id(n) AS node_id`.
 - If you only have DB node ids, use graph actions rather than element actions.
 
@@ -55,6 +64,9 @@ This project is an IFC-focused renderer and semantic exploration tool. The 3D vi
 
 - Roofs may be modeled by related slabs rather than the `IfcRoof` node itself.
 - Bridges may be modeled as `IfcBridge` and `IfcBridgePart` semantic containers, with the visible bridge geometry hanging off those parts through `IfcRelContainedInSpatialStructure`.
+- In bridge/infrastructure models, `IfcFooting`, foundation-like products, piers, and abutments contained by or aggregated under `IfcBridgePart` are usually bridge substructure/support elements. Ground this claim in containment/type relations rather than names alone.
+- For named bridge requests such as railway/rail/road/girder/arched bridge, first identify the matching `IfcBridge` root by name/object type, then anchor descendant/renderable-product queries to that one bridge. Do not descend from all `IfcBridge` roots for a specific bridge request.
+- In the infrastructure sample project, sewer manholes are modeled as renderable `IfcElementAssembly` products, typically with `ObjectType` `accessory_assembly` and a matching `IfcElementAssemblyType`. For manhole viewer actions, check `IfcElementAssembly` / `IfcElementAssemblyType` first and use the assembly `GlobalId`.
 - Slabs are often best understood through nearby relationship nodes such as `IfcRelAggregates`, `IfcRelContainedInSpatialStructure`, `IfcRelDefinesByType`, `IfcRelDefinesByProperties`, and `IfcRelAssociatesMaterial`.
 - A useful roof pattern is:
 
@@ -96,6 +108,7 @@ This project is an IFC-focused renderer and semantic exploration tool. The 3D vi
 - Use bounded varlen mainly to discover candidate descendants or relation context. After that, switch back to a simpler query to inspect the concrete candidate products you found.
 - Avoid starting with a bare `[*]`, `[*1..3]`, or open-ended `*0..` walk unless you also have a very tight anchor and a clear reason. They get noisy quickly.
 - For text/name discovery, first fetch a small set of likely candidates with a simple label query, then inspect returned rows and only refine if needed.
+- Avoid broad unlabeled text scans like `MATCH (n) WHERE toLower(n.Name) CONTAINS ...` when a likely IFC label exists. In this runtime those broad scans can get noisy; prefer label-first queries such as `MATCH (n:IfcElementAssembly) WHERE n.Name CONTAINS 'manhole' ...`.
 - For ad hoc query strategy, ask for a query playbook before improvising. Freestyle Cypher is the escape hatch, not the default.
 - Reuse ids and facts already present in recent session history and tool results before issuing a rediscovery query.
 - If you already have a DB node id and the user asks for properties or explanation, prefer `get_node_properties` and `describe_nodes` over writing more Cypher.

@@ -1534,7 +1534,8 @@ use cc_w_backend::available_demo_resources;
 #[cfg(target_arch = "wasm32")]
 use cc_w_render::{
     Camera, DepthTarget, MeshRenderer, RenderDefaults, RenderProfileDescriptor, RenderProfileId,
-    ViewportSize, fit_camera_to_render_scene, pick_prepared_scene_cpu,
+    ViewportSize, fit_camera_to_bounds_with_scene_context, fit_camera_to_render_scene,
+    interpolate_camera, pick_prepared_scene_cpu,
 };
 #[cfg(target_arch = "wasm32")]
 use cc_w_types::{
@@ -1601,6 +1602,7 @@ struct WebRenderProfileDescriptor {
     id: String,
     name: String,
     label: String,
+    experimental: bool,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2220,10 +2222,8 @@ pub fn viewer_show_elements(ids: Array) -> Result<u32, JsValue> {
     let (changed, events) = with_web_viewer_state_mut(|state| {
         let ids = semantic_ids_from_array(&ids)?;
         let changed = state.runtime_scene.show_elements(ids.iter()) as u32;
-        let mut events = vec![state.upload_runtime_scene(false)?];
-        if changed > 0 {
-            events.push(state.viewer_state_change_event("visibility")?);
-        }
+        let inspection_changed = state.runtime_scene.clear_inspection() as u32;
+        let events = state.commit_show_change(&ids, changed, inspection_changed)?;
         Ok((changed, events))
     })?;
     dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
@@ -2337,10 +2337,33 @@ pub fn viewer_inspect_elements(ids: Array) -> Result<u32, JsValue> {
     let (changed, events) = with_web_viewer_state_mut(|state| {
         let ids = semantic_ids_from_array(&ids)?;
         let changed = state.runtime_scene.set_inspection_focus(ids.iter()) as u32;
-        let mut events = vec![state.upload_runtime_scene(false)?];
-        if changed > 0 {
-            events.push(state.viewer_state_change_event("inspection")?);
-        }
+        let events = state.commit_inspection_change(changed, "replace")?;
+        Ok((changed, events))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(changed)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_add_inspection_elements(ids: Array) -> Result<u32, JsValue> {
+    let (changed, events) = with_web_viewer_state_mut(|state| {
+        let ids = semantic_ids_from_array(&ids)?;
+        let changed = state.runtime_scene.add_inspection_focus(ids.iter()) as u32;
+        let events = state.commit_inspection_change(changed, "add")?;
+        Ok((changed, events))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(changed)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_remove_inspection_elements(ids: Array) -> Result<u32, JsValue> {
+    let (changed, events) = with_web_viewer_state_mut(|state| {
+        let ids = semantic_ids_from_array(&ids)?;
+        let changed = state.runtime_scene.remove_inspection_focus(ids.iter()) as u32;
+        let events = state.commit_inspection_change(changed, "remove")?;
         Ok((changed, events))
     })?;
     dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
@@ -2352,8 +2375,14 @@ pub fn viewer_inspect_elements(ids: Array) -> Result<u32, JsValue> {
 pub fn viewer_clear_inspection() -> Result<u32, JsValue> {
     let (changed, events) = with_web_viewer_state_mut(|state| {
         let changed = state.runtime_scene.clear_inspection() as u32;
+        state.cancel_auto_inspection_probes();
         let mut events = vec![state.upload_runtime_scene(false)?];
         if changed > 0 {
+            state.camera_transition = None;
+            state.inspection_visual_transition = None;
+            state
+                .renderer
+                .set_inspection_context_alpha_multiplier(&state.queue, 1.0);
             events.push(state.viewer_state_change_event("inspection")?);
         }
         Ok((changed, events))
@@ -2603,6 +2632,117 @@ async fn update_orbit_pivot_from_gpu_pick(
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn run_show_visibility_probe_in_state(
+    app_state: Rc<RefCell<WebViewerState>>,
+    probe: ShowVisibilityProbe,
+) -> Result<(), String> {
+    let prepared = {
+        let mut state = app_state.borrow_mut();
+        state.prepare_show_visibility_readback(probe)?
+    };
+
+    JsFuture::from(prepared.target_only.map_promise.clone())
+        .await
+        .map_err(|error| {
+            format!(
+                "GPU target-only show visibility readback failed: {:?}",
+                error
+            )
+        })?;
+    JsFuture::from(prepared.full_scene.map_promise.clone())
+        .await
+        .map_err(|error| {
+            format!(
+                "GPU full-scene show visibility readback failed: {:?}",
+                error
+            )
+        })?;
+
+    let target_only_rgba8 = rgba8_from_color_readback(&prepared.target_only);
+    let full_scene_rgba8 = rgba8_from_color_readback(&prepared.full_scene);
+
+    let result = count_show_visibility_probe_ratio(
+        &target_only_rgba8,
+        &prepared.target_only.pick_targets,
+        &full_scene_rgba8,
+        &prepared.full_scene.pick_targets,
+        &prepared.probe.element_ids,
+    );
+    let events = app_state
+        .borrow_mut()
+        .apply_show_visibility_probe_result(&prepared.probe, result)?;
+    dispatch_web_events(events)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rgba8_from_color_readback(readback: &WebPickColorReadback) -> Vec<u8> {
+    let mapped = readback.readback.slice(..).get_mapped_range();
+    let rgba8 = strip_padded_rows_web(
+        &mapped,
+        readback.unpadded_bytes_per_row as usize,
+        readback.padded_bytes_per_row as usize,
+        readback.region.height as usize,
+    );
+    drop(mapped);
+    readback.readback.unmap();
+    rgba8
+}
+
+#[cfg(target_arch = "wasm32")]
+fn count_show_visibility_probe_ratio(
+    target_only_rgba8: &[u8],
+    target_only_pick_targets: &[PickHit],
+    full_scene_rgba8: &[u8],
+    full_scene_pick_targets: &[PickHit],
+    target_ids: &[SemanticElementId],
+) -> ShowVisibilityProbeResult {
+    let unoccluded_target_pixels =
+        count_target_pick_pixels(target_only_rgba8, target_only_pick_targets, target_ids);
+    let visible_target_pixels =
+        count_target_pick_pixels(full_scene_rgba8, full_scene_pick_targets, target_ids);
+
+    ShowVisibilityProbeResult {
+        visible_target_pixels,
+        unoccluded_target_pixels,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn count_target_pick_pixels(
+    rgba8: &[u8],
+    pick_targets: &[PickHit],
+    target_ids: &[SemanticElementId],
+) -> usize {
+    let target_ids = target_ids.iter().collect::<HashSet<_>>();
+    let mut target_pixels = 0usize;
+
+    for pixel in rgba8.chunks_exact(4) {
+        let pick_index = decode_web_pick_index(pixel);
+        if pick_index == 0 {
+            continue;
+        }
+        let Some(target) = pick_targets.get((pick_index - 1) as usize) else {
+            continue;
+        };
+        if target_ids.contains(&target.element_id) {
+            target_pixels += 1;
+        }
+    }
+
+    target_pixels
+}
+
+#[cfg(target_arch = "wasm32")]
+fn show_visibility_probe_requires_inspection(result: ShowVisibilityProbeResult) -> bool {
+    if result.unoccluded_target_pixels < 24 {
+        return false;
+    }
+    let visible_ratio =
+        result.visible_target_pixels as f64 / result.unoccluded_target_pixels as f64;
+    visible_ratio < 0.5
+}
+
+#[cfg(target_arch = "wasm32")]
 fn dispatch_json_event(window: &Window, event_name: &str, json: &str) -> Result<(), String> {
     let detail = JSON::parse(json)
         .map_err(|error| format!("failed to parse `{event_name}` JSON: {error:?}"))?;
@@ -2714,6 +2854,41 @@ fn unproject_pick_pixel(
         return None;
     }
     Some(world.truncate() / world.w)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn bounds_corners(bounds: Bounds3) -> [DVec3; 8] {
+    [
+        DVec3::new(bounds.min.x, bounds.min.y, bounds.min.z),
+        DVec3::new(bounds.min.x, bounds.min.y, bounds.max.z),
+        DVec3::new(bounds.min.x, bounds.max.y, bounds.min.z),
+        DVec3::new(bounds.min.x, bounds.max.y, bounds.max.z),
+        DVec3::new(bounds.max.x, bounds.min.y, bounds.min.z),
+        DVec3::new(bounds.max.x, bounds.min.y, bounds.max.z),
+        DVec3::new(bounds.max.x, bounds.max.y, bounds.min.z),
+        DVec3::new(bounds.max.x, bounds.max.y, bounds.max.z),
+    ]
+}
+
+#[cfg(target_arch = "wasm32")]
+fn expand_pick_region_to_minimum(
+    region: PickRegion,
+    viewport: ViewportSize,
+    min_width: u32,
+    min_height: u32,
+) -> PickRegion {
+    let viewport = viewport.clamped();
+    let target_width = region.width.max(min_width).min(viewport.width);
+    let target_height = region.height.max(min_height).min(viewport.height);
+    let center_x = region.x.saturating_add(region.width / 2);
+    let center_y = region.y.saturating_add(region.height / 2);
+    let x = center_x
+        .saturating_sub(target_width / 2)
+        .min(viewport.width.saturating_sub(target_width));
+    let y = center_y
+        .saturating_sub(target_height / 2)
+        .min(viewport.height.saturating_sub(target_height));
+    PickRegion::rect(x, y, target_width, target_height)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2939,6 +3114,11 @@ impl WebViewerApp {
             depth_target,
             clear_color: defaults.clear_color,
             orbit,
+            camera_transition: None,
+            inspection_visual_transition: None,
+            pending_show_visibility_probe: None,
+            show_visibility_probe_generation: 0,
+            inspection_generation: 0,
             drag: DragState::default(),
             space_pan_modifier: false,
             last_pick_hits: Vec::new(),
@@ -3188,10 +3368,38 @@ impl WebViewerApp {
         let animation_window = window.clone();
         let animation_state = state.clone();
         let animation_handle = animation_frame.clone();
-        *animation_frame.borrow_mut() = Some(Closure::wrap(Box::new(move |_time: f64| {
-            if let Err(error) = animation_state.borrow_mut().render() {
-                log_viewer_error(&error);
-                return;
+        *animation_frame.borrow_mut() = Some(Closure::wrap(Box::new(move |_time_ms: f64| {
+            let advance = {
+                let mut state = animation_state.borrow_mut();
+                let advance = match state.advance_animations(js_sys::Date::now()) {
+                    Ok(advance) => advance,
+                    Err(error) => {
+                        log_viewer_error(&error);
+                        AnimationAdvance {
+                            anchor_event: None,
+                            show_visibility_probe: None,
+                        }
+                    }
+                };
+                if let Err(error) = state.render() {
+                    log_viewer_error(&error);
+                    return;
+                }
+                advance
+            };
+            if let Some(event) = advance.anchor_event {
+                if let Err(error) = event.dispatch() {
+                    log_viewer_error(&error);
+                }
+            }
+            if let Some(probe) = advance.show_visibility_probe {
+                let probe_state = animation_state.clone();
+                spawn_local(async move {
+                    if let Err(error) = run_show_visibility_probe_in_state(probe_state, probe).await
+                    {
+                        log_viewer_error(&error);
+                    }
+                });
             }
 
             if let Some(callback) = animation_handle.borrow().as_ref() {
@@ -3251,9 +3459,40 @@ struct WebViewerState {
     depth_target: DepthTarget,
     clear_color: wgpu::Color,
     orbit: OrbitCameraController,
+    camera_transition: Option<CameraTransition>,
+    inspection_visual_transition: Option<InspectionVisualTransition>,
+    pending_show_visibility_probe: Option<ShowVisibilityProbe>,
+    show_visibility_probe_generation: u64,
+    inspection_generation: u64,
     drag: DragState,
     space_pan_modifier: bool,
     last_pick_hits: Vec<PickHit>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, Debug)]
+struct CameraTransition {
+    from: Camera,
+    to: Camera,
+    started_at_ms: f64,
+    duration_ms: f64,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, Debug)]
+struct InspectionVisualTransition {
+    from_multiplier: f32,
+    to_multiplier: f32,
+    started_at_ms: f64,
+    duration_ms: f64,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Debug)]
+struct ShowVisibilityProbe {
+    generation: u64,
+    inspection_generation: u64,
+    element_ids: Vec<SemanticElementId>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -3281,6 +3520,25 @@ struct WebPickColorReadback {
     map_promise: Promise,
     unpadded_bytes_per_row: u32,
     padded_bytes_per_row: u32,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct WebShowVisibilityReadback {
+    probe: ShowVisibilityProbe,
+    target_only: WebPickColorReadback,
+    full_scene: WebPickColorReadback,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct ShowVisibilityProbeResult {
+    visible_target_pixels: usize,
+    unoccluded_target_pixels: usize,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct AnimationAdvance {
+    anchor_event: Option<DeferredWebEvent>,
+    show_visibility_probe: Option<ShowVisibilityProbe>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -3333,6 +3591,14 @@ impl WebViewerState {
         self.resource_picker.set_disabled(false);
         self.resource_picker.set_value(&resource);
         self.last_pick_hits.clear();
+        self.camera_transition = None;
+        self.inspection_visual_transition = None;
+        self.pending_show_visibility_probe = None;
+        self.show_visibility_probe_generation =
+            self.show_visibility_probe_generation.wrapping_add(1);
+        self.inspection_generation = self.inspection_generation.wrapping_add(1);
+        self.renderer
+            .set_inspection_context_alpha_multiplier(&self.queue, 1.0);
         Ok(vec![
             self.upload_runtime_scene(true)?,
             self.viewer_state_change_event("resource")?,
@@ -3392,6 +3658,7 @@ impl WebViewerState {
         self.renderer
             .upload_prepared_scene(&self.device, &self.queue, &render_scene);
         if reset_camera {
+            self.camera_transition = None;
             let camera = fit_camera_to_render_scene(&render_scene);
             self.orbit = OrbitCameraController::from_camera(camera);
             self.renderer.set_camera(&self.queue, self.orbit.camera());
@@ -3411,13 +3678,199 @@ impl WebViewerState {
         ])
     }
 
+    fn commit_show_change(
+        &mut self,
+        ids: &[SemanticElementId],
+        visibility_changed: u32,
+        inspection_changed: u32,
+    ) -> Result<Vec<DeferredWebEvent>, String> {
+        if inspection_changed > 0 {
+            self.inspection_generation = self.inspection_generation.wrapping_add(1);
+        }
+        let mut events = vec![self.upload_runtime_scene(false)?];
+        if !ids.is_empty() {
+            self.start_elements_frame_transition(ids, 360.0)?;
+            self.queue_show_visibility_probe(ids);
+        }
+        if visibility_changed > 0 || inspection_changed > 0 {
+            events.push(self.viewer_state_change_event("show")?);
+        }
+        Ok(events)
+    }
+
+    fn commit_inspection_change(
+        &mut self,
+        changed: u32,
+        mode: &str,
+    ) -> Result<Vec<DeferredWebEvent>, String> {
+        self.cancel_auto_inspection_probes();
+        let mut events = vec![self.upload_runtime_scene(false)?];
+        if changed > 0 {
+            self.start_inspection_visual_transition(mode);
+            self.start_inspection_frame_transition()?;
+            events.push(self.viewer_state_change_event("inspection")?);
+        }
+        Ok(events)
+    }
+
     fn frame_visible_scene(&mut self) -> Result<DeferredWebEvent, String> {
         let render_scene = self.runtime_scene.compose_render_scene();
         let camera = fit_camera_to_render_scene(&render_scene);
-        self.orbit = OrbitCameraController::from_camera(camera);
-        self.renderer.set_camera(&self.queue, self.orbit.camera());
+        self.start_camera_transition(camera, 320.0);
         self.refresh_status();
         self.pick_anchor_event()
+    }
+
+    fn start_elements_frame_transition(
+        &mut self,
+        ids: &[SemanticElementId],
+        duration_ms: f64,
+    ) -> Result<(), String> {
+        let Some(focus_bounds) = self.runtime_scene.bounds_for_elements(ids.iter()) else {
+            return Ok(());
+        };
+        let scene_bounds = self.runtime_scene.visible_bounds().unwrap_or(focus_bounds);
+        let camera = fit_camera_to_bounds_with_scene_context(
+            self.renderer.camera(),
+            focus_bounds,
+            scene_bounds,
+        );
+        self.start_camera_transition(camera, duration_ms);
+        Ok(())
+    }
+
+    fn start_inspection_frame_transition(&mut self) -> Result<(), String> {
+        let inspected_ids = self.runtime_scene.inspected_element_ids();
+        if inspected_ids.is_empty() {
+            self.camera_transition = None;
+            return Ok(());
+        }
+
+        let Some(focus_bounds) = self.runtime_scene.bounds_for_elements(inspected_ids.iter())
+        else {
+            return Ok(());
+        };
+        let scene_bounds = self.runtime_scene.visible_bounds().unwrap_or(focus_bounds);
+        let camera = fit_camera_to_bounds_with_scene_context(
+            self.renderer.camera(),
+            focus_bounds,
+            scene_bounds,
+        );
+        self.start_camera_transition(camera, 360.0);
+        Ok(())
+    }
+
+    fn queue_show_visibility_probe(&mut self, ids: &[SemanticElementId]) {
+        self.show_visibility_probe_generation =
+            self.show_visibility_probe_generation.wrapping_add(1);
+        self.pending_show_visibility_probe = Some(ShowVisibilityProbe {
+            generation: self.show_visibility_probe_generation,
+            inspection_generation: self.inspection_generation,
+            element_ids: ids.to_vec(),
+        });
+    }
+
+    fn ready_show_visibility_probe(&mut self) -> Option<ShowVisibilityProbe> {
+        let probe = self.pending_show_visibility_probe.as_ref()?;
+        if probe.inspection_generation != self.inspection_generation {
+            self.pending_show_visibility_probe = None;
+            return None;
+        }
+        let missing = self
+            .runtime_scene
+            .missing_stream_plan_for_elements(probe.element_ids.iter());
+        if !missing.instance_ids.is_empty() || !missing.definition_ids.is_empty() {
+            return None;
+        }
+        self.pending_show_visibility_probe.take()
+    }
+
+    fn cancel_auto_inspection_probes(&mut self) {
+        self.inspection_generation = self.inspection_generation.wrapping_add(1);
+        self.pending_show_visibility_probe = None;
+    }
+
+    fn start_camera_transition(&mut self, camera: Camera, duration_ms: f64) {
+        let start = self.renderer.camera();
+        if camera_distance(start, camera) <= 1.0e-6 {
+            self.camera_transition = None;
+            self.orbit = OrbitCameraController::from_camera(camera);
+            self.renderer.set_camera(&self.queue, camera);
+            return;
+        }
+
+        self.camera_transition = Some(CameraTransition {
+            from: start,
+            to: camera,
+            started_at_ms: self.now_ms(),
+            duration_ms: duration_ms.max(1.0),
+        });
+    }
+
+    fn start_inspection_visual_transition(&mut self, mode: &str) {
+        let from_multiplier = match mode {
+            "add" => 1.45,
+            "remove" => 1.2,
+            _ => 2.25,
+        };
+        let to_multiplier = 1.0;
+        self.inspection_visual_transition = Some(InspectionVisualTransition {
+            from_multiplier,
+            to_multiplier,
+            started_at_ms: self.now_ms(),
+            duration_ms: 300.0,
+        });
+        self.renderer
+            .set_inspection_context_alpha_multiplier(&self.queue, from_multiplier);
+    }
+
+    fn advance_animations(&mut self, time_ms: f64) -> Result<AnimationAdvance, String> {
+        let mut camera_changed = false;
+
+        if let Some(transition) = self.camera_transition {
+            let t = transition_progress(time_ms, transition.started_at_ms, transition.duration_ms);
+            let eased = ease_subtle(t);
+            let camera = interpolate_camera(transition.from, transition.to, eased);
+            self.orbit = OrbitCameraController::from_camera(camera);
+            self.renderer.set_camera(&self.queue, self.orbit.camera());
+            camera_changed = true;
+            if t >= 1.0 {
+                self.camera_transition = None;
+            }
+        }
+
+        if let Some(transition) = self.inspection_visual_transition {
+            let t = transition_progress(time_ms, transition.started_at_ms, transition.duration_ms);
+            let eased = ease_subtle(t) as f32;
+            let multiplier = transition.from_multiplier
+                + (transition.to_multiplier - transition.from_multiplier) * eased;
+            self.renderer
+                .set_inspection_context_alpha_multiplier(&self.queue, multiplier);
+            if t >= 1.0 {
+                self.inspection_visual_transition = None;
+            }
+        }
+
+        let show_visibility_probe = if self.camera_transition.is_none() {
+            self.ready_show_visibility_probe()
+        } else {
+            None
+        };
+
+        let anchor_event = if camera_changed {
+            Some(self.pick_anchor_event()?)
+        } else {
+            None
+        };
+
+        Ok(AnimationAdvance {
+            anchor_event,
+            show_visibility_probe,
+        })
+    }
+
+    fn now_ms(&self) -> f64 {
+        js_sys::Date::now()
     }
 
     fn begin_drag(
@@ -3426,6 +3879,8 @@ impl WebViewerState {
         y: f32,
         button: i16,
     ) -> (DeferredWebEvent, Option<WebOrbitPivotPickRequest>) {
+        self.camera_transition = None;
+        self.pending_show_visibility_probe = None;
         let operation = self.drag_operation_for_mouse_down(button);
         let orbit_pivot = if operation == DragOperation::Orbit {
             self.scene_bounds_orbit_anchor_at_client(x, y)
@@ -3554,6 +4009,8 @@ impl WebViewerState {
         client_x: f32,
         client_y: f32,
     ) -> Result<DeferredWebEvent, String> {
+        self.camera_transition = None;
+        self.pending_show_visibility_probe = None;
         let viewport = ViewportSize::new(self.config.width, self.config.height);
         let (_, delta_y) = wheel_delta_to_pixels(0.0, delta_y, delta_mode, viewport);
         if let Some(anchor) = self.zoom_anchor_at_client(client_x, client_y) {
@@ -3991,6 +4448,241 @@ impl WebViewerState {
         })
     }
 
+    fn prepare_show_visibility_readback(
+        &mut self,
+        probe: ShowVisibilityProbe,
+    ) -> Result<WebShowVisibilityReadback, String> {
+        let region = self.show_visibility_probe_region(&probe.element_ids);
+        let target_only =
+            self.prepare_show_visibility_color_readback(region, Some(&probe.element_ids))?;
+        let full_scene = self.prepare_show_visibility_color_readback(region, None)?;
+
+        Ok(WebShowVisibilityReadback {
+            probe,
+            target_only,
+            full_scene,
+        })
+    }
+
+    fn prepare_show_visibility_color_readback(
+        &self,
+        region: PickRegion,
+        target_ids: Option<&[SemanticElementId]>,
+    ) -> Result<WebPickColorReadback, String> {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("w web show visibility probe texture"),
+            size: wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Uint,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("w web show visibility probe texture view"),
+            ..Default::default()
+        });
+        let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("w web show visibility probe depth texture"),
+            size: wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.renderer.defaults().depth_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("w web show visibility probe depth texture view"),
+            ..Default::default()
+        });
+        let region = self.clamp_pick_region(region);
+        let unpadded_bytes_per_row = region
+            .width
+            .checked_mul(4)
+            .ok_or("show visibility probe region row is too wide")?;
+        let padded_bytes_per_row =
+            align_to_web(unpadded_bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let readback_size = u64::from(padded_bytes_per_row)
+            .checked_mul(u64::from(region.height))
+            .ok_or("show visibility probe region is too large")?;
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("w web show visibility probe readback buffer"),
+            size: readback_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("w web show visibility probe encoder"),
+            });
+        match target_ids {
+            Some(ids) => {
+                self.renderer.render_pick_region_for_elements(
+                    &self.device,
+                    &mut encoder,
+                    &view,
+                    &depth_view,
+                    ids,
+                    region,
+                );
+            }
+            None => {
+                self.renderer
+                    .render_pick_region(&mut encoder, &view, &depth_view, region);
+            }
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: region.x,
+                    y: region.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(region.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: region.width,
+                height: region.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([encoder.finish()]);
+
+        let map_promise = map_buffer_for_read_web(&readback);
+        let _ = self.device.poll(wgpu::PollType::Poll);
+
+        Ok(WebPickColorReadback {
+            region,
+            pick_targets: self.renderer.pick_targets().to_vec(),
+            readback,
+            map_promise,
+            unpadded_bytes_per_row,
+            padded_bytes_per_row,
+        })
+    }
+
+    fn show_visibility_probe_region(&self, ids: &[SemanticElementId]) -> PickRegion {
+        self.runtime_scene
+            .bounds_for_elements(ids.iter())
+            .and_then(|bounds| self.project_bounds_to_pick_region(bounds, 32))
+            .unwrap_or_else(|| PickRegion::rect(0, 0, self.config.width, self.config.height))
+    }
+
+    fn project_bounds_to_pick_region(&self, bounds: Bounds3, margin: u32) -> Option<PickRegion> {
+        let viewport = ViewportSize::new(self.config.width, self.config.height).clamped();
+        let clip_from_world = self.renderer.camera().clip_from_world(viewport);
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        let mut projected = false;
+
+        for corner in bounds_corners(bounds) {
+            let clip = clip_from_world * DVec4::new(corner.x, corner.y, corner.z, 1.0);
+            if clip.w <= f64::EPSILON {
+                continue;
+            }
+            let ndc = clip.truncate() / clip.w;
+            if ndc.z < 0.0 || ndc.z > 1.0 {
+                continue;
+            }
+            projected = true;
+            let x = ((ndc.x + 1.0) * 0.5) * f64::from(viewport.width);
+            let y = (1.0 - ((ndc.y + 1.0) * 0.5)) * f64::from(viewport.height);
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+
+        if !projected {
+            return None;
+        }
+
+        let margin = f64::from(margin);
+        let x0 = (min_x - margin)
+            .floor()
+            .clamp(0.0, f64::from(viewport.width.saturating_sub(1))) as u32;
+        let y0 = (min_y - margin)
+            .floor()
+            .clamp(0.0, f64::from(viewport.height.saturating_sub(1))) as u32;
+        let x1 = (max_x + margin)
+            .ceil()
+            .clamp(0.0, f64::from(viewport.width.saturating_sub(1))) as u32;
+        let y1 = (max_y + margin)
+            .ceil()
+            .clamp(0.0, f64::from(viewport.height.saturating_sub(1))) as u32;
+
+        let region = PickRegion::rect(
+            x0,
+            y0,
+            x1.saturating_sub(x0).saturating_add(1),
+            y1.saturating_sub(y0).saturating_add(1),
+        );
+        Some(expand_pick_region_to_minimum(region, viewport, 96, 96))
+    }
+
+    fn apply_show_visibility_probe_result(
+        &mut self,
+        probe: &ShowVisibilityProbe,
+        result: ShowVisibilityProbeResult,
+    ) -> Result<Vec<DeferredWebEvent>, String> {
+        if probe.generation != self.show_visibility_probe_generation {
+            return Ok(Vec::new());
+        }
+        if probe.inspection_generation != self.inspection_generation {
+            return Ok(Vec::new());
+        }
+
+        if show_visibility_probe_requires_inspection(result) {
+            let changed = self
+                .runtime_scene
+                .set_inspection_focus(probe.element_ids.iter()) as u32;
+            if changed == 0 {
+                return Ok(Vec::new());
+            }
+            self.start_inspection_visual_transition("replace");
+            Ok(vec![
+                self.upload_runtime_scene(false)?,
+                self.viewer_state_change_event("inspection")?,
+            ])
+        } else {
+            let changed = self.runtime_scene.clear_inspection() as u32;
+            if changed == 0 {
+                return Ok(Vec::new());
+            }
+            self.inspection_visual_transition = None;
+            self.renderer
+                .set_inspection_context_alpha_multiplier(&self.queue, 1.0);
+            Ok(vec![
+                self.upload_runtime_scene(false)?,
+                self.viewer_state_change_event("inspection")?,
+            ])
+        }
+    }
+
     fn apply_pick_hits(&mut self, hits: Vec<PickHit>) {
         self.runtime_scene.clear_selection();
         self.last_pick_hits = hits;
@@ -4395,11 +5087,17 @@ struct OrbitCameraController {
 }
 
 #[cfg(target_arch = "wasm32")]
+const MAX_ORBIT_PITCH_RADIANS: f64 = 1.48;
+
+#[cfg(target_arch = "wasm32")]
 impl OrbitCameraController {
     fn from_camera(camera: Camera) -> Self {
         let offset = camera.eye - camera.target;
         let radius = offset.length().max(0.25);
-        let pitch_radians = (offset.z / radius).clamp(-1.0, 1.0).asin();
+        let pitch_radians = (offset.z / radius)
+            .clamp(-1.0, 1.0)
+            .asin()
+            .clamp(-MAX_ORBIT_PITCH_RADIANS, MAX_ORBIT_PITCH_RADIANS);
         let yaw_radians = offset.x.atan2(-offset.y);
 
         Self {
@@ -4433,11 +5131,10 @@ impl OrbitCameraController {
 
     fn orbit_by_pixels(&mut self, dx: f32, dy: f32) {
         const ORBIT_SENSITIVITY: f64 = 0.01;
-        const MAX_PITCH: f64 = 1.52;
 
         self.yaw_radians -= f64::from(dx) * ORBIT_SENSITIVITY;
-        self.pitch_radians =
-            (self.pitch_radians + (f64::from(dy) * ORBIT_SENSITIVITY)).clamp(-MAX_PITCH, MAX_PITCH);
+        self.pitch_radians = (self.pitch_radians + (f64::from(dy) * ORBIT_SENSITIVITY))
+            .clamp(-MAX_ORBIT_PITCH_RADIANS, MAX_ORBIT_PITCH_RADIANS);
     }
 
     fn orbit_around_point_by_pixels(&mut self, dx: f32, dy: f32, pivot: DVec3) {
@@ -4446,8 +5143,10 @@ impl OrbitCameraController {
         let camera = self.camera();
         let forward = normalized_or(camera.target - camera.eye, -WORLD_FORWARD);
         let right = normalized_or(forward.cross(WORLD_UP), WORLD_RIGHT);
-        let yaw = DQuat::from_axis_angle(WORLD_UP, -(f64::from(dx) * ORBIT_SENSITIVITY));
-        let pitch = DQuat::from_axis_angle(right, -(f64::from(dy) * ORBIT_SENSITIVITY));
+        let yaw_delta = f64::from(dx) * ORBIT_SENSITIVITY;
+        let pitch_delta = self.clamped_pitch_delta(f64::from(dy) * ORBIT_SENSITIVITY);
+        let yaw = DQuat::from_axis_angle(WORLD_UP, -yaw_delta);
+        let pitch = DQuat::from_axis_angle(right, -pitch_delta);
         let rotation = yaw * pitch;
         let next_camera = Camera {
             eye: pivot + rotation * (camera.eye - pivot),
@@ -4455,6 +5154,12 @@ impl OrbitCameraController {
             ..camera
         };
         *self = Self::from_camera(next_camera);
+    }
+
+    fn clamped_pitch_delta(&self, requested_delta: f64) -> f64 {
+        let next_pitch = (self.pitch_radians + requested_delta)
+            .clamp(-MAX_ORBIT_PITCH_RADIANS, MAX_ORBIT_PITCH_RADIANS);
+        next_pitch - self.pitch_radians
     }
 
     fn pan_by_pixels(&mut self, dx: f32, dy: f32, viewport: ViewportSize) {
@@ -4522,6 +5227,24 @@ fn normalized_xy_or(vector: DVec3, fallback: DVec3) -> DVec3 {
             WORLD_FORWARD
         }
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn transition_progress(time_ms: f64, started_at_ms: f64, duration_ms: f64) -> f64 {
+    ((time_ms - started_at_ms) / duration_ms.max(1.0)).clamp(0.0, 1.0)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn ease_subtle(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn camera_distance(left: Camera, right: Camera) -> f64 {
+    left.eye.distance(right.eye)
+        + left.target.distance(right.target)
+        + (left.vertical_fov_degrees - right.vertical_fov_degrees).abs()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -4739,6 +5462,7 @@ fn populate_render_profile_picker(
 ) {
     let options = profiles
         .iter()
+        .filter(|profile| !profile.experimental)
         .map(|profile| {
             format!(
                 "<option value=\"{}\">{}</option>",
@@ -4782,6 +5506,7 @@ fn web_render_profile_descriptors(
             id: profile.id.as_str().to_string(),
             name: profile.name.to_string(),
             label: profile.label.to_string(),
+            experimental: profile.experimental,
         })
         .collect()
 }

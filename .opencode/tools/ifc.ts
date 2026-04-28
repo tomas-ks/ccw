@@ -466,7 +466,7 @@ export const elements_select = tool({
 
 export const elements_inspect = tool({
   description:
-    "Ask the host viewer to set the inspection focus to one or more renderable semantic ids, drawing those elements opaque while the surrounding scene can be x-rayed by an inspection render profile.",
+    "Ask the host viewer to update the inspection focus for one or more renderable semantic ids. Use mode replace for a new/only focus, add for additive wording like also/include/plus, and remove for subtractive wording like remove/exclude/subtract.",
   args: {
     semantic_ids: tool.schema
       .array(tool.schema.string())
@@ -476,13 +476,18 @@ export const elements_inspect = tool({
       .string()
       .optional()
       .describe("IFC resource the semantic ids came from, for example ifc/infra-road"),
+    mode: tool.schema
+      .string()
+      .optional()
+      .describe("Inspection update mode: replace, add, or remove. replace sets the focus, add preserves the current focus and adds ids, remove subtracts ids from the current focus."),
     why: tool.schema.string().optional().describe("Short reason for the viewer action"),
   },
   async execute(args) {
     const count = args.semantic_ids.length;
     const reason = args.why?.trim();
+    const mode = args.mode ?? "replace";
     return [
-      `Prepared elements.inspect for ${count} element${count === 1 ? "" : "s"}.`,
+      `Prepared elements.inspect ${mode} for ${count} element${count === 1 ? "" : "s"}.`,
       reason ? `Why: ${reason}` : null,
     ]
       .filter(Boolean)

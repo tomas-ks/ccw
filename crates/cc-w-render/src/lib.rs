@@ -195,7 +195,86 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
     let lit = 0.62 + diffuse * 0.22;
     let neutral = vec3<f32>(0.48, 0.56, 0.66);
     let tint = mix(neutral, input.material_color.xyz, 0.28) * lit;
-    return vec4<f32>(tint, 0.24);
+    return vec4<f32>(tint, 0.24 * max(lighting.factors.z, 0.0));
+}
+"#;
+
+pub const INSPECTION_CONTEXT_TINT_SHADER_WGSL: &str = r#"
+struct Camera {
+    clip_from_world : mat4x4<f32>,
+    viewport_and_profile : vec4<f32>,
+};
+
+struct Lighting {
+    light_direction : vec4<f32>,
+    factors : vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera : Camera;
+
+@group(0) @binding(1)
+var<uniform> lighting : Lighting;
+
+@group(0) @binding(2)
+var focus_mask_texture : texture_2d<u32>;
+
+struct VertexInput {
+    @location(0) position : vec3<f32>,
+    @location(1) normal : vec3<f32>,
+    @location(2) model_col0 : vec4<f32>,
+    @location(3) model_col1 : vec4<f32>,
+    @location(4) model_col2 : vec4<f32>,
+    @location(5) model_col3 : vec4<f32>,
+    @location(6) material_color : vec4<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) position : vec4<f32>,
+    @location(0) normal : vec3<f32>,
+    @location(1) material_color : vec4<f32>,
+};
+
+@vertex
+fn vs_main(input : VertexInput) -> VertexOutput {
+    var out : VertexOutput;
+    let model_from_object = mat4x4<f32>(
+        input.model_col0,
+        input.model_col1,
+        input.model_col2,
+        input.model_col3,
+    );
+    let world_position = model_from_object * vec4<f32>(input.position, 1.0);
+    out.position = camera.clip_from_world * world_position;
+    out.normal = (model_from_object * vec4<f32>(input.normal, 0.0)).xyz;
+    out.material_color = input.material_color;
+    return out;
+}
+
+fn clamped_coord(coord : vec2<i32>) -> vec2<i32> {
+    let size = vec2<i32>(
+        max(i32(camera.viewport_and_profile.x), 1),
+        max(i32(camera.viewport_and_profile.y), 1),
+    );
+    return clamp(coord, vec2<i32>(0, 0), size - vec2<i32>(1, 1));
+}
+
+fn decode_mask(pixel : vec4<u32>) -> u32 {
+    return pixel.x | (pixel.y << 8u) | (pixel.z << 16u) | (pixel.w << 24u);
+}
+
+@fragment
+fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+    let coord = vec2<i32>(floor(input.position.xy));
+    if (decode_mask(textureLoad(focus_mask_texture, clamped_coord(coord), 0)) == 0u) {
+        discard;
+    }
+
+    let diffuse = max(dot(normalize(input.normal), normalize(lighting.light_direction.xyz)), 0.0);
+    let lit = 0.68 + diffuse * 0.18;
+    let neutral = vec3<f32>(0.50, 0.58, 0.68);
+    let tint = mix(neutral, input.material_color.xyz, 0.18) * lit;
+    return vec4<f32>(tint, 0.06 * max(lighting.factors.z, 0.0));
 }
 "#;
 
@@ -946,6 +1025,50 @@ pub fn fit_camera_to_render_scene(scene: &PreparedRenderScene) -> Camera {
     fit_camera_to_bounds(scene.bounds)
 }
 
+pub fn fit_camera_to_bounds_with_scene_context(
+    current_camera: Camera,
+    focus_bounds: Bounds3,
+    scene_bounds: Bounds3,
+) -> Camera {
+    let focus_center = focus_bounds.center();
+    let focus_radius = bounds_radius(focus_bounds).max(0.05);
+    let scene_radius = bounds_radius(scene_bounds).max(focus_radius);
+    let focus_ratio = (focus_radius / scene_radius).clamp(0.0, 1.0);
+    let screen_fraction = inspection_frame_screen_fraction(focus_ratio);
+    let fov_y = current_camera.vertical_fov_degrees.to_radians();
+    let half_angle = (fov_y * screen_fraction * 0.5).clamp(0.02, fov_y * 0.45);
+    let distance = (focus_radius / half_angle.tan()).max(focus_radius * 2.0);
+    let view_direction = normalized_or(
+        current_camera.eye - current_camera.target,
+        ((WORLD_RIGHT * 0.35) - (WORLD_FORWARD * 0.95) + (WORLD_UP * 0.7)).normalize(),
+    );
+    let scene_center = scene_bounds.center();
+    let far_plane = (distance + focus_center.distance(scene_center) + scene_radius * 4.0)
+        .max(current_camera.far_plane)
+        .max(100.0);
+
+    Camera {
+        eye: focus_center + view_direction * distance,
+        target: focus_center,
+        up: current_camera.up,
+        vertical_fov_degrees: current_camera.vertical_fov_degrees,
+        near_plane: current_camera.near_plane,
+        far_plane,
+    }
+}
+
+pub fn interpolate_camera(start: Camera, end: Camera, t: f64) -> Camera {
+    let t = t.clamp(0.0, 1.0);
+    Camera {
+        eye: start.eye.lerp(end.eye, t),
+        target: start.target.lerp(end.target, t),
+        up: normalized_or(start.up.lerp(end.up, t), WORLD_UP),
+        vertical_fov_degrees: lerp_f64(start.vertical_fov_degrees, end.vertical_fov_degrees, t),
+        near_plane: lerp_f64(start.near_plane, end.near_plane, t),
+        far_plane: lerp_f64(start.far_plane, end.far_plane, t),
+    }
+}
+
 pub fn pick_prepared_scene_cpu(
     scene: &PreparedRenderScene,
     camera: Camera,
@@ -1254,6 +1377,28 @@ fn fit_camera_to_min_max(min: DVec3, max: DVec3) -> Camera {
     }
 }
 
+fn bounds_radius(bounds: Bounds3) -> f64 {
+    (bounds.max - bounds.min).length().max(1.0e-6) * 0.5
+}
+
+fn inspection_frame_screen_fraction(focus_to_scene_radius: f64) -> f64 {
+    let t = ((focus_to_scene_radius - 0.05) / 0.45).clamp(0.0, 1.0);
+    let smooth = t * t * (3.0 - 2.0 * t);
+    0.25 + smooth * 0.5
+}
+
+fn lerp_f64(start: f64, end: f64, t: f64) -> f64 {
+    start + (end - start) * t
+}
+
+fn normalized_or(vector: DVec3, fallback: DVec3) -> DVec3 {
+    if vector.length_squared() > 1.0e-12 {
+        vector.normalize()
+    } else {
+        fallback
+    }
+}
+
 pub trait RenderBackend {
     fn upload(&mut self, mesh: &PreparedMesh) -> UploadedMesh;
     fn uploads(&self) -> &[UploadedMesh];
@@ -1334,7 +1479,7 @@ struct LightingUniform {
 }
 
 impl LightingUniform {
-    fn from_defaults(defaults: RenderDefaults) -> Self {
+    fn from_defaults(defaults: RenderDefaults, inspection_context_alpha_multiplier: f32) -> Self {
         let direction = resolved_light_direction(defaults.directional_light.direction);
 
         Self {
@@ -1342,7 +1487,7 @@ impl LightingUniform {
             factors: [
                 defaults.directional_light.ambient,
                 defaults.directional_light.diffuse_intensity,
-                0.0,
+                inspection_context_alpha_multiplier.max(0.0),
                 0.0,
             ],
         }
@@ -1382,6 +1527,7 @@ struct GpuInstanceBatch {
     instance_buffer: wgpu::Buffer,
     instance_count: u32,
     render_layer: RenderLayer,
+    instances: Vec<GpuInstance>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1627,6 +1773,7 @@ pub struct MeshRenderer {
     pipeline: wgpu::RenderPipeline,
     architectural_pipeline: wgpu::RenderPipeline,
     inspection_context_pipeline: wgpu::RenderPipeline,
+    inspection_context_tint_pipeline: wgpu::RenderPipeline,
     surface_decal_pipeline: wgpu::RenderPipeline,
     architectural_surface_decal_pipeline: wgpu::RenderPipeline,
     reference_grid_pipeline: wgpu::RenderPipeline,
@@ -1634,14 +1781,16 @@ pub struct MeshRenderer {
     ssao_pipeline: wgpu::RenderPipeline,
     edge_pipeline: wgpu::RenderPipeline,
     crease_edge_pipeline: wgpu::RenderPipeline,
+    focus_mask_pipeline: wgpu::RenderPipeline,
     outline_id_pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
     pick_pipeline: wgpu::RenderPipeline,
     pick_surface_decal_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
-    _lighting_buffer: wgpu::Buffer,
+    lighting_buffer: wgpu::Buffer,
     scene_bind_group: wgpu::BindGroup,
     outline_bind_group_layout: wgpu::BindGroupLayout,
+    inspection_tint_bind_group_layout: wgpu::BindGroupLayout,
     ssao_bind_group_layout: wgpu::BindGroupLayout,
     outline_targets: ScreenSpaceOutlineTargets,
     ssao_targets: ScreenSpaceAmbientOcclusionTargets,
@@ -1649,6 +1798,7 @@ pub struct MeshRenderer {
     camera: Camera,
     defaults: RenderDefaults,
     profile: RenderProfileId,
+    inspection_context_alpha_multiplier: f32,
     reference_grid_visible: bool,
     reference_grid_vertex_buffer: Option<wgpu::Buffer>,
     reference_grid_vertex_count: u32,
@@ -1687,11 +1837,13 @@ impl MeshRenderer {
             contents: bytes_of(&camera_uniform),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let lighting_uniform = LightingUniform::from_defaults(defaults);
+        let inspection_context_alpha_multiplier = 1.0;
+        let lighting_uniform =
+            LightingUniform::from_defaults(defaults, inspection_context_alpha_multiplier);
         let lighting_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("w lighting buffer"),
             contents: bytes_of(&lighting_uniform),
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         let scene_bind_group_layout =
@@ -1734,11 +1886,53 @@ impl MeshRenderer {
                 },
             ],
         });
+        let inspection_tint_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("w inspection context tint bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Uint,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                ],
+            });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("w mesh pipeline layout"),
             bind_group_layouts: &[Some(&scene_bind_group_layout)],
             immediate_size: 0,
         });
+        let inspection_tint_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("w inspection context tint pipeline layout"),
+                bind_group_layouts: &[Some(&inspection_tint_bind_group_layout)],
+                immediate_size: 0,
+            });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("w basic mesh shader"),
             source: wgpu::ShaderSource::Wgsl(BASIC_MESH_SHADER_WGSL.into()),
@@ -1751,6 +1945,11 @@ impl MeshRenderer {
             label: Some("w inspection context mesh shader"),
             source: wgpu::ShaderSource::Wgsl(INSPECTION_CONTEXT_MESH_SHADER_WGSL.into()),
         });
+        let inspection_context_tint_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("w inspection context tint shader"),
+                source: wgpu::ShaderSource::Wgsl(INSPECTION_CONTEXT_TINT_SHADER_WGSL.into()),
+            });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("w mesh pipeline"),
             layout: Some(&pipeline_layout),
@@ -1859,6 +2058,46 @@ impl MeshRenderer {
                 multisample: wgpu::MultisampleState::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &inspection_context_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        let inspection_context_tint_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("w inspection context tint mesh pipeline"),
+                layout: Some(&inspection_tint_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &inspection_context_tint_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[GpuVertex::layout(), GpuInstance::layout()],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: defaults.front_face,
+                    cull_mode: defaults.cull_mode,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: defaults.depth_format,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(defaults.depth_compare),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &inspection_context_tint_shader,
                     entry_point: Some("fs_main"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     targets: &[Some(wgpu::ColorTargetState {
@@ -2327,6 +2566,45 @@ impl MeshRenderer {
             label: Some("w pick mesh shader"),
             source: wgpu::ShaderSource::Wgsl(PICK_MESH_SHADER_WGSL.into()),
         });
+        let focus_mask_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("w inspection focus mask mesh pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &pick_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[GpuVertex::layout(), GpuInstance::layout()],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: defaults.front_face,
+                cull_mode: defaults.cull_mode,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: defaults.depth_format,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(depth_compare_equal_variant(defaults.depth_compare)),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &pick_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: SCREEN_SPACE_OBJECT_ID_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let pick_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("w pick mesh pipeline"),
             layout: Some(&pipeline_layout),
@@ -2411,6 +2689,7 @@ impl MeshRenderer {
             pipeline,
             architectural_pipeline,
             inspection_context_pipeline,
+            inspection_context_tint_pipeline,
             surface_decal_pipeline,
             architectural_surface_decal_pipeline,
             reference_grid_pipeline,
@@ -2418,14 +2697,16 @@ impl MeshRenderer {
             ssao_pipeline,
             edge_pipeline,
             crease_edge_pipeline,
+            focus_mask_pipeline,
             outline_id_pipeline,
             outline_pipeline,
             pick_pipeline,
             pick_surface_decal_pipeline,
             camera_buffer,
-            _lighting_buffer: lighting_buffer,
+            lighting_buffer,
             scene_bind_group,
             outline_bind_group_layout,
+            inspection_tint_bind_group_layout,
             ssao_bind_group_layout,
             outline_targets: ScreenSpaceOutlineTargets::new(device, viewport),
             ssao_targets: ScreenSpaceAmbientOcclusionTargets::new(device, viewport),
@@ -2433,6 +2714,7 @@ impl MeshRenderer {
             camera,
             defaults,
             profile: RenderProfileId::Bim,
+            inspection_context_alpha_multiplier,
             reference_grid_visible: false,
             reference_grid_vertex_buffer: None,
             reference_grid_vertex_count: 0,
@@ -2668,6 +2950,7 @@ impl MeshRenderer {
             instance_buffer,
             instance_count: instances.len() as u32,
             render_layer,
+            instances: instances.to_vec(),
         });
     }
 
@@ -2701,6 +2984,15 @@ impl MeshRenderer {
 
     pub fn set_profile(&mut self, profile: RenderProfileId) {
         self.profile = profile;
+    }
+
+    pub fn set_inspection_context_alpha_multiplier(
+        &mut self,
+        queue: &wgpu::Queue,
+        multiplier: f32,
+    ) {
+        self.inspection_context_alpha_multiplier = multiplier.max(0.0);
+        self.update_lighting(queue);
     }
 
     pub fn reference_grid_visible(&self) -> bool {
@@ -2769,12 +3061,12 @@ impl MeshRenderer {
             return;
         }
 
-        let inspection_profile = self.profile == RenderProfileId::Bim;
+        let inspection_profile = self.profile == RenderProfileId::Architectural;
         let needs_depth_sampling = matches!(
             self.profile,
-            RenderProfileId::ArchitecturalV2
+            RenderProfileId::Bim
                 | RenderProfileId::ArchitecturalV3
-                | RenderProfileId::Bim
+                | RenderProfileId::Architectural
                 | RenderProfileId::ArchitecturalV4
         ) && device.is_some();
         {
@@ -2867,9 +3159,16 @@ impl MeshRenderer {
             }
             if matches!(
                 self.profile,
-                RenderProfileId::ArchitecturalV3 | RenderProfileId::Bim
+                RenderProfileId::ArchitecturalV3 | RenderProfileId::Architectural
             ) {
                 self.draw_mesh_crease_edges(&mut pass);
+            }
+        }
+
+        if inspection_profile {
+            if let Some(device) = device {
+                self.render_inspection_focus_mask(encoder, depth_target);
+                self.render_inspection_context_tint(device, encoder, target, depth_target);
             }
         }
 
@@ -2916,7 +3215,7 @@ impl MeshRenderer {
         pass: &mut wgpu::RenderPass<'pass>,
         pipeline: &'pass wgpu::RenderPipeline,
     ) {
-        let inspection_profile = self.profile == RenderProfileId::Bim;
+        let inspection_profile = self.profile == RenderProfileId::Architectural;
         pass.set_pipeline(pipeline);
         for batch in self
             .instance_batches
@@ -2964,6 +3263,116 @@ impl MeshRenderer {
         });
         pass.set_bind_group(0, &self.scene_bind_group, &[]);
         self.draw_mesh_crease_edges(&mut pass);
+    }
+
+    fn render_inspection_focus_mask(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        depth_target: &wgpu::TextureView,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("w inspection focus mask pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.outline_targets.object_id_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_target,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.focus_mask_pipeline);
+        pass.set_bind_group(0, &self.scene_bind_group, &[]);
+
+        for batch in self
+            .instance_batches
+            .iter()
+            .filter(|batch| batch.render_layer.draws_as_opaque(true))
+        {
+            let mesh = &self.meshes[batch.mesh_index];
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
+            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
+        }
+    }
+
+    fn render_inspection_context_tint(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        depth_target: &wgpu::TextureView,
+    ) {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("w inspection context tint bind group"),
+            layout: &self.inspection_tint_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.lighting_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(
+                        &self.outline_targets.object_id_view,
+                    ),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("w inspection context tint pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_target,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.inspection_context_tint_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+
+        for batch in self
+            .instance_batches
+            .iter()
+            .filter(|batch| batch.render_layer.draws_as_inspection_context())
+        {
+            let mesh = &self.meshes[batch.mesh_index];
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
+            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
+        }
     }
 
     fn render_normal_buffer(
@@ -3092,7 +3501,7 @@ impl MeshRenderer {
         pass.set_pipeline(&self.outline_id_pipeline);
         pass.set_bind_group(0, &self.scene_bind_group, &[]);
 
-        let inspection_profile = self.profile == RenderProfileId::Bim;
+        let inspection_profile = self.profile == RenderProfileId::Architectural;
         for batch in self
             .instance_batches
             .iter()
@@ -3205,6 +3614,104 @@ impl MeshRenderer {
         pass.set_pipeline(&self.pick_surface_decal_pipeline);
         for batch in self
             .instance_batches
+            .iter()
+            .filter(|batch| batch.render_layer.picks_as_surface_decal())
+        {
+            let mesh = &self.meshes[batch.mesh_index];
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
+            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
+        }
+
+        Some(region)
+    }
+
+    pub fn render_pick_region_for_elements(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        depth_target: &wgpu::TextureView,
+        element_ids: &[SemanticElementId],
+        region: PickRegion,
+    ) -> Option<PickRegion> {
+        let region = clamp_pick_region(region, self.viewport)?;
+        let element_ids = element_ids.iter().collect::<HashSet<_>>();
+
+        let filtered_batches = self
+            .instance_batches
+            .iter()
+            .filter_map(|batch| {
+                let instances = batch
+                    .instances
+                    .iter()
+                    .copied()
+                    .filter(|instance| {
+                        self.pick_targets
+                            .get(instance.pick_index.saturating_sub(1) as usize)
+                            .is_some_and(|target| element_ids.contains(&target.element_id))
+                    })
+                    .collect::<Vec<_>>();
+                if instances.is_empty() {
+                    return None;
+                }
+                let instance_buffer =
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("w filtered pick instance buffer"),
+                        contents: cast_slice(&instances),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                Some(GpuInstanceBatch {
+                    mesh_index: batch.mesh_index,
+                    instance_buffer,
+                    instance_count: instances.len() as u32,
+                    render_layer: batch.render_layer,
+                    instances,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("w filtered pick mesh pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_target,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(self.defaults.depth_clear_value),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_scissor_rect(region.x, region.y, region.width, region.height);
+        pass.set_pipeline(&self.pick_pipeline);
+        pass.set_bind_group(0, &self.scene_bind_group, &[]);
+
+        for batch in filtered_batches
+            .iter()
+            .filter(|batch| batch.render_layer.picks_as_opaque())
+        {
+            let mesh = &self.meshes[batch.mesh_index];
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
+            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
+        }
+
+        pass.set_pipeline(&self.pick_surface_decal_pipeline);
+        for batch in filtered_batches
             .iter()
             .filter(|batch| batch.render_layer.picks_as_surface_decal())
         {
@@ -3354,6 +3861,12 @@ impl MeshRenderer {
     fn update_camera(&self, queue: &wgpu::Queue) {
         let uniform = CameraUniform::from_camera(self.camera, self.viewport);
         queue.write_buffer(&self.camera_buffer, 0, bytes_of(&uniform));
+    }
+
+    fn update_lighting(&self, queue: &wgpu::Queue) {
+        let uniform =
+            LightingUniform::from_defaults(self.defaults, self.inspection_context_alpha_multiplier);
+        queue.write_buffer(&self.lighting_buffer, 0, bytes_of(&uniform));
     }
 }
 
@@ -3521,9 +4034,9 @@ fn uses_architectural_surface_lighting(profile: RenderProfileId) -> bool {
     matches!(
         profile,
         RenderProfileId::ArchitecturalV1
-            | RenderProfileId::ArchitecturalV2
-            | RenderProfileId::ArchitecturalV3
             | RenderProfileId::Bim
+            | RenderProfileId::ArchitecturalV3
+            | RenderProfileId::Architectural
             | RenderProfileId::ArchitecturalV4
     )
 }
@@ -3531,9 +4044,9 @@ fn uses_architectural_surface_lighting(profile: RenderProfileId) -> bool {
 fn uses_screen_space_outline(profile: RenderProfileId) -> bool {
     matches!(
         profile,
-        RenderProfileId::ArchitecturalV2
+        RenderProfileId::Bim
             | RenderProfileId::ArchitecturalV3
-            | RenderProfileId::Bim
+            | RenderProfileId::Architectural
             | RenderProfileId::ArchitecturalV4
     )
 }
@@ -3883,6 +4396,45 @@ mod tests {
     }
 
     #[test]
+    fn focused_camera_uses_smaller_screen_fraction_for_tiny_targets() {
+        let current = Camera::default();
+        let scene_bounds = Bounds3::from_points(&[
+            DVec3::new(-50.0, -50.0, -10.0),
+            DVec3::new(50.0, 50.0, 30.0),
+        ])
+        .expect("scene bounds");
+        let tiny_bounds =
+            Bounds3::from_points(&[DVec3::ZERO, DVec3::new(1.0, 1.0, 1.0)]).expect("tiny bounds");
+        let large_bounds =
+            Bounds3::from_points(&[DVec3::new(-35.0, -35.0, -8.0), DVec3::new(35.0, 35.0, 24.0)])
+                .expect("large bounds");
+
+        let tiny_camera =
+            fit_camera_to_bounds_with_scene_context(current, tiny_bounds, scene_bounds);
+        let large_camera =
+            fit_camera_to_bounds_with_scene_context(current, large_bounds, scene_bounds);
+
+        assert!(inspection_frame_screen_fraction(0.01) < 0.26);
+        assert!(inspection_frame_screen_fraction(0.75) > 0.74);
+        assert_eq!(tiny_camera.target, tiny_bounds.center());
+        assert_eq!(large_camera.target, large_bounds.center());
+    }
+
+    #[test]
+    fn camera_interpolation_keeps_endpoints_stable() {
+        let start = Camera::default();
+        let end = Camera {
+            eye: DVec3::new(10.0, -2.0, 4.0),
+            target: DVec3::new(3.0, 1.0, 2.0),
+            far_plane: 250.0,
+            ..start
+        };
+
+        assert_eq!(interpolate_camera(start, end, 0.0), start);
+        assert_eq!(interpolate_camera(start, end, 1.0), end);
+    }
+
+    #[test]
     fn render_classes_control_architectural_edge_overlay_by_edge_kind() {
         let physical = GpuInstance::from_instance(
             DMat4::IDENTITY,
@@ -3986,13 +4538,13 @@ mod tests {
         assert!(uses_architectural_surface_lighting(
             RenderProfileId::ArchitecturalV1
         ));
-        assert!(uses_architectural_surface_lighting(
-            RenderProfileId::ArchitecturalV2
-        ));
+        assert!(uses_architectural_surface_lighting(RenderProfileId::Bim));
         assert!(uses_architectural_surface_lighting(
             RenderProfileId::ArchitecturalV3
         ));
-        assert!(uses_architectural_surface_lighting(RenderProfileId::Bim));
+        assert!(uses_architectural_surface_lighting(
+            RenderProfileId::Architectural
+        ));
         assert!(uses_architectural_surface_lighting(
             RenderProfileId::ArchitecturalV4
         ));
@@ -4473,9 +5025,9 @@ mod tests {
             renderer.set_reference_grid_visible(true);
 
             for profile in [
-                RenderProfileId::ArchitecturalV2,
-                RenderProfileId::ArchitecturalV3,
                 RenderProfileId::Bim,
+                RenderProfileId::ArchitecturalV3,
+                RenderProfileId::Architectural,
                 RenderProfileId::ArchitecturalV4,
             ] {
                 renderer.set_profile(profile);

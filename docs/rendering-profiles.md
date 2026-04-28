@@ -8,19 +8,24 @@ Profiles let us experiment with different presentation styles without changing m
 streaming, selection ownership, picking identity, or IFC semantics. The same project, runtime scene,
 camera, visibility overrides, and resident geometry should be drawable through multiple profiles.
 
-The first profiles are:
+The stable user-facing profiles are:
 
 - `diffuse`: the current baseline renderer
+- `bim`: the default lightweight BIM renderer, based on the old `architectural-v2` screen-space
+  outline profile
+- `architectural`: the richer architectural renderer, based on the old `bim` inspection-capable
+  profile
+
+The older numbered styles are retained as experimental comparison profiles:
+
 - `architectural-v1`: solid shaded geometry plus geometry-derived crease and boundary lines
-- `architectural-v2`: solid shaded geometry plus screen-space depth and object-id outlines
 - `architectural-v3`: solid shaded geometry plus screen-space outlines and selective crease lines
-- `bim`: the default BIM presentation profile, based on `architectural-v3` plus opaque inspection
-  focus and x-ray context geometry
 - `architectural-v4`: experimental `architectural-v3` plus normal-aware screen-space ambient
   occlusion
 
-Later experimental profiles may include normal-buffer edges, hidden-line views, analysis colors, or
-other technical illustration styles.
+The old `architectural-v2` name remains accepted as a compatibility alias for `bim`. The old
+`architectural-v3-inspection` and `architectural-v3-inspect` names remain accepted as compatibility
+aliases for `architectural`.
 
 ## Ownership
 
@@ -98,9 +103,10 @@ Crease edges are triangle edges shared by two triangles whose adjacent face norm
 the profile threshold. The initial threshold should be conservative, around 30 degrees, and kept as a
 profile parameter so it can be tuned without changing the geometry payload contract.
 
-### `architectural-v2`
+### `bim`
 
-The second architectural experiment.
+The default lightweight BIM presentation profile. It started as `architectural-v2`, and that old
+profile name remains accepted as a compatibility alias.
 
 Pass stack:
 
@@ -120,6 +126,9 @@ should promote this to an explicit `outline_group_id` carried by the prepared in
 
 Picking remains profile-independent. The profile's object-id target is presentation-only and does
 not replace the ID-color pick pass.
+
+This profile is the default for the web app and the renderer because it is lighter than the richer
+architectural inspection profile and has proven good enough for bridge-scale work.
 
 ### `architectural-v3`
 
@@ -147,9 +156,10 @@ The architectural profiles intentionally use a softer matte surface shader than 
 directional light is still present, but dark-facing surfaces keep a stronger ambient fill so models
 read more like architectural presentation geometry and less like game-lit assets.
 
-### `bim`
+### `architectural`
 
-The default BIM presentation profile. It started as `architectural-v3-inspection`, and that old
+The richer architectural presentation profile. It started as `bim`, and the old
+`architectural-v3-inspection` and `architectural-v3-inspect`
 profile name remains accepted as a compatibility alias.
 
 Inspection is runtime render state, similar to selection. It does not change geometry residency,
@@ -171,9 +181,8 @@ Pass stack:
 5. Visible object-id pass for normal/focused geometry.
 6. Fullscreen screen-space outline pass that samples final depth and visible object id.
 
-This profile is the default for the web app and the renderer. `architectural-v3` remains available
-as the non-inspection architectural baseline, while `bim` is the everyday mode for semantic
-inspection workflows.
+This profile is the everyday inspection-capable architectural mode for semantic workflows. It is not
+the default because `bim` is lighter and keeps bridge navigation crisp.
 
 ### `architectural-v4`
 
@@ -231,12 +240,12 @@ The web shell should expose the same capability through the viewer bridge:
 ```js
 viewer.profile()
 viewer.profiles()
-viewer.setProfile("architectural-v4")
+viewer.setProfile("bim")
 ```
 
 The native shell should expose a profile selector because native is the rendering debug interface.
-The web shell can expose a smaller selector later, but the JS API should exist first so experiments
-can run from the console.
+The web shell exposes the stable selector (`diffuse`, `bim`, `architectural`) by default. The JS API
+may still accept experimental profile ids for comparison work.
 
 ## Adding A Profile
 
@@ -275,25 +284,26 @@ profile. The renderer should decide which passes and pipelines that profile impl
     - `diffuse` still draws the current baseline
     - `architectural-v1` draws with an additional edge pass
     - picking returns the same ids under both profiles
-11. Implement `architectural-v2` as solid shaded triangles plus screen-space outline passes:
+11. Implement `bim` as solid shaded triangles plus screen-space outline passes:
     - keep the main depth target sampleable
     - draw visible outline ids into an offscreen `Rgba8Uint` target
     - composite depth and object-id discontinuities in a fullscreen pass
     - suppress noisy object-id outlines for semantic classes such as terrain, water, vegetation
       cover, and surface decals
-12. Add render smoke coverage for `architectural-v2` so the fullscreen pass is validated by an
+12. Add render smoke coverage for `bim` so the fullscreen pass is validated by an
     actual GPU render call.
 13. Implement `architectural-v3` as the hybrid profile:
     - reuse the v2 screen-space outline stack
     - add a crease-only mesh edge pass before the fullscreen outline composite
     - keep boundary edges out of the v3 mesh pass to avoid double-drawing object boundaries
 14. Add render smoke coverage for `architectural-v3`.
-15. Implement `bim` as the default inspection-capable BIM presentation profile:
+15. Implement `architectural` as the inspection-capable architectural presentation profile:
     - add `PreparedRenderRole` to prepared render instances
     - let runtime inspection focus mark `Inspected` and `InspectionContext`
-    - draw context geometry through a translucent no-depth-write pass only in the BIM profile
+    - draw context geometry through a translucent no-depth-write pass only in the architectural
+      profile
     - keep picking profile-independent and ID-correct
-16. Add runtime and renderer smoke coverage for `bim`.
+16. Add runtime and renderer smoke coverage for `architectural`.
 17. Implement `architectural-v4` as the normal-aware SSAO profile:
     - render visible opaque geometry into a view-space normal target
     - sample normal plus reverse-Z depth in a fullscreen AO overlay

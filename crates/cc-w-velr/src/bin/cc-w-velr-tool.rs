@@ -362,6 +362,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "body-summary" => {
             let mut artifacts_root = default_ifc_artifacts_root();
             let mut model = None;
+            let mut diagnostic = false;
+            let mut brep_limit_items = None;
+            let mut write_cache = false;
+            let mut cache_diagnostic = false;
 
             while let Some(arg) = args.next() {
                 match arg.as_str() {
@@ -369,11 +373,85 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "--artifacts-root" => {
                         artifacts_root = PathBuf::from(require_value(&mut args, &arg)?)
                     }
+                    "--diagnostic" => diagnostic = true,
+                    "--limit-brep-items" => {
+                        let value = require_value(&mut args, &arg)?;
+                        brep_limit_items = Some(value.parse::<usize>().map_err(|_| {
+                            format!("--limit-brep-items must be a non-negative integer: {value}")
+                        })?)
+                    }
+                    "--write-cache" => write_cache = true,
+                    "--cache-diagnostic" => cache_diagnostic = true,
                     _ => return Err(format!("unknown option for body-summary: {arg}").into()),
                 }
             }
 
             let model = model.ok_or("body-summary requires --model <slug>")?;
+            if cache_diagnostic {
+                let diagnostic = VelrIfcModel::diagnose_body_package_cache_from_artifacts_root(
+                    &artifacts_root,
+                    &model,
+                )?;
+                println!(
+                    "geometry_cache_status: {}",
+                    diagnostic.cache_status.as_str()
+                );
+                if let Some(bytes) = diagnostic.cache_bytes {
+                    println!("cache_bytes: {bytes}");
+                }
+                if let Some(summary) = diagnostic.geometry_summary() {
+                    println!("definitions: {}", summary.definitions);
+                    println!("elements: {}", summary.elements);
+                    println!("instances: {}", summary.instances);
+                    println!("triangles: {}", summary.triangles);
+                }
+                for timing in diagnostic.timings {
+                    println!("phase.{}.ms: {}", timing.name, timing.elapsed_ms);
+                    if let Some(rows) = timing.rows {
+                        println!("phase.{}.rows: {}", timing.name, rows);
+                    }
+                }
+                return Ok(());
+            }
+            if diagnostic || brep_limit_items.is_some() || write_cache {
+                let handle = VelrIfcModel::open(IfcArtifactLayout::new(&artifacts_root, model))?;
+                let diagnostic = handle.build_body_package_diagnostic_with_cache_write(
+                    brep_limit_items,
+                    write_cache,
+                )?;
+                let summary = diagnostic.geometry_summary();
+                let colored_instances = diagnostic
+                    .instance_summaries()
+                    .into_iter()
+                    .filter(|instance| instance.display_color.is_some())
+                    .count();
+                println!("geometry_cache_status: diagnostic_uncached");
+                println!(
+                    "brep_limit_items: {}",
+                    format_optional_usize(brep_limit_items)
+                );
+                println!("definitions: {}", summary.definitions);
+                println!("elements: {}", summary.elements);
+                println!("instances: {}", summary.instances);
+                println!("colored_instances: {colored_instances}");
+                println!("triangles: {}", summary.triangles);
+                println!("brep_geometry_items: {}", diagnostic.brep.geometry_items);
+                println!("brep_geometry_faces: {}", diagnostic.brep.geometry_faces);
+                println!(
+                    "brep_geometry_point_rows: {}",
+                    diagnostic.brep.geometry_point_rows
+                );
+                println!("brep_metadata_rows: {}", diagnostic.brep.metadata_rows);
+                println!("cache_written: {}", diagnostic.cache_written);
+                for timing in diagnostic.timings {
+                    println!("phase.{}.ms: {}", timing.name, timing.elapsed_ms);
+                    if let Some(rows) = timing.rows {
+                        println!("phase.{}.rows: {}", timing.name, rows);
+                    }
+                }
+                return Ok(());
+            }
+
             let load = VelrIfcModel::load_body_package_with_cache_status_from_artifacts_root(
                 &artifacts_root,
                 &model,
@@ -508,6 +586,10 @@ fn require_value(
         .ok_or_else(|| format!("missing value for {flag}").into())
 }
 
+fn format_optional_usize(value: Option<usize>) -> String {
+    value.map_or_else(|| "all".to_string(), |value| value.to_string())
+}
+
 fn print_usage() {
     println!("cc-w-velr-tool commands:");
     println!("  list-fixtures");
@@ -526,7 +608,9 @@ fn print_usage() {
     );
     println!("  query-projects --model <slug> [--artifacts-root <path>]");
     println!("  summary --model <slug> [--artifacts-root <path>]");
-    println!("  body-summary --model <slug> [--artifacts-root <path>]");
+    println!(
+        "  body-summary --model <slug> [--artifacts-root <path>] [--diagnostic] [--limit-brep-items <n>] [--write-cache] [--cache-diagnostic]"
+    );
     println!("  body-instances --model <slug> [--artifacts-root <path>]");
     println!("  placement-summary --model <slug> [--artifacts-root <path>]");
     println!("  cypher --model <slug> --query <openCypher> [--artifacts-root <path>]");

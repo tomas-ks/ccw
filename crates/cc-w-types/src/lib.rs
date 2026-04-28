@@ -954,6 +954,8 @@ pub struct DisplayColor {
 }
 
 impl DisplayColor {
+    pub const UNSTYLED_SURFACE: Self = Self::new(0.90, 0.91, 0.89);
+
     pub const fn new(red: f32, green: f32, blue: f32) -> Self {
         Self {
             rgb: [red, green, blue],
@@ -967,7 +969,7 @@ impl DisplayColor {
 
 impl Default for DisplayColor {
     fn default() -> Self {
-        Self::new(0.2, 0.65, 0.95)
+        Self::UNSTYLED_SURFACE
     }
 }
 

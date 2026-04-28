@@ -406,7 +406,7 @@ The rendering backend on top of `wgpu`:
 - material binding model
 
 This crate consumes prepared assets and view data. It should not know about IFC or STEP semantics.
-Named rendering profiles such as `diffuse`, `architectural-v1`, and `bim` are owned here; the profile
+Named rendering profiles such as `diffuse`, `bim`, and `architectural` are owned here; the profile
 contract and implementation plan live in [rendering-profiles.md](./rendering-profiles.md).
 
 #### `cc-w-runtime`
