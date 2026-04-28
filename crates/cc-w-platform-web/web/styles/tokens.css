@@ -1,0 +1,151 @@
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --side-panel-width: 648px;
+  --terminal-height: 220px;
+  --resizer-size: 10px;
+  --radius-control: 6px;
+  --radius-panel: 8px;
+  --accent: #8db6ff;
+  --accent-strong: #6ea8fe;
+  --danger: #ffb8aa;
+  --warning: #f2c879;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-app: #24282d;
+  --surface-viewer: #24282d;
+  --surface-header: #2c3138;
+  --surface-footer: #2c3138;
+  --surface-panel: #292e34;
+  --surface-panel-strong: #22262c;
+  --surface-elevated: rgba(41, 46, 52, 0.92);
+  --surface-elevated-solid: #292e34;
+  --surface-terminal: #21252b;
+  --surface-terminal-strong: #1f2329;
+  --surface-graph: #282d34;
+  --surface-control: #222730;
+  --surface-control-hover: #343a43;
+  --surface-control-active: #3b5d8f;
+  --text-primary: #f0f1f2;
+  --text-secondary: rgba(240, 241, 242, 0.72);
+  --text-muted: rgba(240, 241, 242, 0.56);
+  --text-soft: rgba(240, 241, 242, 0.66);
+  --text-disabled: rgba(240, 241, 242, 0.34);
+  --border-subtle: rgba(255, 255, 255, 0.1);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --border-accent: rgba(100, 145, 205, 0.62);
+  --hover-accent: rgba(100, 145, 205, 0.14);
+  --shadow-panel: 0 18px 38px rgba(0, 0, 0, 0.32);
+  --viewer-clear: #24282d;
+  --terminal-foreground: #d8dce2;
+  --terminal-selection: rgba(100, 145, 205, 0.28);
+  --balloon-arrow-border: rgba(255, 255, 255, 0.13);
+  --graph-label: #e2e6ec;
+  --graph-edge: rgba(118, 158, 210, 0.5);
+  --graph-edge-size: 1.45;
+  --graph-edge-label: rgba(226, 230, 236, 0.88);
+  --graph-hover-fill: rgba(240, 241, 242, 0.11);
+  --graph-hover-panel: rgba(41, 46, 52, 0.94);
+  --graph-hover-border: rgba(100, 145, 205, 0.34);
+  --graph-node-selected: #e6ad55;
+  --graph-node-relation: #a3adb9;
+  --graph-node-spatial: #78a9de;
+  --graph-node-wall: #6fbc9d;
+  --graph-node-slab: #d9a166;
+  --graph-node-space: #b492d6;
+  --graph-node-default: #7da4c8;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --surface-app: #eff1f2;
+  --surface-viewer: #fafbfb;
+  --surface-header: #d7dadd;
+  --surface-footer: #d7dadd;
+  --surface-panel: #f0f2f3;
+  --surface-panel-strong: #e7eaec;
+  --surface-elevated: rgba(255, 255, 255, 0.9);
+  --surface-elevated-solid: #ffffff;
+  --surface-terminal: #eceff2;
+  --surface-terminal-strong: #f7f8f8;
+  --surface-graph: #f5f6f7;
+  --surface-control: #f8f9fb;
+  --surface-control-hover: #ffffff;
+  --surface-control-active: #dbe8ff;
+  --text-primary: #20242c;
+  --text-secondary: rgba(32, 36, 44, 0.74);
+  --text-muted: rgba(32, 36, 44, 0.58);
+  --text-soft: rgba(32, 36, 44, 0.66);
+  --text-disabled: rgba(32, 36, 44, 0.38);
+  --border-subtle: rgba(33, 37, 45, 0.14);
+  --border-strong: rgba(33, 37, 45, 0.2);
+  --border-accent: rgba(67, 119, 205, 0.46);
+  --hover-accent: rgba(67, 119, 205, 0.11);
+  --shadow-panel: 0 18px 42px rgba(32, 36, 44, 0.16);
+  --viewer-clear: #fafbfb;
+  --terminal-foreground: #242a34;
+  --terminal-selection: rgba(67, 119, 205, 0.2);
+  --balloon-arrow-border: rgba(33, 37, 45, 0.18);
+  --graph-label: #223044;
+  --graph-edge: rgba(48, 105, 164, 0.72);
+  --graph-edge-size: 1.85;
+  --graph-edge-label: rgba(28, 42, 62, 0.82);
+  --graph-hover-fill: rgba(76, 112, 150, 0.1);
+  --graph-hover-panel: rgba(255, 255, 255, 0.92);
+  --graph-hover-border: rgba(76, 112, 150, 0.28);
+  --graph-node-selected: #c79a3e;
+  --graph-node-relation: #9aa7b6;
+  --graph-node-spatial: #5f90c2;
+  --graph-node-wall: #5b9d8a;
+  --graph-node-slab: #b98258;
+  --graph-node-space: #8f82b5;
+  --graph-node-default: #6b8fac;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+body {
+  margin: 0;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--surface-app);
+  color: var(--text-primary);
+}
+
+body.is-resizing {
+  user-select: none;
+}
+
+body.is-resizing.horizontal {
+  cursor: row-resize;
+}
+
+body.is-resizing.vertical {
+  cursor: col-resize;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, SF Mono, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.94em;
+}

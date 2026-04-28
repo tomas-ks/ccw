@@ -8,31 +8,39 @@ type ToolContext = {
 
 const DEFAULT_SCHEMA = "IFC4X3_ADD2";
 const DEFAULT_API_BASE = "http://127.0.0.1:8001";
+const FALLBACK_API_BASES = ["http://127.0.0.1:8001", "http://localhost:8001"];
 
-function resolveViewerApiBase(apiBase?: string): string {
-  const envBase = process.env.CC_W_VIEWER_API_BASE?.trim();
-  const candidate = (apiBase ?? envBase ?? DEFAULT_API_BASE).trim();
-  if (candidate) {
-    try {
-      const url = new URL(candidate);
-      if (url.protocol === "http:" || url.protocol === "https:") {
-        return url.toString();
-      }
-    } catch {
-      // ignore invalid or relative values
-    }
+function validViewerApiBase(value?: string): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
   }
-  if (envBase) {
-    try {
-      const url = new URL(envBase);
-      if (url.protocol === "http:" || url.protocol === "https:") {
-        return url.toString();
-      }
-    } catch {
-      // ignore invalid or relative values
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol === "http:" || url.protocol === "https:") {
+      return url.toString();
     }
+  } catch {
+    // ignore invalid or relative values
   }
-  return DEFAULT_API_BASE;
+  return null;
+}
+
+function viewerApiBaseCandidates(apiBase?: string): string[] {
+  const candidates = [
+    validViewerApiBase(process.env.CC_W_VIEWER_API_BASE),
+    validViewerApiBase(apiBase),
+    ...FALLBACK_API_BASES.map(validViewerApiBase),
+  ].filter((value): value is string => Boolean(value));
+  return [...new Set(candidates)];
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function repoRoot(context: ToolContext): string {
@@ -95,36 +103,7 @@ async function runReadonlyCypher(
   why?: string,
   apiBase?: string,
 ): Promise<string> {
-  const resolvedApiBase = resolveViewerApiBase(apiBase);
-  const response = await fetch(new URL("/api/cypher", resolvedApiBase), {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      resource,
-      cypher,
-      why,
-    }),
-  });
-
-  const text = await response.text();
-  if (!response.ok) {
-    return JSON.stringify(
-      {
-        ok: false,
-        resource,
-        cypher,
-        why: why ?? null,
-        status: response.status,
-        error: text,
-      },
-      null,
-      2,
-    );
-  }
-
-  return text.trim();
+  return postViewerJson(apiBase, "/api/cypher", { resource, cypher, why });
 }
 
 async function runProjectReadonlyCypher(
@@ -135,38 +114,12 @@ async function runProjectReadonlyCypher(
   resourceFilter?: string[],
   apiBase?: string,
 ): Promise<string> {
-  const resolvedApiBase = resolveViewerApiBase(apiBase);
-  const response = await fetch(new URL("/api/cypher", resolvedApiBase), {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      resource: projectResource,
-      cypher,
-      why,
-      resourceFilter: resourceFilter ?? [],
-    }),
+  return postViewerJson(apiBase, "/api/cypher", {
+    resource: projectResource,
+    cypher,
+    why,
+    resourceFilter: resourceFilter ?? [],
   });
-
-  const text = await response.text();
-  if (!response.ok) {
-    return JSON.stringify(
-      {
-        ok: false,
-        resource: projectResource,
-        cypher,
-        why: why ?? null,
-        resourceFilter: resourceFilter ?? [],
-        status: response.status,
-        error: text,
-      },
-      null,
-      2,
-    );
-  }
-
-  return text.trim();
 }
 
 async function postViewerJson(
@@ -174,30 +127,52 @@ async function postViewerJson(
   path: string,
   body: Record<string, unknown>,
 ): Promise<string> {
-  const resolvedApiBase = resolveViewerApiBase(apiBase);
-  const response = await fetch(new URL(path, resolvedApiBase), {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+  const bases = viewerApiBaseCandidates(apiBase);
+  const failures: string[] = [];
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    for (const base of bases) {
+      try {
+        const response = await fetch(new URL(path, base), {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(body),
+        });
 
-  const text = await response.text();
-  if (!response.ok) {
-    return JSON.stringify(
-      {
-        ok: false,
-        path,
-        status: response.status,
-        error: text,
-      },
-      null,
-      2,
-    );
+        const text = await response.text();
+        if (!response.ok) {
+          return JSON.stringify(
+            {
+              ok: false,
+              path,
+              base,
+              status: response.status,
+              error: text,
+            },
+            null,
+            2,
+          );
+        }
+
+        return text.trim();
+      } catch (error) {
+        failures.push(`${base}: ${errorMessage(error)}`);
+      }
+    }
+    await sleep(80 * (attempt + 1));
   }
 
-  return text.trim();
+  return JSON.stringify(
+    {
+      ok: false,
+      path,
+      error: "viewer API connection failed",
+      tried: failures,
+    },
+    null,
+    2,
+  );
 }
 
 export const schema_context = tool({

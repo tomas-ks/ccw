@@ -1533,9 +1533,9 @@ fn map_geometry_backend_error(error: GeometryBackendError) -> GeometryPackageSou
 use cc_w_backend::available_demo_resources;
 #[cfg(target_arch = "wasm32")]
 use cc_w_render::{
-    Camera, DepthTarget, MeshRenderer, RenderDefaults, RenderProfileDescriptor, RenderProfileId,
-    ViewportSize, fit_camera_to_bounds_with_scene_context, fit_camera_to_render_scene,
-    interpolate_camera, pick_prepared_scene_cpu,
+    Camera, DepthTarget, MeshRenderer, PICK_DEPTH_BITS_FORMAT, PICK_INDEX_FORMAT, RenderDefaults,
+    RenderProfileDescriptor, RenderProfileId, ViewportSize, fit_camera_to_bounds_with_scene_context,
+    fit_camera_to_render_scene, interpolate_camera,
 };
 #[cfg(target_arch = "wasm32")]
 use cc_w_types::{
@@ -2510,7 +2510,7 @@ async fn pick_region_in_state(
         .map_err(|error| format!("GPU pick readback failed: {:?}", error))?;
 
     let mapped = prepared.readback.slice(..).get_mapped_range();
-    let rgba8 = strip_padded_rows_web(
+    let pick_index_bytes = strip_padded_rows_web(
         &mapped,
         prepared.unpadded_bytes_per_row as usize,
         prepared.padded_bytes_per_row as usize,
@@ -2519,39 +2519,29 @@ async fn pick_region_in_state(
     drop(mapped);
     prepared.readback.unmap();
 
-    JsFuture::from(prepared.depth_map_promise)
+    JsFuture::from(prepared.depth_bits_map_promise)
         .await
-        .map_err(|error| format!("GPU pick depth readback failed: {:?}", error))?;
+        .map_err(|error| format!("GPU pick depth-bits readback failed: {:?}", error))?;
 
-    let depth_mapped = prepared.depth_readback.slice(..).get_mapped_range();
-    let depth_bytes = strip_padded_rows_web(
-        &depth_mapped,
-        prepared.depth_unpadded_bytes_per_row as usize,
-        prepared.depth_padded_bytes_per_row as usize,
+    let depth_bits_mapped = prepared.depth_bits_readback.slice(..).get_mapped_range();
+    let depth_bits_bytes = strip_padded_rows_web(
+        &depth_bits_mapped,
+        prepared.depth_bits_unpadded_bytes_per_row as usize,
+        prepared.depth_bits_padded_bytes_per_row as usize,
         prepared.region.height as usize,
     );
-    drop(depth_mapped);
-    prepared.depth_readback.unmap();
-    let depth_values = depth32_values_from_bytes(&depth_bytes)?;
+    drop(depth_bits_mapped);
+    prepared.depth_bits_readback.unmap();
+    let depth_bits = u32_values_from_bytes(&depth_bits_bytes, "pick depth-bits readback")?;
 
-    let mut result = decode_pick_pixels_with_depth(
+    let result = decode_pick_pixels_with_depth_bits(
         prepared.region,
-        &rgba8,
+        &pick_index_bytes,
         &prepared.pick_targets,
-        &depth_values,
+        &depth_bits,
         prepared.clip_from_world,
         ViewportSize::new(prepared.viewport_width, prepared.viewport_height),
     );
-    if result.hits.is_empty() {
-        let state = app_state.borrow();
-        let render_scene = interactive_pick_scene(&state.runtime_scene.compose_render_scene());
-        result = pick_prepared_scene_cpu(
-            &render_scene,
-            state.renderer.camera(),
-            ViewportSize::new(prepared.viewport_width, prepared.viewport_height),
-            prepared.region,
-        );
-    }
     let json = web_pick_response_json(prepared.region, &result.hits)?;
 
     let anchor_json = {
@@ -2601,7 +2591,7 @@ async fn update_orbit_pivot_from_gpu_pick(
 ) -> Result<(), String> {
     let prepared = {
         let mut state = app_state.borrow_mut();
-        state.prepare_pick_color_readback(request.request)?
+        state.prepare_pick_readback(request.request)?
     };
 
     JsFuture::from(prepared.map_promise)
@@ -2609,7 +2599,7 @@ async fn update_orbit_pivot_from_gpu_pick(
         .map_err(|error| format!("GPU orbit pivot pick readback failed: {:?}", error))?;
 
     let mapped = prepared.readback.slice(..).get_mapped_range();
-    let rgba8 = strip_padded_rows_web(
+    let pick_index_bytes = strip_padded_rows_web(
         &mapped,
         prepared.unpadded_bytes_per_row as usize,
         prepared.padded_bytes_per_row as usize,
@@ -2618,16 +2608,37 @@ async fn update_orbit_pivot_from_gpu_pick(
     drop(mapped);
     prepared.readback.unmap();
 
-    let hit = decode_pick_pixels_without_depth(prepared.region, &rgba8, &prepared.pick_targets)
-        .first_hit()
-        .cloned();
+    JsFuture::from(prepared.depth_bits_map_promise)
+        .await
+        .map_err(|error| format!("GPU orbit pivot depth-bits readback failed: {:?}", error))?;
+    let depth_bits_mapped = prepared.depth_bits_readback.slice(..).get_mapped_range();
+    let depth_bits_bytes = strip_padded_rows_web(
+        &depth_bits_mapped,
+        prepared.depth_bits_unpadded_bytes_per_row as usize,
+        prepared.depth_bits_padded_bytes_per_row as usize,
+        prepared.region.height as usize,
+    );
+    drop(depth_bits_mapped);
+    prepared.depth_bits_readback.unmap();
+    let depth_bits = u32_values_from_bytes(&depth_bits_bytes, "orbit pivot depth-bits readback")?;
+
+    let hit = decode_pick_pixels_with_depth_bits(
+        prepared.region,
+        &pick_index_bytes,
+        &prepared.pick_targets,
+        &depth_bits,
+        prepared.clip_from_world,
+        ViewportSize::new(prepared.viewport_width, prepared.viewport_height),
+    )
+    .first_hit()
+    .cloned();
     let Some(hit) = hit else {
         return Ok(());
     };
 
     app_state
         .borrow_mut()
-        .apply_orbit_pivot_pick(request.drag_generation, hit.world_centroid);
+        .apply_orbit_pivot_pick(request.drag_generation, hit.world_anchor);
     Ok(())
 }
 
@@ -2658,13 +2669,13 @@ async fn run_show_visibility_probe_in_state(
             )
         })?;
 
-    let target_only_rgba8 = rgba8_from_color_readback(&prepared.target_only);
-    let full_scene_rgba8 = rgba8_from_color_readback(&prepared.full_scene);
+    let target_only_pick_indices = pick_index_bytes_from_color_readback(&prepared.target_only);
+    let full_scene_pick_indices = pick_index_bytes_from_color_readback(&prepared.full_scene);
 
     let result = count_show_visibility_probe_ratio(
-        &target_only_rgba8,
+        &target_only_pick_indices,
         &prepared.target_only.pick_targets,
-        &full_scene_rgba8,
+        &full_scene_pick_indices,
         &prepared.full_scene.pick_targets,
         &prepared.probe.element_ids,
     );
@@ -2675,9 +2686,9 @@ async fn run_show_visibility_probe_in_state(
 }
 
 #[cfg(target_arch = "wasm32")]
-fn rgba8_from_color_readback(readback: &WebPickColorReadback) -> Vec<u8> {
+fn pick_index_bytes_from_color_readback(readback: &WebPickColorReadback) -> Vec<u8> {
     let mapped = readback.readback.slice(..).get_mapped_range();
-    let rgba8 = strip_padded_rows_web(
+    let pick_index_bytes = strip_padded_rows_web(
         &mapped,
         readback.unpadded_bytes_per_row as usize,
         readback.padded_bytes_per_row as usize,
@@ -2685,21 +2696,21 @@ fn rgba8_from_color_readback(readback: &WebPickColorReadback) -> Vec<u8> {
     );
     drop(mapped);
     readback.readback.unmap();
-    rgba8
+    pick_index_bytes
 }
 
 #[cfg(target_arch = "wasm32")]
 fn count_show_visibility_probe_ratio(
-    target_only_rgba8: &[u8],
+    target_only_pick_indices: &[u8],
     target_only_pick_targets: &[PickHit],
-    full_scene_rgba8: &[u8],
+    full_scene_pick_indices: &[u8],
     full_scene_pick_targets: &[PickHit],
     target_ids: &[SemanticElementId],
 ) -> ShowVisibilityProbeResult {
     let unoccluded_target_pixels =
-        count_target_pick_pixels(target_only_rgba8, target_only_pick_targets, target_ids);
+        count_target_pick_pixels(target_only_pick_indices, target_only_pick_targets, target_ids);
     let visible_target_pixels =
-        count_target_pick_pixels(full_scene_rgba8, full_scene_pick_targets, target_ids);
+        count_target_pick_pixels(full_scene_pick_indices, full_scene_pick_targets, target_ids);
 
     ShowVisibilityProbeResult {
         visible_target_pixels,
@@ -2709,15 +2720,15 @@ fn count_show_visibility_probe_ratio(
 
 #[cfg(target_arch = "wasm32")]
 fn count_target_pick_pixels(
-    rgba8: &[u8],
+    pick_index_bytes: &[u8],
     pick_targets: &[PickHit],
     target_ids: &[SemanticElementId],
 ) -> usize {
     let target_ids = target_ids.iter().collect::<HashSet<_>>();
     let mut target_pixels = 0usize;
 
-    for pixel in rgba8.chunks_exact(4) {
-        let pick_index = decode_web_pick_index(pixel);
+    for pixel in pick_index_bytes.chunks_exact(4) {
+        let pick_index = decode_pick_index_u32(pixel);
         if pick_index == 0 {
             continue;
         }
@@ -2754,22 +2765,22 @@ fn dispatch_json_event(window: &Window, event_name: &str, json: &str) -> Result<
 }
 
 #[cfg(target_arch = "wasm32")]
-fn depth32_values_from_bytes(bytes: &[u8]) -> Result<Vec<f32>, String> {
+fn u32_values_from_bytes(bytes: &[u8], label: &str) -> Result<Vec<u32>, String> {
     if bytes.len() % 4 != 0 {
-        return Err("pick depth readback had a non-f32 byte length".to_string());
+        return Err(format!("{label} had a non-u32 byte length"));
     }
     Ok(bytes
         .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .map(decode_pick_index_u32)
         .collect())
 }
 
 #[cfg(target_arch = "wasm32")]
-fn decode_pick_pixels_with_depth(
+fn decode_pick_pixels_with_depth_bits(
     region: PickRegion,
-    rgba8: &[u8],
+    pick_index_bytes: &[u8],
     pick_targets: &[PickHit],
-    depth_values: &[f32],
+    depth_bits: &[u32],
     clip_from_world: DMat4,
     viewport: ViewportSize,
 ) -> cc_w_types::PickResult {
@@ -2777,8 +2788,8 @@ fn decode_pick_pixels_with_depth(
     let mut hits = Vec::new();
     let world_from_clip = clip_from_world.inverse();
 
-    for (pixel_index, pixel) in rgba8.chunks_exact(4).enumerate() {
-        let pick_index = decode_web_pick_index(pixel);
+    for (pixel_index, pixel) in pick_index_bytes.chunks_exact(4).enumerate() {
+        let pick_index = decode_pick_index_u32(pixel);
         if pick_index == 0 || !seen.insert(pick_index) {
             continue;
         }
@@ -2786,7 +2797,7 @@ fn decode_pick_pixels_with_depth(
             continue;
         };
         let mut hit = target.clone();
-        if let Some(depth) = depth_values.get(pixel_index).copied() {
+        if let Some(depth) = depth_bits.get(pixel_index).copied().map(f32::from_bits) {
             if let Some(world_anchor) =
                 unproject_pick_pixel(region, pixel_index, depth, world_from_clip, viewport)
             {
@@ -2800,30 +2811,7 @@ fn decode_pick_pixels_with_depth(
 }
 
 #[cfg(target_arch = "wasm32")]
-fn decode_pick_pixels_without_depth(
-    region: PickRegion,
-    rgba8: &[u8],
-    pick_targets: &[PickHit],
-) -> cc_w_types::PickResult {
-    let mut seen = HashSet::new();
-    let mut hits = Vec::new();
-
-    for pixel in rgba8.chunks_exact(4) {
-        let pick_index = decode_web_pick_index(pixel);
-        if pick_index == 0 || !seen.insert(pick_index) {
-            continue;
-        }
-        let Some(target) = pick_targets.get((pick_index - 1) as usize) else {
-            continue;
-        };
-        hits.push(target.clone());
-    }
-
-    cc_w_types::PickResult { region, hits }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn decode_web_pick_index(pixel: &[u8]) -> u32 {
+fn decode_pick_index_u32(pixel: &[u8]) -> u32 {
     u32::from(pixel[0])
         | (u32::from(pixel[1]) << 8)
         | (u32::from(pixel[2]) << 16)
@@ -3506,10 +3494,10 @@ struct WebPickReadback {
     map_promise: Promise,
     unpadded_bytes_per_row: u32,
     padded_bytes_per_row: u32,
-    depth_readback: wgpu::Buffer,
-    depth_map_promise: Promise,
-    depth_unpadded_bytes_per_row: u32,
-    depth_padded_bytes_per_row: u32,
+    depth_bits_readback: wgpu::Buffer,
+    depth_bits_map_promise: Promise,
+    depth_bits_unpadded_bytes_per_row: u32,
+    depth_bits_padded_bytes_per_row: u32,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -4190,8 +4178,8 @@ impl WebViewerState {
         request: WebPickRequest,
     ) -> Result<WebPickReadback, String> {
         let region = self.css_pick_request_to_region(request);
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("w web pick texture"),
+        let pick_index_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("w web pick index texture"),
             size: wgpu::Extent3d {
                 width: self.config.width,
                 height: self.config.height,
@@ -4200,22 +4188,16 @@ impl WebViewerState {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Uint,
+            format: PICK_INDEX_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("w web pick texture view"),
+        let pick_index_view = pick_index_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("w web pick index texture view"),
             ..Default::default()
         });
-        let depth_format = self.renderer.defaults().depth_format;
-        if depth_format != wgpu::TextureFormat::Depth32Float {
-            return Err(format!(
-                "pick anchors require Depth32Float readback; renderer uses {depth_format:?}"
-            ));
-        }
-        let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("w web pick depth texture"),
+        let pick_depth_bits_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("w web pick depth-bits texture"),
             size: wgpu::Extent3d {
                 width: self.config.width,
                 height: self.config.height,
@@ -4224,150 +4206,21 @@ impl WebViewerState {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: depth_format,
+            format: PICK_DEPTH_BITS_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("w web pick depth texture view"),
-            ..Default::default()
-        });
-        let region = self.clamp_pick_region(region);
-        let unpadded_bytes_per_row = region
-            .width
-            .checked_mul(4)
-            .ok_or("pick region row is too wide")?;
-        let padded_bytes_per_row =
-            align_to_web(unpadded_bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let depth_unpadded_bytes_per_row = unpadded_bytes_per_row;
-        let depth_padded_bytes_per_row = padded_bytes_per_row;
-        let readback_size = u64::from(padded_bytes_per_row)
-            .checked_mul(u64::from(region.height))
-            .ok_or("pick region is too large")?;
-        let depth_readback_size = u64::from(depth_padded_bytes_per_row)
-            .checked_mul(u64::from(region.height))
-            .ok_or("pick depth region is too large")?;
-        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("w web pick readback buffer"),
-            size: readback_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let depth_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("w web pick depth readback buffer"),
-            size: depth_readback_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("w web pick encoder"),
+        let pick_depth_bits_view =
+            pick_depth_bits_texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("w web pick depth-bits texture view"),
+                ..Default::default()
             });
-        self.renderer
-            .render_pick_region(&mut encoder, &view, &depth_view, region);
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: region.x,
-                    y: region.y,
-                    z: 0,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_bytes_per_row),
-                    rows_per_image: Some(region.height),
-                },
-            },
-            wgpu::Extent3d {
-                width: region.width,
-                height: region.height,
-                depth_or_array_layers: 1,
-            },
-        );
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &depth_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: region.x,
-                    y: region.y,
-                    z: 0,
-                },
-                aspect: wgpu::TextureAspect::DepthOnly,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &depth_readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(depth_padded_bytes_per_row),
-                    rows_per_image: Some(region.height),
-                },
-            },
-            wgpu::Extent3d {
-                width: region.width,
-                height: region.height,
-                depth_or_array_layers: 1,
-            },
-        );
-        self.queue.submit([encoder.finish()]);
-
-        let map_promise = map_buffer_for_read_web(&readback);
-        let depth_map_promise = map_buffer_for_read_web(&depth_readback);
-        let _ = self.device.poll(wgpu::PollType::Poll);
-
-        Ok(WebPickReadback {
-            region,
-            viewport_width: self.config.width,
-            viewport_height: self.config.height,
-            clip_from_world: self
-                .renderer
-                .camera()
-                .clip_from_world(ViewportSize::new(self.config.width, self.config.height)),
-            pick_targets: self.renderer.pick_targets().to_vec(),
-            readback,
-            map_promise,
-            unpadded_bytes_per_row,
-            padded_bytes_per_row,
-            depth_readback,
-            depth_map_promise,
-            depth_unpadded_bytes_per_row,
-            depth_padded_bytes_per_row,
-        })
-    }
-
-    fn prepare_pick_color_readback(
-        &mut self,
-        request: WebPickRequest,
-    ) -> Result<WebPickColorReadback, String> {
-        let region = self.css_pick_request_to_region(request);
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("w web orbit pivot pick texture"),
-            size: wgpu::Extent3d {
-                width: self.config.width,
-                height: self.config.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Uint,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("w web orbit pivot pick texture view"),
-            ..Default::default()
-        });
+        let clip_from_world = self
+            .renderer
+            .camera()
+            .clip_from_world(ViewportSize::new(self.config.width, self.config.height));
         let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("w web orbit pivot pick depth texture"),
+            label: Some("w web pick visibility depth texture"),
             size: wgpu::Extent3d {
                 width: self.config.width,
                 height: self.config.height,
@@ -4381,22 +4234,33 @@ impl WebViewerState {
             view_formats: &[],
         });
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("w web orbit pivot pick depth texture view"),
+            label: Some("w web pick visibility depth texture view"),
             ..Default::default()
         });
         let region = self.clamp_pick_region(region);
         let unpadded_bytes_per_row = region
             .width
             .checked_mul(4)
-            .ok_or("orbit pivot pick region row is too wide")?;
+            .ok_or("pick region row is too wide")?;
         let padded_bytes_per_row =
             align_to_web(unpadded_bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let depth_bits_unpadded_bytes_per_row = unpadded_bytes_per_row;
+        let depth_bits_padded_bytes_per_row = padded_bytes_per_row;
         let readback_size = u64::from(padded_bytes_per_row)
             .checked_mul(u64::from(region.height))
-            .ok_or("orbit pivot pick region is too large")?;
+            .ok_or("pick region is too large")?;
+        let depth_bits_readback_size = u64::from(depth_bits_padded_bytes_per_row)
+            .checked_mul(u64::from(region.height))
+            .ok_or("pick depth-bits region is too large")?;
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("w web orbit pivot pick readback buffer"),
+            label: Some("w web pick index readback buffer"),
             size: readback_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let depth_bits_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("w web pick depth-bits readback buffer"),
+            size: depth_bits_readback_size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -4404,13 +4268,19 @@ impl WebViewerState {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("w web orbit pivot pick encoder"),
+                label: Some("w web pick encoder"),
             });
         self.renderer
-            .render_pick_region(&mut encoder, &view, &depth_view, region);
+            .render_pick_region(
+                &mut encoder,
+                &pick_index_view,
+                &pick_depth_bits_view,
+                &depth_view,
+                region,
+            );
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &texture,
+                texture: &pick_index_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d {
                     x: region.x,
@@ -4433,18 +4303,51 @@ impl WebViewerState {
                 depth_or_array_layers: 1,
             },
         );
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &pick_depth_bits_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: region.x,
+                    y: region.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &depth_bits_readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(depth_bits_padded_bytes_per_row),
+                    rows_per_image: Some(region.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: region.width,
+                height: region.height,
+                depth_or_array_layers: 1,
+            },
+        );
         self.queue.submit([encoder.finish()]);
 
         let map_promise = map_buffer_for_read_web(&readback);
+        let depth_bits_map_promise = map_buffer_for_read_web(&depth_bits_readback);
         let _ = self.device.poll(wgpu::PollType::Poll);
 
-        Ok(WebPickColorReadback {
+        Ok(WebPickReadback {
             region,
+            viewport_width: self.config.width,
+            viewport_height: self.config.height,
+            clip_from_world,
             pick_targets: self.renderer.pick_targets().to_vec(),
             readback,
             map_promise,
             unpadded_bytes_per_row,
             padded_bytes_per_row,
+            depth_bits_readback,
+            depth_bits_map_promise,
+            depth_bits_unpadded_bytes_per_row,
+            depth_bits_padded_bytes_per_row,
         })
     }
 
@@ -4470,7 +4373,7 @@ impl WebViewerState {
         target_ids: Option<&[SemanticElementId]>,
     ) -> Result<WebPickColorReadback, String> {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("w web show visibility probe texture"),
+            label: Some("w web show visibility probe pick index texture"),
             size: wgpu::Extent3d {
                 width: self.config.width,
                 height: self.config.height,
@@ -4479,16 +4382,34 @@ impl WebViewerState {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Uint,
+            format: PICK_INDEX_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("w web show visibility probe texture view"),
+            label: Some("w web show visibility probe pick index texture view"),
+            ..Default::default()
+        });
+        let depth_bits_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("w web show visibility probe depth-bits texture"),
+            size: wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: PICK_DEPTH_BITS_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_bits_view = depth_bits_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("w web show visibility probe depth-bits texture view"),
             ..Default::default()
         });
         let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("w web show visibility probe depth texture"),
+            label: Some("w web show visibility probe visibility depth texture"),
             size: wgpu::Extent3d {
                 width: self.config.width,
                 height: self.config.height,
@@ -4502,7 +4423,7 @@ impl WebViewerState {
             view_formats: &[],
         });
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("w web show visibility probe depth texture view"),
+            label: Some("w web show visibility probe visibility depth texture view"),
             ..Default::default()
         });
         let region = self.clamp_pick_region(region);
@@ -4533,6 +4454,7 @@ impl WebViewerState {
                     &self.device,
                     &mut encoder,
                     &view,
+                    &depth_bits_view,
                     &depth_view,
                     ids,
                     region,
@@ -4540,7 +4462,7 @@ impl WebViewerState {
             }
             None => {
                 self.renderer
-                    .render_pick_region(&mut encoder, &view, &depth_view, region);
+                    .render_pick_region(&mut encoder, &view, &depth_bits_view, &depth_view, region);
             }
         }
         encoder.copy_texture_to_buffer(

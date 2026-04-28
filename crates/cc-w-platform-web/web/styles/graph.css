@@ -1,0 +1,84 @@
+.graph-status {
+  color: var(--text-secondary);
+}
+
+.graph-floating-button {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  z-index: 5;
+  width: 26px;
+  height: 24px;
+  background: color-mix(in srgb, var(--surface-control) 86%, transparent);
+  backdrop-filter: blur(6px);
+}
+
+.graph-floating-button:disabled {
+  opacity: 0.45;
+  cursor: default;
+  border-color: var(--border-subtle);
+}
+
+.graph-floating-button:focus:not(:focus-visible) {
+  outline: none;
+}
+
+.graph-status[data-tone="warn"] {
+  color: var(--warning);
+}
+
+.graph-status[data-tone="error"] {
+  color: var(--danger);
+}
+
+.graph-shell {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--surface-graph);
+}
+
+.graph-view,
+.graph-fallback-list {
+  position: absolute;
+  inset: 0;
+}
+
+.graph-view {
+  background: var(--surface-graph);
+}
+
+.graph-fallback-list {
+  overflow: auto;
+  padding: 10px 12px 18px;
+}
+
+.graph-fallback-row {
+  width: 100%;
+  padding: 10px 12px;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.graph-fallback-row:hover,
+.graph-fallback-row.active {
+  background: var(--hover-accent);
+}
+
+.graph-fallback-row strong {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.graph-fallback-row span {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-soft);
+}

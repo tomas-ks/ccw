@@ -24,6 +24,8 @@ pub const DEFAULT_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth
 const ARCHITECTURAL_EDGE_WIDTH_PX: f32 = 3.5;
 const ARCHITECTURAL_CREASE_ANGLE_DEGREES: f32 = 30.0;
 const SCREEN_SPACE_OUTLINE_DEPTH_THRESHOLD: f32 = 0.004;
+pub const PICK_INDEX_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
+pub const PICK_DEPTH_BITS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 const SCREEN_SPACE_OBJECT_ID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Uint;
 const SCREEN_SPACE_NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
@@ -327,6 +329,57 @@ fn vs_main(input : VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(input : VertexOutput) -> @location(0) vec4<u32> {
     return input.pick_color;
+}
+"#;
+
+pub const PICK_MESH_WITH_DEPTH_SHADER_WGSL: &str = r#"
+struct Camera {
+    clip_from_world : mat4x4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera : Camera;
+
+struct VertexInput {
+    @location(0) position : vec3<f32>,
+    @location(2) model_col0 : vec4<f32>,
+    @location(3) model_col1 : vec4<f32>,
+    @location(4) model_col2 : vec4<f32>,
+    @location(5) model_col3 : vec4<f32>,
+    @location(7) pick_index : u32,
+};
+
+struct VertexOutput {
+    @builtin(position) position : vec4<f32>,
+    @location(0) @interpolate(flat) pick_index : u32,
+};
+
+struct FragmentOutput {
+    @location(0) pick_index : u32,
+    @location(1) depth_bits : u32,
+};
+
+@vertex
+fn vs_main(input : VertexInput) -> VertexOutput {
+    var out : VertexOutput;
+    let model_from_object = mat4x4<f32>(
+        input.model_col0,
+        input.model_col1,
+        input.model_col2,
+        input.model_col3,
+    );
+    let world_position = model_from_object * vec4<f32>(input.position, 1.0);
+    out.position = camera.clip_from_world * world_position;
+    out.pick_index = input.pick_index;
+    return out;
+}
+
+@fragment
+fn fs_main(input : VertexOutput) -> FragmentOutput {
+    var out : FragmentOutput;
+    out.pick_index = input.pick_index;
+    out.depth_bits = bitcast<u32>(clamp(input.position.z, 0.0, 1.0));
+    return out;
 }
 "#;
 
@@ -2566,6 +2619,10 @@ impl MeshRenderer {
             label: Some("w pick mesh shader"),
             source: wgpu::ShaderSource::Wgsl(PICK_MESH_SHADER_WGSL.into()),
         });
+        let pick_with_depth_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("w pick mesh with depth shader"),
+            source: wgpu::ShaderSource::Wgsl(PICK_MESH_WITH_DEPTH_SHADER_WGSL.into()),
+        });
         let focus_mask_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("w inspection focus mask mesh pipeline"),
             layout: Some(&pipeline_layout),
@@ -2609,7 +2666,7 @@ impl MeshRenderer {
             label: Some("w pick mesh pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &pick_shader,
+                module: &pick_with_depth_shader,
                 entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[GpuVertex::layout(), GpuInstance::layout()],
@@ -2632,14 +2689,21 @@ impl MeshRenderer {
             }),
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
-                module: &pick_shader,
+                module: &pick_with_depth_shader,
                 entry_point: Some("fs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Uint,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: PICK_INDEX_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: PICK_DEPTH_BITS_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
             }),
             multiview_mask: None,
             cache: None,
@@ -2649,7 +2713,7 @@ impl MeshRenderer {
                 label: Some("w pick surface decal mesh pipeline"),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
-                    module: &pick_shader,
+                    module: &pick_with_depth_shader,
                     entry_point: Some("vs_main"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     buffers: &[GpuVertex::layout(), GpuInstance::layout()],
@@ -2672,14 +2736,21 @@ impl MeshRenderer {
                 }),
                 multisample: wgpu::MultisampleState::default(),
                 fragment: Some(wgpu::FragmentState {
-                    module: &pick_shader,
+                    module: &pick_with_depth_shader,
                     entry_point: Some("fs_main"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8Uint,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
+                    targets: &[
+                        Some(wgpu::ColorTargetState {
+                            format: PICK_INDEX_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        Some(wgpu::ColorTargetState {
+                            format: PICK_DEPTH_BITS_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                    ],
                 }),
                 multiview_mask: None,
                 cache: None,
@@ -3061,14 +3132,16 @@ impl MeshRenderer {
             return;
         }
 
-        let inspection_profile = self.profile == RenderProfileId::Architectural;
-        let needs_depth_sampling = matches!(
-            self.profile,
-            RenderProfileId::Bim
-                | RenderProfileId::ArchitecturalV3
-                | RenderProfileId::Architectural
-                | RenderProfileId::ArchitecturalV4
-        ) && device.is_some();
+        let inspection_context_rendering = uses_inspection_context_rendering(self.profile);
+        let needs_depth_sampling = (inspection_context_rendering
+            || matches!(
+                self.profile,
+                RenderProfileId::Bim
+                    | RenderProfileId::ArchitecturalV3
+                    | RenderProfileId::Architectural
+                    | RenderProfileId::ArchitecturalV4
+            ))
+            && device.is_some();
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("w mesh pass"),
@@ -3109,7 +3182,7 @@ impl MeshRenderer {
             };
             pass.set_bind_group(0, &self.scene_bind_group, &[]);
 
-            if inspection_profile {
+            if inspection_context_rendering {
                 pass.set_pipeline(&self.inspection_context_pipeline);
                 for batch in self
                     .instance_batches
@@ -3125,11 +3198,11 @@ impl MeshRenderer {
             }
 
             pass.set_pipeline(mesh_pipeline);
-            for batch in self
-                .instance_batches
-                .iter()
-                .filter(|batch| batch.render_layer.draws_as_opaque(inspection_profile))
-            {
+            for batch in self.instance_batches.iter().filter(|batch| {
+                batch
+                    .render_layer
+                    .draws_as_opaque(inspection_context_rendering)
+            }) {
                 let mesh = &self.meshes[batch.mesh_index];
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
@@ -3141,7 +3214,7 @@ impl MeshRenderer {
             for batch in self.instance_batches.iter().filter(|batch| {
                 batch
                     .render_layer
-                    .draws_as_surface_decal(inspection_profile)
+                    .draws_as_surface_decal(inspection_context_rendering)
             }) {
                 let mesh = &self.meshes[batch.mesh_index];
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -3165,7 +3238,7 @@ impl MeshRenderer {
             }
         }
 
-        if inspection_profile {
+        if inspection_context_rendering {
             if let Some(device) = device {
                 self.render_inspection_focus_mask(encoder, depth_target);
                 self.render_inspection_context_tint(device, encoder, target, depth_target);
@@ -3215,13 +3288,13 @@ impl MeshRenderer {
         pass: &mut wgpu::RenderPass<'pass>,
         pipeline: &'pass wgpu::RenderPipeline,
     ) {
-        let inspection_profile = self.profile == RenderProfileId::Architectural;
+        let inspection_context_rendering = uses_inspection_context_rendering(self.profile);
         pass.set_pipeline(pipeline);
-        for batch in self
-            .instance_batches
-            .iter()
-            .filter(|batch| batch.render_layer.draws_as_opaque(inspection_profile))
-        {
+        for batch in self.instance_batches.iter().filter(|batch| {
+            batch
+                .render_layer
+                .draws_as_opaque(inspection_context_rendering)
+        }) {
             let mesh = &self.meshes[batch.mesh_index];
             let Some(edge_vertex_buffer) = &mesh.edge_vertex_buffer else {
                 continue;
@@ -3501,12 +3574,12 @@ impl MeshRenderer {
         pass.set_pipeline(&self.outline_id_pipeline);
         pass.set_bind_group(0, &self.scene_bind_group, &[]);
 
-        let inspection_profile = self.profile == RenderProfileId::Architectural;
-        for batch in self
-            .instance_batches
-            .iter()
-            .filter(|batch| batch.render_layer.draws_as_opaque(inspection_profile))
-        {
+        let inspection_context_rendering = uses_inspection_context_rendering(self.profile);
+        for batch in self.instance_batches.iter().filter(|batch| {
+            batch
+                .render_layer
+                .draws_as_opaque(inspection_context_rendering)
+        }) {
             let mesh = &self.meshes[batch.mesh_index];
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
@@ -3566,7 +3639,8 @@ impl MeshRenderer {
     pub fn render_pick_region(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        target: &wgpu::TextureView,
+        pick_index_target: &wgpu::TextureView,
+        pick_depth_bits_target: &wgpu::TextureView,
         depth_target: &wgpu::TextureView,
         region: PickRegion,
     ) -> Option<PickRegion> {
@@ -3574,15 +3648,26 @@ impl MeshRenderer {
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("w pick mesh pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment {
+                    view: pick_index_target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: pick_depth_bits_target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+            ],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth_target,
                 depth_ops: Some(wgpu::Operations {
@@ -3631,7 +3716,8 @@ impl MeshRenderer {
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        target: &wgpu::TextureView,
+        pick_index_target: &wgpu::TextureView,
+        pick_depth_bits_target: &wgpu::TextureView,
         depth_target: &wgpu::TextureView,
         element_ids: &[SemanticElementId],
         region: PickRegion,
@@ -3674,15 +3760,26 @@ impl MeshRenderer {
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("w filtered pick mesh pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment {
+                    view: pick_index_target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: pick_depth_bits_target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+            ],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth_target,
                 depth_ops: Some(wgpu::Operations {
@@ -3725,20 +3822,19 @@ impl MeshRenderer {
         Some(region)
     }
 
-    pub fn decode_pick_pixels(&self, region: PickRegion, rgba8: &[u8]) -> PickResult {
-        Self::decode_pick_pixels_with_targets(region, rgba8, &self.pick_targets)
+    pub fn decode_pick_pixels(&self, region: PickRegion, pick_index_bytes: &[u8]) -> PickResult {
+        Self::decode_pick_pixels_with_targets(region, pick_index_bytes, &self.pick_targets)
     }
 
     pub fn decode_pick_pixels_with_targets(
         region: PickRegion,
-        rgba8: &[u8],
+        pick_index_bytes: &[u8],
         pick_targets: &[PickHit],
     ) -> PickResult {
         let mut seen = HashSet::new();
         let mut hits = Vec::new();
 
-        for pixel in rgba8.chunks_exact(4) {
-            let pick_index = decode_pick_index(pixel);
+        for pick_index in pick_index_bytes.chunks_exact(4).map(decode_pick_index) {
             if pick_index == 0 || !seen.insert(pick_index) {
                 continue;
             }
@@ -3766,7 +3862,7 @@ impl MeshRenderer {
             return Ok(PickResult::empty(region));
         };
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("w pick texture"),
+            label: Some("w pick index texture"),
             size: wgpu::Extent3d {
                 width: self.viewport.width,
                 height: self.viewport.height,
@@ -3775,12 +3871,30 @@ impl MeshRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Uint,
+            format: PICK_INDEX_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("w pick texture view"),
+            label: Some("w pick index texture view"),
+            ..Default::default()
+        });
+        let depth_bits_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("w pick depth bits texture"),
+            size: wgpu::Extent3d {
+                width: self.viewport.width,
+                height: self.viewport.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: PICK_DEPTH_BITS_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_bits_view = depth_bits_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("w pick depth bits texture view"),
             ..Default::default()
         });
         let depth_target =
@@ -3805,7 +3919,13 @@ impl MeshRenderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("w pick encoder"),
         });
-        self.render_pick_region(&mut encoder, &view, depth_target.view(), region);
+        self.render_pick_region(
+            &mut encoder,
+            &view,
+            &depth_bits_view,
+            depth_target.view(),
+            region,
+        );
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -3846,7 +3966,7 @@ impl MeshRenderer {
         mapping_result?;
 
         let mapped = slice.get_mapped_range();
-        let rgba8 = strip_padded_rows(
+        let pick_index_bytes = strip_padded_rows(
             &mapped,
             unpadded_bytes_per_row as usize,
             padded_bytes_per_row as usize,
@@ -3855,7 +3975,7 @@ impl MeshRenderer {
         drop(mapped);
         readback.unmap();
 
-        Ok(self.decode_pick_pixels(region, &rgba8))
+        Ok(self.decode_pick_pixels(region, &pick_index_bytes))
     }
 
     fn update_camera(&self, queue: &wgpu::Queue) {
@@ -4049,6 +4169,11 @@ fn uses_screen_space_outline(profile: RenderProfileId) -> bool {
             | RenderProfileId::Architectural
             | RenderProfileId::ArchitecturalV4
     )
+}
+
+fn uses_inspection_context_rendering(profile: RenderProfileId) -> bool {
+    let _ = profile;
+    true
 }
 
 fn edge_ribbon_vertices(mesh: &PreparedMesh, edges: &ExtractedMeshEdges) -> Vec<GpuEdgeVertex> {
@@ -4551,6 +4676,20 @@ mod tests {
     }
 
     #[test]
+    fn all_profiles_use_inspection_context_rendering() {
+        for profile in [
+            RenderProfileId::Diffuse,
+            RenderProfileId::Bim,
+            RenderProfileId::Architectural,
+            RenderProfileId::ArchitecturalV1,
+            RenderProfileId::ArchitecturalV3,
+            RenderProfileId::ArchitecturalV4,
+        ] {
+            assert!(uses_inspection_context_rendering(profile));
+        }
+    }
+
+    #[test]
     fn inspection_context_instances_use_context_layers_but_do_not_pick() {
         let base_instance = PreparedRenderInstance {
             id: GeometryInstanceId(1),
@@ -4700,7 +4839,7 @@ mod tests {
     }
 
     #[test]
-    fn pick_indices_round_trip_through_rgba_bytes() {
+    fn pick_indices_round_trip_through_u32_bytes() {
         for index in [0, 1, 255, 256, 65_535, 65_536, 0x12_34_56_78] {
             assert_eq!(decode_pick_index(&encode_pick_index(index)), index);
         }

@@ -4527,6 +4527,31 @@ fn summarize_cypher_tool_output(output: Option<&Value>) -> String {
     let output = normalize_progress_payload(raw_output);
     match &output {
         Value::Object(object) => {
+            if object.get("ok").and_then(Value::as_bool) == Some(false) {
+                let message = get_first_string(object, &["error", "message"])
+                    .unwrap_or_else(|| "unknown error".to_owned());
+                let mut summary = format!(
+                    "Read-only Cypher failed: {}",
+                    shorten_for_progress(&message, 280)
+                );
+                if let Some(base) = get_first_string(object, &["base"]) {
+                    summary.push_str(&format!(" Base: {}.", shorten_for_progress(&base, 120)));
+                } else if let Some(tried) = object.get("tried").and_then(Value::as_array) {
+                    let tried = tried
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    if !tried.is_empty() {
+                        summary.push_str(&format!(
+                            " Tried: {}.",
+                            shorten_for_progress(&tried, 240)
+                        ));
+                    }
+                }
+                return summary;
+            }
             let rows = object.get("rows").and_then(Value::as_array).map(Vec::len);
             let row_count = rows.unwrap_or(0);
             let row_label = if row_count == 1 { "row" } else { "rows" };
@@ -5438,6 +5463,24 @@ mod tests {
             }),
             "expected cypher results to be summarized instead of emitted as a response document"
         );
+    }
+
+    #[test]
+    fn cypher_progress_summary_reports_structured_transport_failures() {
+        let output = serde_json::json!({
+            "ok": false,
+            "path": "/api/cypher",
+            "error": "viewer API connection failed",
+            "tried": [
+                "http://127.0.0.1:8001/: fetch failed",
+                "http://localhost:8001/: fetch failed"
+            ]
+        });
+
+        let summary = summarize_cypher_tool_output(Some(&output));
+
+        assert!(summary.contains("Read-only Cypher failed: viewer API connection failed"));
+        assert!(summary.contains("Tried: http://127.0.0.1:8001/: fetch failed"));
     }
 
     #[test]

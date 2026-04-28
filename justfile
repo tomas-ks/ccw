@@ -106,6 +106,8 @@ web-viewer-build:
     if [[ ! -d crates/cc-w-platform-web/web/node_modules/@xterm/xterm || ! -d crates/cc-w-platform-web/web/node_modules/sigma || ! -d crates/cc-w-platform-web/web/node_modules/graphology || ! -d crates/cc-w-platform-web/web/node_modules/@sigma/edge-curve ]]; then npm ci --prefix crates/cc-w-platform-web/web; fi
     mkdir -p crates/cc-w-platform-web/artifacts/viewer/pkg
     mkdir -p crates/cc-w-platform-web/artifacts/viewer/vendor
+    mkdir -p crates/cc-w-platform-web/artifacts/viewer/js
+    mkdir -p crates/cc-w-platform-web/artifacts/viewer/styles
     mkdir -p crates/cc-w-platform-web/artifacts/viewer/vendor/sigma
     mkdir -p crates/cc-w-platform-web/artifacts/viewer/vendor/sigma-edge-curve
     cargo build -p cc-w-platform-web --lib --target wasm32-unknown-unknown
@@ -120,6 +122,8 @@ web-viewer-build:
     cp -R crates/cc-w-platform-web/web/node_modules/sigma/utils crates/cc-w-platform-web/artifacts/viewer/vendor/sigma/
     cp -R crates/cc-w-platform-web/web/node_modules/@sigma/edge-curve/dist crates/cc-w-platform-web/artifacts/viewer/vendor/sigma-edge-curve/
     cp crates/cc-w-platform-web/web/vendor/graphology-utils-is-graph.mjs crates/cc-w-platform-web/artifacts/viewer/vendor/graphology-utils-is-graph.mjs
+    cp -R crates/cc-w-platform-web/web/js/. crates/cc-w-platform-web/artifacts/viewer/js/
+    cp -R crates/cc-w-platform-web/web/styles/. crates/cc-w-platform-web/artifacts/viewer/styles/
     cp crates/cc-w-platform-web/web/index.html crates/cc-w-platform-web/artifacts/viewer/index.html
     echo "web viewer output: crates/cc-w-platform-web/artifacts/viewer/index.html"
 
@@ -127,6 +131,8 @@ web-viewer-build-release:
     if [[ ! -d crates/cc-w-platform-web/web/node_modules/@xterm/xterm || ! -d crates/cc-w-platform-web/web/node_modules/sigma || ! -d crates/cc-w-platform-web/web/node_modules/graphology || ! -d crates/cc-w-platform-web/web/node_modules/@sigma/edge-curve ]]; then npm ci --prefix crates/cc-w-platform-web/web; fi
     mkdir -p crates/cc-w-platform-web/artifacts/viewer/pkg
     mkdir -p crates/cc-w-platform-web/artifacts/viewer/vendor
+    mkdir -p crates/cc-w-platform-web/artifacts/viewer/js
+    mkdir -p crates/cc-w-platform-web/artifacts/viewer/styles
     mkdir -p crates/cc-w-platform-web/artifacts/viewer/vendor/sigma
     mkdir -p crates/cc-w-platform-web/artifacts/viewer/vendor/sigma-edge-curve
     cargo build --release -p cc-w-platform-web --lib --target wasm32-unknown-unknown
@@ -141,6 +147,8 @@ web-viewer-build-release:
     cp -R crates/cc-w-platform-web/web/node_modules/sigma/utils crates/cc-w-platform-web/artifacts/viewer/vendor/sigma/
     cp -R crates/cc-w-platform-web/web/node_modules/@sigma/edge-curve/dist crates/cc-w-platform-web/artifacts/viewer/vendor/sigma-edge-curve/
     cp crates/cc-w-platform-web/web/vendor/graphology-utils-is-graph.mjs crates/cc-w-platform-web/artifacts/viewer/vendor/graphology-utils-is-graph.mjs
+    cp -R crates/cc-w-platform-web/web/js/. crates/cc-w-platform-web/artifacts/viewer/js/
+    cp -R crates/cc-w-platform-web/web/styles/. crates/cc-w-platform-web/artifacts/viewer/styles/
     cp crates/cc-w-platform-web/web/index.html crates/cc-w-platform-web/artifacts/viewer/index.html
     echo "release web viewer output: crates/cc-w-platform-web/artifacts/viewer/index.html"
 

@@ -1,0 +1,177 @@
+.viewer-header {
+  flex: 0 0 auto;
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 12px;
+  padding: 5px 12px;
+  background: var(--surface-header);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.header-tools,
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.header-actions {
+  margin-left: auto;
+}
+
+:root.electron-shell .viewer-header {
+  min-height: 42px;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  -webkit-app-region: drag;
+}
+
+:root.electron-shell[data-electron-platform="darwin"] .viewer-header {
+  padding-left: 116px;
+}
+
+:root.electron-shell button,
+:root.electron-shell select,
+:root.electron-shell .settings-menu {
+  -webkit-app-region: no-drag;
+}
+
+.electron-window-controls {
+  display: none;
+  align-items: center;
+  gap: 2px;
+  margin-left: 4px;
+  padding-left: 8px;
+  border-left: 1px solid var(--border-subtle);
+}
+
+:root.electron-shell:not([data-electron-platform="darwin"]) .electron-window-controls {
+  display: flex;
+}
+
+.electron-window-button {
+  width: 34px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.electron-window-button:hover {
+  background: var(--surface-control-hover);
+  color: var(--text-primary);
+}
+
+.electron-window-button.close:hover {
+  background: #d94841;
+  color: #fff;
+}
+
+.electron-window-button svg {
+  width: 13px;
+  height: 13px;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  fill: none;
+}
+
+.icon-button {
+  width: 28px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-control);
+  background: var(--surface-control);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.icon-button:hover {
+  color: var(--text-primary);
+  border-color: var(--border-accent);
+}
+
+.icon-button:disabled {
+  opacity: 0.45;
+  cursor: default;
+  color: var(--text-disabled);
+  border-color: var(--border-subtle);
+}
+
+.icon-button.active,
+.icon-button[aria-pressed="true"] {
+  color: var(--text-primary);
+  background: var(--surface-control-active);
+  border-color: var(--border-accent);
+}
+
+.icon-button svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.settings-menu {
+  position: relative;
+}
+
+.settings-dropdown {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 24;
+  width: 210px;
+  padding: 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-panel);
+  background: var(--surface-elevated);
+  box-shadow: var(--shadow-panel);
+  backdrop-filter: blur(10px);
+}
+
+.settings-dropdown[hidden] {
+  display: none;
+}
+
+.settings-label {
+  margin: 0 0 7px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.settings-select {
+  width: 100%;
+  height: 28px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-control);
+  background: var(--surface-control);
+  color: var(--text-primary);
+  font: inherit;
+  padding: 0 8px;
+}
