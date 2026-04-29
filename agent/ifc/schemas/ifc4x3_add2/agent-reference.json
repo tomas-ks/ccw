@@ -1,0 +1,162 @@
+{
+  "schemaId": "IFC4X3_ADD2",
+  "schemaSlug": "ifc4x3_add2",
+  "summary": "Full IFC4X3_ADD2 runtime bundle with both building and infrastructure scope. Roof/slab patterns still apply in building models, but this schema also includes alignment, bridge, road, facility, and civil element families, so the agent should confirm the model domain before assuming storeys and roofs are central.",
+  "cautions": [
+    "IfcRoof and IfcSlab sit under IfcBuiltElement in IFC4X3_ADD2, not the older IfcBuildingElement family.",
+    "This schema includes infrastructure-heavy entities such as IfcAlignment, IfcBridge, IfcBridgePart, IfcRoad, IfcFacility, and IfcCivilElement; do not assume every model is building-centric.",
+    "Roof/slab heuristics are still useful for building models, but they should not be the first assumption for civil or facility models.",
+    "Use DB node ids for graph actions and GlobalId values for viewer element actions."
+  ],
+  "queryHabits": [
+    "Check whether the model is building-centric or infrastructure-centric before assuming storeys or roofs are the main story.",
+    "Use id(n) AS node_id for graph seeds and GlobalId AS global_id for viewer element actions.",
+    "If an element's type value is weak or opaque, inspect aggregate, containment, type, property, and material relations before answering.",
+    "For building models, roof-to-slab traversal is still a strong default; for infrastructure models, first confirm that roof/storey concepts are even present."
+  ],
+  "entities": {
+    "IfcProject": {
+      "summary": "Semantic and context root for the model. Good first graph seed regardless of whether the model is building or infrastructure oriented.",
+      "commonRelations": [
+        "IfcRelAggregates",
+        "IfcUnitAssignment",
+        "IfcRepresentationContext"
+      ],
+      "queryPatterns": [
+        "MATCH (p:IfcProject) RETURN id(p) AS node_id LIMIT 1"
+      ]
+    },
+    "IfcBuildingStorey": {
+      "summary": "Spatial structure node used in building-centric IFC4X3 models.",
+      "commonRelations": [
+        "IfcRelAggregates",
+        "IfcRelContainedInSpatialStructure",
+        "IfcRelReferencedInSpatialStructure"
+      ],
+      "queryPatterns": [
+        "MATCH (s:IfcBuildingStorey) RETURN id(s) AS node_id LIMIT 8"
+      ]
+    },
+    "IfcRoof": {
+      "summary": "Roof product under the IfcBuiltElement family. Useful for semantic roof reasoning in building models.",
+      "commonRelations": [
+        "IfcRelAggregates",
+        "IfcRelContainedInSpatialStructure",
+        "IfcRelDefinesByProperties"
+      ],
+      "queryPatterns": [
+        "MATCH (r:IfcRoof) RETURN id(r) AS node_id LIMIT 8",
+        "MATCH (:IfcRoof)<--(:IfcRelAggregates)-->(slab:IfcSlab) RETURN DISTINCT id(slab) AS node_id LIMIT 16"
+      ]
+    },
+    "IfcSlab": {
+      "summary": "Slab product under IfcBuiltElement. In building models it is often one of the actual visible roof or floor carriers.",
+      "commonRelations": [
+        "IfcRelAggregates",
+        "IfcRelContainedInSpatialStructure",
+        "IfcRelDefinesByType",
+        "IfcRelDefinesByProperties",
+        "IfcRelAssociatesMaterial"
+      ],
+      "queryPatterns": [
+        "MATCH (slab:IfcSlab) RETURN id(slab) AS node_id LIMIT 8",
+        "MATCH (slab:IfcSlab)<-[r]-(other) RETURN type(r) AS rel, other.declared_entity AS entity, other.Name AS name LIMIT 24"
+      ]
+    },
+    "IfcAlignment": {
+      "summary": "Infrastructure-centric root-style entity. Its presence is a good clue that the model is not purely building-focused.",
+      "commonRelations": [
+        "IfcRelAggregates",
+        "IfcRelNests"
+      ]
+    },
+    "IfcBridge": {
+      "summary": "Infrastructure facility entity. Use it as a domain clue before applying building-only exploration habits.",
+      "commonRelations": [
+        "IfcRelAggregates",
+        "IfcRelContainedInSpatialStructure"
+      ],
+      "queryPatterns": [
+        "MATCH (bridge:IfcBridge) RETURN id(bridge) AS node_id LIMIT 8",
+        "MATCH (bridge:IfcBridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) RETURN DISTINCT prod.GlobalId AS global_id LIMIT 32"
+      ],
+      "cautions": [
+        "IfcBridge is often a semantic facility root. For viewer actions, inspect descendant bridge parts and the products contained by them."
+      ]
+    },
+    "IfcBridgePart": {
+      "summary": "Infrastructure subdivision/container node. Bridge parts often sit between the bridge root and the visible products like columns, walls, members, fill, and signs.",
+      "commonRelations": [
+        "IfcRelAggregates",
+        "IfcRelContainedInSpatialStructure"
+      ],
+      "queryPatterns": [
+        "MATCH (part:IfcBridgePart) RETURN id(part) AS node_id LIMIT 8",
+        "MATCH (part:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) RETURN DISTINCT prod.GlobalId AS global_id LIMIT 32"
+      ],
+      "cautions": [
+        "IfcBridgePart is often still semantic/spatial structure. For viewer actions, use the contained products' GlobalId values."
+      ]
+    },
+    "IfcRoad": {
+      "summary": "Infrastructure facility entity. Another strong signal that the model is not purely building-oriented.",
+      "commonRelations": [
+        "IfcRelAggregates",
+        "IfcRelContainedInSpatialStructure"
+      ]
+    },
+    "IfcRelAggregates": {
+      "summary": "Main decomposition relation for both building hierarchy and infrastructure/facility decomposition.",
+      "commonRelations": [
+        "RELATING_OBJECT",
+        "RELATED_OBJECTS"
+      ]
+    },
+    "IfcRelContainedInSpatialStructure": {
+      "summary": "Containment relation between elements and spatial structure.",
+      "commonRelations": [
+        "RELATED_ELEMENTS",
+        "RELATING_STRUCTURE"
+      ]
+    },
+    "IfcRelDefinesByType": {
+      "summary": "Type attachment relation. Useful across both building and infrastructure models when a product label is too weak.",
+      "commonRelations": [
+        "RELATED_OBJECTS",
+        "RELATING_TYPE"
+      ]
+    },
+    "IfcRelDefinesByProperties": {
+      "summary": "Property-set attachment relation. Use it to turn graph facts into user-facing explanations.",
+      "commonRelations": [
+        "RELATED_OBJECTS",
+        "RELATING_PROPERTY_DEFINITION"
+      ]
+    },
+    "IfcRelAssociatesMaterial": {
+      "summary": "Material attachment relation. Useful for composition questions in any domain.",
+      "commonRelations": [
+        "RELATED_OBJECTS",
+        "RELATING_MATERIAL"
+      ]
+    }
+  },
+  "queryPlaybooks": {
+    "projectSeed": [
+      "MATCH (p:IfcProject) RETURN id(p) AS node_id LIMIT 1"
+    ],
+    "domainCheck": [
+      "MATCH (n) WHERE n.declared_entity IN ['IfcBuilding','IfcBuildingStorey','IfcBridge','IfcRoad','IfcAlignment'] RETURN DISTINCT n.declared_entity AS entity LIMIT 12"
+    ],
+    "roofToSlabsGraph": [
+      "MATCH (:IfcRoof)<--(:IfcRelAggregates)-->(slab:IfcSlab) RETURN DISTINCT id(slab) AS node_id LIMIT 16"
+    ],
+    "slabRelationContext": [
+      "MATCH (slab:IfcSlab)<-[r]-(other) RETURN type(r) AS rel, other.declared_entity AS entity, other.Name AS name LIMIT 24"
+    ],
+    "bridgeToProducts": [
+      "MATCH (bridge:IfcBridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) RETURN DISTINCT prod.GlobalId AS global_id LIMIT 32",
+      "MATCH (bridge:IfcBridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)--(:IfcRelAggregates)-->(subpart:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) RETURN DISTINCT prod.GlobalId AS global_id LIMIT 32"
+    ]
+  }
+}

@@ -25,7 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DEFAULT_TIMEOUT_MS: u64 = 45_000;
+const DEFAULT_TIMEOUT_MS: u64 = 180_000;
 const DEFAULT_MAX_STDOUT_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_STDERR_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_STEPS_PER_TURN: usize = 12;
@@ -833,8 +833,9 @@ impl OpencodeExecutor {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if last_activity.elapsed() >= idle_timeout {
+                        let _ = native_server.abort_session(&native_session_id);
                         return Err(format!(
-                            "opencode executable timed out after {} ms without progress",
+                            "opencode turn timed out after {} ms without progress and was aborted",
                             idle_timeout.as_millis()
                         ));
                     }
@@ -2506,6 +2507,12 @@ fn display_native_tool_name(tool_name: &str) -> String {
         "run_project_readonly_cypher" => "ifc_project_readonly_cypher".to_owned(),
         "node_relations" => "ifc_node_relations".to_owned(),
         "renderable_descendants" => "ifc_renderable_descendants".to_owned(),
+        "element_search" => "ifc_element_search".to_owned(),
+        "scope_summary" => "ifc_scope_summary".to_owned(),
+        "scope_inspect" => "ifc_scope_inspect".to_owned(),
+        "bridge_structure_summary" => "ifc_bridge_structure_summary".to_owned(),
+        "quantity_takeoff" => "ifc_quantity_takeoff".to_owned(),
+        "section_at_point_or_station" => "ifc_section_at_point_or_station".to_owned(),
         other => other.to_owned(),
     }
 }
@@ -2563,6 +2570,16 @@ fn native_action_candidate_from_tool_call(
             candidate
         }),
         "elements_inspect" => native_semantic_ids_from_input(input).map(|semantic_ids| {
+            let mut candidate = AgentActionCandidate::elements_inspect_with_mode(
+                semantic_ids,
+                native_inspection_mode_from_input(input),
+            );
+            if let Some(resource) = native_resource_from_input(input) {
+                candidate = candidate.with_resource(resource);
+            }
+            candidate
+        }),
+        "scope_inspect" => native_semantic_ids_from_input(input).map(|semantic_ids| {
             let mut candidate = AgentActionCandidate::elements_inspect_with_mode(
                 semantic_ids,
                 native_inspection_mode_from_input(input),
@@ -3049,6 +3066,18 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
         } else {
             "Return only JSON, with no markdown fences or commentary.".to_owned()
         },
+        if native_agent {
+            "High-value native model tools: use `ifc_element_search` to find candidates; use `ifc_scope_summary` to understand grouped ids; use `ifc_scope_inspect` for show/inspect flows; use `ifc_bridge_structure_summary` for bridge decomposition; use `ifc_quantity_takeoff` for count/material/BOM style summaries with provenance; use `ifc_section_at_point_or_station` only when explicit station/point/ids are available, and never invent section geometry.".to_owned()
+        } else {
+            "Use only the JSON toolCalls kinds listed below; do not invent direct native tool wrappers.".to_owned()
+        },
+        if native_agent {
+            "For requests like `inspect all bearings`, once you have renderable `GlobalId` values, immediately issue the viewer inspection action. Do not spend another turn summarizing or reasoning over every returned row unless the user asked for that summary.".to_owned()
+        } else {
+            "For requests like `inspect all bearings`, once you have renderable `GlobalId` values, emit the viewer inspection action. Do not spend another turn summarizing every returned row unless the user asked for that summary.".to_owned()
+        },
+        "For viewer actions with explicit complete/plural scope, such as `add the piles`, `inspect all bearings`, or `hide every column`, bounded queries are only for discovery. The final id-collection query/action must be complete and must not use LIMIT unless the user explicitly asks for a sample or subset. If the result could be large, count first, then collect all focused renderable ids or explain why the full action is unsafe.".to_owned(),
+        "When using `ifc_element_search` to collect ids for a complete viewer action, set `all_matches: true` and provide a focused anchor such as `entity_names: [\"IfcPile\"]`. Do not use broad text-only search as the final complete action source.".to_owned(),
         turn_context_block(
             &request.resource,
             &request.schema_id,
@@ -3106,6 +3135,10 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
         "- Never default a missing id to `0`. If an id is missing, ask for another small query or use a different inspection tool.".to_owned(),
         "- Every `run_readonly_cypher` tool call must include a short `why` string explaining what you are trying to learn from that query.".to_owned(),
         "- When the bound resource starts with `project/` and the user asks a broad project-level question, prefer `run_project_readonly_cypher`; use `run_readonly_cypher` for single-IFC focused follow-ups only.".to_owned(),
+        "- For project-wide overview/product-family summaries, do not combine several independent `OPTIONAL MATCH` aggregate branches in one query. That shape can explode into a Cartesian product. Prefer `MATCH (n) WHERE n.declared_entity IS NOT NULL RETURN n.declared_entity AS entity, count(*) AS count ORDER BY count DESC LIMIT 20`, or split counts into separate small label-first queries.".to_owned(),
+        "- For bridge structural breakdowns, first list `IfcBridgePart` ids, then query contained products one bridge part at a time with `WHERE id(part) = ...`. Do not run one unanchored aggregate query from every bridge part through `IfcRelContainedInSpatialStructure`; that shape is known to be slow.".to_owned(),
+        "- If a Cypher tool reports that it timed out and the query process was killed, briefly tell the user the previous query was too broad, then continue with a smaller anchored query. Do not retry the same broad shape.".to_owned(),
+        "- For viewer actions with explicit complete/plural scope, bounded queries are only for discovery. The final action ids must be complete and must not use LIMIT unless the user asked for a sample/subset. Prefer `ifc_element_search` with `all_matches: true` and a focused entity label when available.".to_owned(),
         "- The current model schema is already provided. Use it. If entity meaning, relation shape, or query strategy is unclear, ask for schema context, entity reference, relation reference, or a query playbook before guessing.".to_owned(),
         "- Use recent session history to resolve vague follow-up requests like `show me the relations`, `show them`, or `what about that one`.".to_owned(),
         "- Before issuing a new discovery query for a repeated factual question, check sessionHistory for an earlier answer. If the fact was already established, answer from that prior finding and only run a small verification query when freshness or certainty really matters.".to_owned(),
@@ -4544,10 +4577,8 @@ fn summarize_cypher_tool_output(output: Option<&Value>) -> String {
                         .collect::<Vec<_>>()
                         .join("; ");
                     if !tried.is_empty() {
-                        summary.push_str(&format!(
-                            " Tried: {}.",
-                            shorten_for_progress(&tried, 240)
-                        ));
+                        summary
+                            .push_str(&format!(" Tried: {}.", shorten_for_progress(&tried, 240)));
                     }
                 }
                 return summary;

@@ -36,18 +36,152 @@ Implemented:
 - active semantic focus now flows through app state for graph picks and 3D picks
 - property balloon open/close/dismiss and screen anchor state now flow through app state
 - the browser now reads project membership from the Rust-owned viewer resource catalog
+- graph shell ownership is extracted to `web/js/graph/graph-shell.js`
+- property balloon content/query orchestration is extracted to
+  `web/js/ui/balloon-controller.js` and `web/js/semantic/properties.js`
+- resource and render-profile picker rendering are extracted to dedicated viewer controllers
 
 Remaining gaps:
 
-- graph layout and graph visual selection are still local to `createGraphShell`
-- property balloon content is still rendered locally from query results
-- resource picker rendering still relies on the Rust-populated select element rather than an
-  app-state-rendered control
 - some derived UI still reacts directly to DOM or viewer events instead of a single app-state
   subscriber path
 
 The main risk is state drift: two widgets can believe different things because they reacted to
 different events.
+
+## Post-Refactor Module Ownership Target
+
+The end state should make each extracted module's ownership narrow enough that it can be reasoned
+about without opening the full app entrypoint.
+
+### Graph Shell
+
+Target owner: a graph-shell/controller module under the graph UI boundary.
+
+Owns:
+
+- Graphology/Sigma instance lifetime
+- graph layout positions, camera state, and visual selected-node styling
+- graph command surface such as `reset`, `expand`, `select`, `clear`, and `frame`
+- graph status text that describes graph-controller readiness or query failures
+
+Does not own:
+
+- panel visibility, which remains `appState.panels.graph`
+- semantic focus, which remains `appState.focus`
+- renderer selection/highlight truth, which remains the renderer committed state
+- graph/database facts, which remain backend query results
+- property balloon open state or content
+
+Inputs:
+
+- committed resource changes from `viewer/committed`
+- app-state focus snapshots
+- backend graph query results
+- explicit terminal or AI graph commands
+
+Outputs:
+
+- app-state `focus/set` or `focus/clear` actions for semantic focus changes
+- renderer selection commands only when a graph node maps to a renderable semantic id
+- graph-local render updates for layout and visual node selection
+
+Graph clicks must not directly update sibling widgets. A click can set focus, optionally command
+renderer selection, and let subscribers decide what to render.
+
+### Balloon Controller
+
+Target owner: `js/ui/balloon.js`.
+
+Owns:
+
+- property balloon DOM lookup
+- screen positioning, arrow placement, and pick-anchor marker placement
+- close/dismiss button wiring
+- rendering the open/closed/anchored visual state from app state
+- rendering an already prepared property view into the balloon DOM
+
+Does not own:
+
+- semantic focus selection
+- pick-tool policy
+- property query/fetch ownership
+- renderer selection
+
+Inputs:
+
+- `appState.balloon` for `open`, `source`, `anchor`, and `dismissed`
+- focus-keyed property query results from the semantic/data owner
+- viewport/canvas measurements for positioning
+
+Outputs:
+
+- `balloon/open`, `balloon/close`, `balloon/dismiss`, and `balloon/anchor` actions
+- DOM positioning side effects only inside the balloon/marker elements
+
+Content requests should be keyed to the current focus/resource. If a stale property query resolves
+after focus changes, it must be ignored instead of replacing the current balloon content.
+
+### Resource And Profile Pickers
+
+Target owners: small picker controllers, separate from graph, outliner, terminal, and app entrypoint
+orchestration.
+
+Resource picker contract:
+
+- the Rust resource catalog owns available resources and projects
+- app state owns pending `requestedResource` intent
+- renderer committed state owns the active loaded resource
+- the picker renders options from the catalog and selected/pending state from app and renderer
+  snapshots
+- `change` dispatches `resource/requested` and invokes the renderer load path
+- graph clearing, outliner rendering, and chat binding must wait for `viewer/committed`
+
+Profile picker contract:
+
+- the renderer owns available profiles and the committed active profile
+- the picker may record pending profile intent only as UI intent, not as renderer truth
+- `change` invokes the renderer profile command
+- selected profile display updates from the committed renderer/profile snapshot
+- a profile mutation that changes renderer state must emit one committed viewer-state event
+
+Raw picker values are never authoritative outside the picker controller. They are intent signals
+until the owning state domain commits.
+
+### Chat Readiness
+
+Target owner: an AI/chat readiness controller near the terminal/agent boundary.
+
+Owns:
+
+- chat readiness derivation and status text
+- AI model/level control enablement
+- active chat session binding for the committed resource/project
+- stale-session invalidation when committed resource or profile changes
+
+Does not own:
+
+- resource or profile truth
+- terminal panel visibility or active terminal tab
+- renderer state
+- backend semantic/database facts
+
+Inputs:
+
+- `appState.terminal.activeTool` and terminal panel visibility
+- committed viewer resource/profile snapshots
+- resource catalog project membership
+- backend agent capability/session state
+- selected AI model and level
+
+Outputs:
+
+- readiness UI state such as disabled controls and status copy
+- one session bind/update after the viewer commits the resource it will answer against
+- no chat bind or prompt dispatch for a pending picker value
+
+When a resource/profile change is pending, chat should report a pending/not-ready state instead of
+answering against the previous committed context or the raw picker value.
 
 ## Slice 1: Introduce A Small App-State Store
 
@@ -106,8 +240,7 @@ Acceptance:
 
 ## Slice 2: Make Resource Switching Commit-Driven
 
-Status: implemented for graph clearing and AI binding; resource picker visual rendering still needs
-one more cleanup pass.
+Status: implemented for graph clearing, AI binding, and resource picker rendering.
 
 Route all resource picker changes through the app store.
 
@@ -165,7 +298,8 @@ Acceptance:
 
 ## Slice 4: Normalize Focus And Selection
 
-Status: partly implemented.
+Status: implemented for focus ownership; graph layout remains intentionally owned by the graph
+shell module.
 
 Implemented:
 
@@ -174,12 +308,9 @@ Implemented:
 - 3D picks dispatch `focus/set`
 - empty picks and graph clear paths dispatch `focus/clear`
 - property balloon open/close/dismiss and anchor placement dispatch app-state actions
-
-Remaining:
-
-- graph layout and Sigma visual selected-node state still live locally in `createGraphShell`
-- renderer highlight remains an imperative effect from graph selection
-- property balloon content is still populated directly from graph/pick query results
+- property balloon content is populated by the balloon controller from app focus plus semantic
+  readback results
+- renderer highlight remains a renderer-owned effect commanded by graph selection
 
 Introduce one app-level semantic focus object while keeping 3D highlight in the renderer.
 
@@ -218,6 +349,8 @@ Refactor widgets to render from snapshots:
 - header buttons render from app state
 - resource picker renders from resource catalog plus committed/pending resource state
 - property balloon renders from app focus, anchor, and property query results
+- graph layout and graph visual selection render from the graph shell's graph snapshot; app state
+  owns semantic focus, not graph coordinates
 
 Rules:
 
@@ -272,12 +405,16 @@ Implemented:
 
 - JS smoke harness added at `crates/cc-w-platform-web/web/smoke/state-smoke.mjs`
 - harness covers resource commit, outliner project rows, and suppression persistence
+- no-browser state contract smoke added at
+  `crates/cc-w-platform-web/web/smoke/state-contract-smoke.mjs`
+- no-browser smoke covers app-state dispatch semantics, resource catalog helpers, balloon helper
+  behavior, stable DOM anchors, and this plan's post-refactor ownership headings
 
 Remaining:
 
 - run the smoke harness against a live viewer once Playwright is installed/resolvable in the local
   Node environment
-- add graph selection/balloon browser smoke once the selection flow is fully centralized
+- add graph selection/balloon browser smoke to cover the moduleized controller path
 
 Add or preserve tests at each layer.
 
@@ -291,8 +428,11 @@ Rust:
 JavaScript/browser smoke:
 
 - module syntax parse
+- no-browser state-contract smoke
 - outliner resource-switch smoke
 - panel toggle smoke
+- resource/profile picker smoke
+- chat readiness smoke
 - graph selection/balloon smoke
 
 Manual smoke script:
@@ -309,6 +449,10 @@ Manual smoke script:
 10. Turn pick off, click graph node, verify no balloon.
 11. Turn pick on, click graph node, verify balloon.
 12. Rotate while balloon is visible, verify no focus steal.
+13. Change render profile and verify footer/viewer state update from one committed state event.
+14. During resource/profile pending state, verify AI chat controls are not ready for the raw picker
+    context.
+15. After commit, verify chat readiness binds to the committed resource/project once.
 
 ## Implementation Order
 
@@ -331,6 +475,8 @@ We can consider the design fully followed when:
 
 - every mutable state domain has a named owner
 - all resource switching is commit-driven
+- resource and profile pickers render from catalog/app/renderer snapshots rather than local truth
+- chat readiness follows committed resource/profile state rather than raw picker values
 - no UI component stores renderer truth locally
 - no UI component renders from raw picker values as authoritative state
 - all renderer mutations produce one committed state event

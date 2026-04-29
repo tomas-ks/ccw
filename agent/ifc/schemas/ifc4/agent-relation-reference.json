@@ -1,0 +1,39 @@
+{
+  "schemaId": "IFC4",
+  "schemaSlug": "ifc4",
+  "references": {
+    "IfcRelAggregates": {
+      "summary": "Decomposition relation connecting semantic parents to aggregated children.",
+      "commonConnections": ["RELATING_OBJECT", "RELATED_OBJECTS"],
+      "queryPatterns": ["MATCH (parent)<--(rel:IfcRelAggregates)-->(child) RETURN id(rel) AS node_id, parent.Name AS parent_name, child.Name AS child_name LIMIT 24"],
+      "cautions": ["Structural, not renderable."]
+    },
+    "IfcRelContainedInSpatialStructure": {
+      "summary": "Containment relation between products and spatial containers.",
+      "commonConnections": ["RELATING_STRUCTURE", "RELATED_ELEMENTS"],
+      "queryPatterns": ["MATCH (container)<--(rel:IfcRelContainedInSpatialStructure)-->(element) RETURN id(rel) AS node_id, container.Name AS container_name, element.Name AS element_name LIMIT 24"],
+      "cautions": ["Good for hierarchy explanations."]
+    },
+    "IfcRelDefinesByType": {
+      "summary": "Type attachment relation for instances.",
+      "commonConnections": ["RELATING_TYPE", "RELATED_OBJECTS"],
+      "queryPatterns": ["MATCH (instance)<--(rel:IfcRelDefinesByType)-->(type) RETURN id(rel) AS node_id, instance.Name AS instance_name, type.Name AS type_name LIMIT 24"],
+      "cautions": ["Useful when instance properties are weak."]
+    },
+    "IfcRelAssociatesMaterial": {
+      "summary": "Material association relation between products and materials or intermediate material-definition nodes.",
+      "commonConnections": ["RELATING_MATERIAL", "RELATED_OBJECTS"],
+      "queryPatterns": [
+        "MATCH (rel:IfcRelAssociatesMaterial)--(other) RETURN DISTINCT labels(other)[0] AS node_label, count(*) AS connections ORDER BY connections DESC LIMIT 24",
+        "MATCH (:IfcRelAssociatesMaterial)--(material:IfcMaterial) RETURN DISTINCT material.Name AS material_name LIMIT 24"
+      ],
+      "cautions": ["Direct IfcMaterial hops may be incomplete."]
+    },
+    "RELATED_OBJECTS": {
+      "summary": "Role from aggregate, type, property, and material relations toward related product objects.",
+      "commonConnections": ["IfcRelAggregates", "IfcRelDefinesByType", "IfcRelDefinesByProperties", "IfcRelAssociatesMaterial"],
+      "queryPatterns": ["MATCH (rel)-[:RELATED_OBJECTS]->(other) RETURN labels(rel)[0] AS relation_label, labels(other)[0] AS other_label, count(*) AS connections ORDER BY connections DESC LIMIT 24"],
+      "cautions": ["Inspect the relation node label too."]
+    }
+  }
+}

@@ -1,0 +1,96 @@
+{
+  "schemaId": "IFC2X3_TC1",
+  "schemaSlug": "ifc2x3_tc1",
+  "playbooks": {
+    "model_overview": {
+      "summary": "For broad questions about what the current model is, start with a tiny overview: identify the project root, check one or two domain signals, and sample a small material vocabulary.",
+      "whenToUse": [
+        "what can you tell me about the model",
+        "what is in this model",
+        "give me an overview of the model",
+        "what kind of model is this"
+      ],
+      "recommendedPatterns": [
+        "MATCH (p:IfcProject) RETURN id(p) AS node_id, p.Name AS project_name, p.GlobalId AS global_id LIMIT 1",
+        "MATCH (b:IfcBuilding) RETURN count(b) AS building_count",
+        "MATCH (bridge:IfcBridge) RETURN count(bridge) AS bridge_count",
+        "MATCH (:IfcRelAssociatesMaterial)--(material:IfcMaterial) RETURN DISTINCT material.Name AS material_name LIMIT 12"
+      ],
+      "relatedEntities": ["IfcProject", "IfcBuilding", "IfcBridge", "IfcMaterial"],
+      "cautions": [
+        "Keep the first pass tiny. Do not start an overview answer with a broad unlabeled scan or deep multi-join query.",
+        "Use one or two domain signals only, then explain what they imply instead of enumerating the whole model."
+      ],
+      "avoidPatterns": [
+        "Broad unlabeled exploration before checking IfcProject.",
+        "Large product-family scans or graph walks as the first overview step."
+      ]
+    },
+    "project_seed": {
+      "summary": "Use the IFC project root as the most stable semantic graph seed in IFC2X3 models.",
+      "whenToUse": ["seed the graph from the project", "start from the project root"],
+      "recommendedPatterns": ["MATCH (p:IfcProject) RETURN id(p) AS node_id LIMIT 1"],
+      "relatedEntities": ["IfcProject"],
+      "cautions": ["IfcProject is semantic, not renderable."],
+      "avoidPatterns": ["Broad unlabeled scans before checking IfcProject."]
+    },
+    "named_furniture_discovery": {
+      "summary": "For kitchen-like furnishing questions, start with a small furniture scan and inspect returned names.",
+      "whenToUse": ["is there a kitchen unit", "find furniture by name"],
+      "recommendedPatterns": [
+        "MATCH (n:IfcFurniture) RETURN id(n) AS node_id, n.GlobalId AS global_id, n.Name AS name, n.ObjectType AS object_type LIMIT 25"
+      ],
+      "relatedEntities": ["IfcFurniture"],
+      "cautions": ["Keep the first query simple in IFC2X3."],
+      "avoidPatterns": ["Large text-filter predicates as the first step."]
+    },
+    "relation_summary": {
+      "summary": "Use a plain local relation summary before filtered exploration.",
+      "whenToUse": ["what relations are slabs connected to", "how is this connected"],
+      "recommendedPatterns": [
+        "MATCH (slab:IfcSlab)-[r]-(other) RETURN type(r) AS relation, count(*) AS connections ORDER BY connections DESC LIMIT 24"
+      ],
+      "relatedEntities": ["IfcSlab"],
+      "cautions": ["Narrow only after the first relation summary."],
+      "avoidPatterns": ["Complex WHERE filters on the first query."]
+    },
+    "roof_renderable_descendants": {
+      "summary": "Resolve roof slabs when the user wants visible roof elements.",
+      "whenToUse": ["hide the roof", "find roof slabs"],
+      "recommendedPatterns": [
+        "MATCH (:IfcRoof)<--(:IfcRelAggregates)-->(slab:IfcSlab) RETURN DISTINCT slab.GlobalId AS global_id LIMIT 200",
+        "MATCH (:IfcRoof)<--(:IfcRelAggregates)-->(slab:IfcSlab) RETURN DISTINCT id(slab) AS node_id LIMIT 24"
+      ],
+      "relatedEntities": ["IfcRoof", "IfcSlab", "IfcRelAggregates"],
+      "cautions": ["IfcRoof often remains semantic even in IFC2X3."],
+      "avoidPatterns": ["Trying to hide an IfcRoof directly with element actions."]
+    },
+    "bounded_descendant_discovery": {
+      "summary": "Use a small, relation-constrained variable-length traversal to discover candidate descendants when the exact one-hop structure is unclear.",
+      "whenToUse": ["find renderable descendants", "explore descendants", "walk the local structure"],
+      "recommendedPatterns": [
+        "MATCH (root)-[:RELATED_OBJECTS|RELATED_ELEMENTS*1..3]-(n) RETURN DISTINCT n.declared_entity AS entity, n.GlobalId AS global_id, n.Name AS name LIMIT 40",
+        "MATCH (root)-[:RELATING_OBJECT|RELATED_OBJECTS|RELATING_STRUCTURE|RELATED_ELEMENTS*1..3]-(n) RETURN DISTINCT n.declared_entity AS entity, n.GlobalId AS global_id, n.Name AS name LIMIT 40"
+      ],
+      "relatedEntities": ["IfcRelAggregates", "IfcRelContainedInSpatialStructure"],
+      "cautions": [
+        "Keep the range bounded and the relation family as narrow as you can.",
+        "Use the varlen walk to discover candidates, then follow up with a simpler query on the concrete products you found."
+      ],
+      "avoidPatterns": [
+        "Bare `[*]` or `[*1..3]` walks when the relation family is already known.",
+        "Open-ended `*0..` traversal as a first exploration step."
+      ]
+    },
+    "material_scan": {
+      "summary": "List named materials first, then refine if the answer is too broad.",
+      "whenToUse": ["what is the house built of", "material overview"],
+      "recommendedPatterns": [
+        "MATCH (:IfcRelAssociatesMaterial)--(material:IfcMaterial) RETURN DISTINCT material.Name AS material_name LIMIT 24"
+      ],
+      "relatedEntities": ["IfcRelAssociatesMaterial", "IfcMaterial"],
+      "cautions": ["Be explicit when material evidence is indirect."],
+      "avoidPatterns": ["Speculative multi-join material tables as a first step."]
+    }
+  }
+}

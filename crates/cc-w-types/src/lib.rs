@@ -99,6 +99,72 @@ pub const WORLD_RIGHT_F32: Vec3 = Vec3::X;
 pub const WORLD_FORWARD_F32: Vec3 = Vec3::Y;
 pub const WORLD_UP_F32: Vec3 = Vec3::Z;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SectionPose {
+    pub origin: DVec3,
+    pub tangent: DVec3,
+    pub normal: DVec3,
+    pub up: DVec3,
+}
+
+impl SectionPose {
+    pub fn new(origin: DVec3, tangent: DVec3, normal: DVec3, up: DVec3) -> Self {
+        Self {
+            origin,
+            tangent,
+            normal,
+            up,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SectionDisplayMode {
+    #[default]
+    ThreeDOverlay,
+    TwoDSection,
+    Both,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SectionClipMode {
+    #[default]
+    None,
+    ClipPositiveNormal,
+    ClipNegativeNormal,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SectionState {
+    pub resource: String,
+    pub alignment_id: Option<String>,
+    pub station: Option<f64>,
+    pub pose: SectionPose,
+    pub width: f64,
+    pub height: f64,
+    pub thickness: f64,
+    pub mode: SectionDisplayMode,
+    pub clip: SectionClipMode,
+    pub provenance: Vec<String>,
+}
+
+impl SectionState {
+    pub fn new(resource: impl Into<String>, pose: SectionPose) -> Self {
+        Self {
+            resource: resource.into(),
+            alignment_id: None,
+            station: None,
+            pose,
+            width: 20.0,
+            height: 20.0,
+            thickness: 0.1,
+            mode: SectionDisplayMode::ThreeDOverlay,
+            clip: SectionClipMode::None,
+            provenance: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SignedAxis {
     PositiveX,

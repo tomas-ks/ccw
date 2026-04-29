@@ -100,6 +100,101 @@ async function waitForPagePredicate(page, description, callback, timeoutMs, arg)
   console.log(`ok - ${description}`);
 }
 
+async function expectPanelState(
+  page,
+  description,
+  { panel, visible, bodyHiddenClass, buttonSelector, panelSelector }
+) {
+  return expectPageValue(
+    page,
+    description,
+    ({ panel, visible, bodyHiddenClass, buttonSelector, panelSelector }) => {
+      const state = window.wAppState?.getState?.();
+      const button = document.querySelector(buttonSelector);
+      const panelElement = document.querySelector(panelSelector);
+      const style = panelElement ? getComputedStyle(panelElement) : null;
+      const panelIsRendered = Boolean(
+        panelElement &&
+          !panelElement.hidden &&
+          style?.display !== "none" &&
+          style?.visibility !== "hidden" &&
+          panelElement.getClientRects().length > 0
+      );
+      const headerVisible =
+        panel === "graph"
+          ? window.wHeader?.graphVisible?.()
+          : panel === "terminal"
+            ? window.wHeader?.terminalVisible?.()
+            : undefined;
+
+      if (!state) {
+        return { ok: false, message: "window.wAppState is unavailable" };
+      }
+      if (state.panels?.[panel] !== visible) {
+        return {
+          ok: false,
+          message: `state.panels.${panel} is ${JSON.stringify(state.panels?.[panel])}`,
+        };
+      }
+      if (headerVisible !== undefined && headerVisible !== visible) {
+        return {
+          ok: false,
+          message: `window.wHeader ${panel} visible is ${JSON.stringify(headerVisible)}`,
+        };
+      }
+      if (!button) {
+        return { ok: false, message: `missing ${buttonSelector}` };
+      }
+      if (button.disabled || button.hasAttribute("disabled")) {
+        return { ok: false, message: `${buttonSelector} is disabled` };
+      }
+      if (button.getAttribute("aria-pressed") !== String(visible)) {
+        return {
+          ok: false,
+          message: `${buttonSelector} aria-pressed is not ${visible}`,
+        };
+      }
+      if (button.classList.contains("active") !== visible) {
+        return {
+          ok: false,
+          message: `${buttonSelector} active class is not ${visible}`,
+        };
+      }
+      if (document.body.classList.contains(bodyHiddenClass) !== !visible) {
+        return {
+          ok: false,
+          message: `body ${bodyHiddenClass} class does not match visibility`,
+        };
+      }
+      if (panelIsRendered !== visible) {
+        return {
+          ok: false,
+          message: `${panelSelector} rendered visibility is ${panelIsRendered}`,
+        };
+      }
+
+      if (panel === "terminal" && visible) {
+        const activeTool = state.terminal?.activeTool;
+        const activeHostId =
+          activeTool === "ai" ? "agent-terminal" : activeTool === "js" ? "repl-terminal" : null;
+        const activeHost = activeHostId ? document.getElementById(activeHostId) : null;
+        const activeTab = activeTool
+          ? document.querySelector(`[data-terminal-tool="${activeTool}"]`)
+          : null;
+        if (!activeHost || activeHost.hidden || !activeHost.classList.contains("active")) {
+          return { ok: false, message: "active terminal host is not visible" };
+        }
+        if (!activeTab || activeTab.getAttribute("aria-selected") !== "true") {
+          return { ok: false, message: "active terminal tab is not selected" };
+        }
+      }
+
+      return { ok: true };
+    },
+    { panel, visible, bodyHiddenClass, buttonSelector, panelSelector }
+  );
+}
+
 async function run() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
@@ -111,13 +206,36 @@ async function run() {
   const browser = await chromium.launch({ headless: !options.headed });
   const page = await browser.newPage();
   const browserErrors = [];
+  const externalRequests = [];
+  const aiTurnRequests = [];
+  const viewerOrigin = new URL(options.url).origin;
 
   page.on("pageerror", (error) => {
     browserErrors.push(error.message);
   });
   page.on("console", (message) => {
     if (message.type() === "error") {
-      browserErrors.push(message.text());
+      const text = message.text();
+      if (/Failed to load resource: the server responded with a status of 404/.test(text)) {
+        return;
+      }
+      browserErrors.push(text);
+    }
+  });
+  page.on("request", (request) => {
+    const requestUrl = new URL(request.url());
+    if (requestUrl.protocol !== "http:" && requestUrl.protocol !== "https:") {
+      return;
+    }
+    if (requestUrl.origin !== viewerOrigin) {
+      externalRequests.push(request.url());
+      return;
+    }
+    if (
+      requestUrl.pathname === "/api/agent/turn-start" ||
+      requestUrl.pathname === "/api/agent/turn-poll"
+    ) {
+      aiTurnRequests.push(`${request.method()} ${requestUrl.pathname}`);
     }
   });
 
@@ -138,6 +256,77 @@ async function run() {
         ? { ok: true, value: resource }
         : { ok: false, message: "missing committed viewer resource" };
     });
+
+    await expectPanelState(page, "graph panel starts hidden", {
+      panel: "graph",
+      visible: false,
+      bodyHiddenClass: "graph-hidden",
+      buttonSelector: "#graph-toggle-button",
+      panelSelector: ".side-panel",
+    });
+
+    await page.click("#graph-toggle-button");
+    await expectPanelState(page, "header graph toggle opens graph panel", {
+      panel: "graph",
+      visible: true,
+      bodyHiddenClass: "graph-hidden",
+      buttonSelector: "#graph-toggle-button",
+      panelSelector: ".side-panel",
+    });
+
+    await page.click("#graph-toggle-button");
+    await expectPanelState(page, "header graph toggle closes graph panel", {
+      panel: "graph",
+      visible: false,
+      bodyHiddenClass: "graph-hidden",
+      buttonSelector: "#graph-toggle-button",
+      panelSelector: ".side-panel",
+    });
+
+    await expectPanelState(page, "terminal panel starts hidden", {
+      panel: "terminal",
+      visible: false,
+      bodyHiddenClass: "terminal-hidden",
+      buttonSelector: "#terminal-toggle-button",
+      panelSelector: ".terminal",
+    });
+
+    await page.evaluate(() => {
+      window.__stateSmokeTerminalVisibilityEvents = [];
+      window.addEventListener("w-terminal-visibility-change", (event) => {
+        window.__stateSmokeTerminalVisibilityEvents.push(Boolean(event.detail?.visible));
+      });
+    });
+
+    await page.click("#terminal-toggle-button");
+    await expectPanelState(page, "header terminal toggle opens terminal panel", {
+      panel: "terminal",
+      visible: true,
+      bodyHiddenClass: "terminal-hidden",
+      buttonSelector: "#terminal-toggle-button",
+      panelSelector: ".terminal",
+    });
+    await waitForPagePredicate(
+      page,
+      "terminal toggle emits visible event",
+      () => window.__stateSmokeTerminalVisibilityEvents?.includes(true),
+      options.timeoutMs
+    );
+
+    await page.click("#terminal-toggle-button");
+    await expectPanelState(page, "header terminal toggle closes terminal panel", {
+      panel: "terminal",
+      visible: false,
+      bodyHiddenClass: "terminal-hidden",
+      buttonSelector: "#terminal-toggle-button",
+      panelSelector: ".terminal",
+    });
+    await waitForPagePredicate(
+      page,
+      "terminal toggle emits hidden event",
+      () => window.__stateSmokeTerminalVisibilityEvents?.includes(false),
+      options.timeoutMs
+    );
 
     await page.click("#outliner-toggle-button");
     await expectPageValue(page, "outliner panel is app-state driven", () => {
@@ -184,6 +373,24 @@ async function run() {
       options.toResource
     );
 
+    await expectPageValue(page, "resource picker reflects committed resource", (toResource) => {
+      const state = window.wAppState.getState();
+      const picker = document.querySelector("#resource-picker");
+      if (picker?.value !== toResource) {
+        return { ok: false, message: `picker value is ${JSON.stringify(picker?.value)}` };
+      }
+      if (state?.committedViewerState?.resource !== toResource) {
+        return {
+          ok: false,
+          message: `committed resource is ${JSON.stringify(state?.committedViewerState?.resource)}`,
+        };
+      }
+      if (state?.requestedResource) {
+        return { ok: false, message: `requested resource is still ${state.requestedResource}` };
+      }
+      return { ok: true };
+    }, options.toResource);
+
     await expectPageValue(page, "project outliner renders member rows after commit", () => {
       const rows = Array.from(document.querySelectorAll("#outliner-body .outliner-row"));
       if (!rows.length) {
@@ -196,7 +403,7 @@ async function run() {
         : { ok: false, message: "one or more outliner rows has no checkbox" };
     });
 
-    await expectPageValue(page, "outliner checkboxes preserve renderer ownership", () => {
+    const outlinerToggleTarget = await expectPageValue(page, "outliner checkbox target resolves", () => {
       const checkbox = Array.from(
         document.querySelectorAll('#outliner-body .outliner-row input[type="checkbox"]')
       ).find((input) => !input.disabled && input.checked);
@@ -213,35 +420,63 @@ async function run() {
       if (!member || !memberIds.length) {
         return { ok: false, message: "could not resolve checked outliner member ids" };
       }
+      const row = checkbox.closest(".outliner-row");
+      const rows = Array.from(document.querySelectorAll("#outliner-body .outliner-row"));
+      const rowIndex = rows.indexOf(row);
+      if (rowIndex < 0) {
+        return { ok: false, message: "could not resolve outliner row index" };
+      }
       const countVisible = (state) => {
         const visible = new Set(state.visibleElementIds || []);
         return memberIds.filter((id) => visible.has(id)).length;
       };
       const beforeCount = countVisible(before);
-      checkbox.click();
-      const suppressed = window.wViewer.viewState();
-      checkbox.click();
-      const restored = window.wViewer.viewState();
-      if (!Array.isArray(before.visibleElementIds) || !Array.isArray(restored.visibleElementIds)) {
+      if (!Array.isArray(before.visibleElementIds)) {
         return { ok: false, message: "view state does not expose visibleElementIds" };
       }
-      const suppressedCount = countVisible(suppressed);
-      const restoredCount = countVisible(restored);
-      if (suppressedCount >= beforeCount) {
-        return {
-          ok: false,
-          message: `suppression did not reduce visible count (${beforeCount} -> ${suppressedCount})`,
-        };
-      }
-      if (restoredCount !== beforeCount) {
-        return {
-          ok: false,
-          message: `unsuppression did not restore visible count (${beforeCount} -> ${restoredCount})`,
-        };
-      }
-      return { ok: true };
+      return { ok: true, value: { rowIndex, member, memberIds, beforeCount } };
     });
 
+    const outlinerCheckboxSelector =
+      `#outliner-body .outliner-row:nth-of-type(${outlinerToggleTarget.rowIndex + 1}) ` +
+      'input[type="checkbox"]';
+    await page.click(outlinerCheckboxSelector);
+    await waitForPagePredicate(
+      page,
+      "outliner checkbox suppresses default member visibility",
+      ({ memberIds, beforeCount }) => {
+        const state = window.wViewer?.viewState?.();
+        const visible = new Set(state?.visibleElementIds || []);
+        const count = memberIds.filter((id) => visible.has(id)).length;
+        return count < beforeCount;
+      },
+      options.timeoutMs,
+      outlinerToggleTarget
+    );
+    await page.click(outlinerCheckboxSelector);
+    await waitForPagePredicate(
+      page,
+      "outliner checkbox restores default member visibility",
+      ({ memberIds, beforeCount }) => {
+        const state = window.wViewer?.viewState?.();
+        const visible = new Set(state?.visibleElementIds || []);
+        const count = memberIds.filter((id) => visible.has(id)).length;
+        return count === beforeCount;
+      },
+      options.timeoutMs,
+      outlinerToggleTarget
+    );
+
+    if (externalRequests.length) {
+      throw new Error(
+        `browser made non-local requests:\n${Array.from(new Set(externalRequests)).join("\n")}`
+      );
+    }
+    if (aiTurnRequests.length) {
+      throw new Error(
+        `browser made AI turn requests:\n${Array.from(new Set(aiTurnRequests)).join("\n")}`
+      );
+    }
     if (browserErrors.length) {
       throw new Error(`browser emitted errors:\n${browserErrors.join("\n")}`);
     }

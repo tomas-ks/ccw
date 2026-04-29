@@ -10,9 +10,9 @@ graph facts into good answers or viewer actions.
 - The host already binds the current IFC model and its schema.
 - Do not guess the schema from entity names alone.
 - Prefer the schema-aware reference bundle for the active model:
-  - `artifacts/ifc/_graphql/ifc2x3_tc1/agent-reference.json`
-  - `artifacts/ifc/_graphql/ifc4/agent-reference.json`
-  - `artifacts/ifc/_graphql/ifc4x3_add2/agent-reference.json`
+  - `agent/ifc/schemas/ifc2x3_tc1/agent-reference.json`
+  - `agent/ifc/schemas/ifc4/agent-reference.json`
+  - `agent/ifc/schemas/ifc4x3_add2/agent-reference.json`
 
 Use the active schema reference first when:
 - the user asks what an entity means

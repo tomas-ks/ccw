@@ -16,6 +16,11 @@ name = "cc-w-platform-web-server"
 path = "src/bin/server.rs"
 required-features = ["native-server"]
 
+[[bin]]
+name = "cc-w-platform-web-cypher-worker"
+path = "src/bin/cypher_worker.rs"
+required-features = ["native-server"]
+
 [dependencies]
 cc-w-backend = { path = "../cc-w-backend" }
 cc-w-db = { path = "../cc-w-db" }

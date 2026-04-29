@@ -126,11 +126,17 @@ Those directories contain the generated schema/runtime artifacts:
 
 The first thing the agent should reach for is a compact per-schema reference:
 
-- `artifacts/ifc/_graphql/<schema>/agent-reference.json`
+- `agent/ifc/schemas/<schema>/agent-reference.json`
+- `agent/ifc/schemas/<schema>/agent-query-playbook.json`
+- `agent/ifc/schemas/<schema>/agent-relation-reference.json`
 
 And the shared human-maintained exploration guidance:
 
 - `docs/agent/ifc-exploration-playbook.md`
+
+The `agent/ifc/schemas/` files are repo-owned agent knowledge, not imported IFC model data. They
+should stay out of `artifacts/`, which is reserved for generated schema/runtime outputs and model
+artifacts.
 
 The Rust server should expose bounded, schema-aware tools over that knowledge instead of giving the
 external agent raw file-system roaming:
@@ -150,9 +156,14 @@ you want a different repo-local profile.
 
 Current files:
 
-- `.opencode/agents/ifc-explorer.md`
+- `agent/agents/ifc-explorer.md`
+- `.opencode/agents/ifc-explorer.md` materialized for the OpenCode adapter
 - `.opencode/tools/ifc.ts`
 - `crates/cc-w-platform-web/src/bin/ifc-knowledge.rs`
+
+`agent/agents/` is the source-of-truth location for repo-owned agent profiles. The
+`just opencode-sync-agents` recipe copies those profiles into `.opencode/agents/` before
+OpenCode-backed launch recipes run.
 
 The `ifc_*` tools are the only OpenCode tools that should be allowed automatically for the IFC
 exploration agent. The repo-local OpenCode config in `tools/opencode/opencode.json` denies by

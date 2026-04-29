@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env,
     fs,
     path::{Path, PathBuf},
 };
@@ -212,8 +213,10 @@ fn load_schema_reference_asset(
     artifacts_root: &Path,
     schema: &IfcSchemaId,
 ) -> Result<AgentSchemaReferenceAsset, String> {
-    let path = schema_reference_path(artifacts_root, schema);
-    if path.is_file() {
+    for path in schema_asset_candidate_paths(artifacts_root, schema, "agent-reference.json") {
+        if !path.is_file() {
+            continue;
+        }
         let raw = fs::read_to_string(&path).map_err(|error| {
             format!(
                 "failed to read schema reference `{}`: {error}",
@@ -242,8 +245,10 @@ fn load_query_playbook_asset_file(
     artifacts_root: &Path,
     schema: &IfcSchemaId,
 ) -> Result<AgentQueryPlaybookAssetFile, String> {
-    let path = query_playbook_path(artifacts_root, schema);
-    if path.is_file() {
+    for path in schema_asset_candidate_paths(artifacts_root, schema, "agent-query-playbook.json") {
+        if !path.is_file() {
+            continue;
+        }
         let raw = fs::read_to_string(&path).map_err(|error| {
             format!(
                 "failed to read query playbooks `{}`: {error}",
@@ -273,8 +278,14 @@ fn load_relation_reference_asset_file(
     artifacts_root: &Path,
     schema: &IfcSchemaId,
 ) -> Result<AgentRelationReferenceAssetFile, String> {
-    let path = relation_reference_path(artifacts_root, schema);
-    if path.is_file() {
+    for path in schema_asset_candidate_paths(
+        artifacts_root,
+        schema,
+        "agent-relation-reference.json",
+    ) {
+        if !path.is_file() {
+            continue;
+        }
         let raw = fs::read_to_string(&path).map_err(|error| {
             format!(
                 "failed to read relation references `{}`: {error}",
@@ -300,28 +311,61 @@ fn load_relation_reference_asset_file(
     Ok(default_relation_reference_asset_file(schema))
 }
 
-fn schema_reference_path(artifacts_root: &Path, schema: &IfcSchemaId) -> PathBuf {
+fn schema_asset_candidate_paths(
+    artifacts_root: &Path,
+    schema: &IfcSchemaId,
+    file_name: &str,
+) -> Vec<PathBuf> {
     let stem = schema.generated_artifact_stem().unwrap_or("other");
-    artifacts_root
-        .join("_graphql")
-        .join(stem)
-        .join("agent-reference.json")
+    let mut paths = Vec::new();
+
+    if let Ok(root) = env::var("CC_W_AGENT_KNOWLEDGE_ROOT") {
+        paths.push(PathBuf::from(root).join(stem).join(file_name));
+    }
+
+    let include_repo_agent_paths = artifacts_root.exists();
+    if include_repo_agent_paths {
+        if let Ok(cwd) = env::current_dir() {
+            paths.push(
+                cwd.join("agent")
+                    .join("ifc")
+                    .join("schemas")
+                    .join(stem)
+                    .join(file_name),
+            );
+        }
+
+        paths.push(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join("agent")
+                .join("ifc")
+                .join("schemas")
+                .join(stem)
+                .join(file_name),
+        );
+    }
+
+    paths.push(
+        artifacts_root
+            .join("_graphql")
+            .join(stem)
+            .join(file_name),
+    );
+
+    dedup_paths(paths)
 }
 
-fn query_playbook_path(artifacts_root: &Path, schema: &IfcSchemaId) -> PathBuf {
-    let stem = schema.generated_artifact_stem().unwrap_or("other");
-    artifacts_root
-        .join("_graphql")
-        .join(stem)
-        .join("agent-query-playbook.json")
-}
-
-fn relation_reference_path(artifacts_root: &Path, schema: &IfcSchemaId) -> PathBuf {
-    let stem = schema.generated_artifact_stem().unwrap_or("other");
-    artifacts_root
-        .join("_graphql")
-        .join(stem)
-        .join("agent-relation-reference.json")
+fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for path in paths {
+        let key = path.to_string_lossy().into_owned();
+        if seen.insert(key) {
+            deduped.push(path);
+        }
+    }
+    deduped
 }
 
 fn find_entity_reference<'a>(

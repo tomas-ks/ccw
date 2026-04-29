@@ -38,6 +38,7 @@ This project is an IFC-focused renderer and semantic exploration tool. The 3D vi
 - `elements.hide`, `elements.show`, `elements.select`, and `elements.inspect` expect renderable semantic ids, typically returned from `GlobalId` / `global_id`.
 - `viewer.clear_inspection` expects no ids and clears the current inspection focus.
 - Treat "show/reveal/display this element" as a 3D viewer action. Only seed/open the graph when the user explicitly asks for relations, graph, neighborhood, or connections.
+- For viewer actions with explicit complete/plural scope, such as "add the piles", "inspect all bearings", "hide every column", or "show all beams", bounded queries are only for discovery. The final id-collection query/action must be complete and must not use `LIMIT` unless the user explicitly asks for a sample or subset.
 - Do not wrap `id(...)` in `toString(...)`; when you need graph ids, return raw numeric ids as `id(n) AS node_id`.
 - If you only have DB node ids, use graph actions rather than element actions.
 
@@ -78,11 +79,11 @@ This project is an IFC-focused renderer and semantic exploration tool. The 3D vi
 
 - A useful bridge hide/show pattern is:
 
-  `MATCH (bridge:IfcBridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) RETURN DISTINCT prod.GlobalId AS global_id LIMIT 200`
+  `MATCH (bridge:IfcBridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) RETURN DISTINCT prod.GlobalId AS global_id`
 
 - If that only covers part of the visible bridge, a useful nested bridge-part pattern is:
 
-  `MATCH (bridge:IfcBridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)--(:IfcRelAggregates)-->(subpart:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) RETURN DISTINCT prod.GlobalId AS global_id LIMIT 200`
+  `MATCH (bridge:IfcBridge)--(:IfcRelAggregates)-->(part:IfcBridgePart)--(:IfcRelAggregates)-->(subpart:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) RETURN DISTINCT prod.GlobalId AS global_id`
 
 - A useful local neighborhood pattern is:
 

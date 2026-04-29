@@ -19,6 +19,7 @@ use std::{
     io::{ErrorKind, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Component, Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -109,10 +110,11 @@ const MAX_AGENT_ACTIONS: usize = 16;
 const MAX_AGENT_ACTION_IDS: usize = 2_000;
 const MAX_AGENT_TRANSCRIPT_EVENTS: usize = 32;
 const MAX_AGENT_SESSION_CONTEXT_EVENTS: usize = 24;
-const DEFAULT_AGENT_MAX_READONLY_QUERIES_PER_TURN: usize = 12;
 const DEFAULT_AGENT_MAX_ROWS_PER_QUERY: usize = 200;
 const DEFAULT_AGENT_QUERY_LOG_PATH: &str = ".tools/logs/agent-readonly-cypher.jsonl";
 const DEFAULT_AGENT_ERROR_LOG_PATH: &str = ".tools/logs/agent-backend-errors.jsonl";
+const DEFAULT_CYPHER_WORKER_TIMEOUT_MS: u64 = 30_000;
+const MAX_CYPHER_WORKER_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_OPENCODE_MODEL_ID: &str = "openai/gpt-5.4";
 const DEFAULT_OPENCODE_MODEL_IDS: &[&str] = &["openai/gpt-5.4", "openai/gpt-5.4-mini"];
 const DEFAULT_OPENCODE_MODEL_DISCOVERY_TIMEOUT_MS: u64 = 5_000;
@@ -386,6 +388,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let root = fs::canonicalize(&args.root)
         .map_err(|error| format!("w web server could not resolve {:?}: {error}", args.root))?;
     let mut agent_runtime = AgentRuntimeConfig::from_env()?;
+    let cypher_worker = CypherWorkerConfig::from_env()?;
     let project_registry = Arc::new(load_project_resource_registry(&root)?);
     let (listener, bound_port) = bind_listener(&args.host, args.port)?;
     listener.set_nonblocking(true)?;
@@ -399,7 +402,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         root,
         ifc_artifacts_root: args.ifc_artifacts_root,
         project_registry,
-        ifc_model_cache: Mutex::new(HashMap::new()),
+        cypher_worker,
         agent_sessions: Arc::new(Mutex::new(AgentSessionStore::default())),
         agent_turns: Arc::new(Mutex::new(AgentTurnStore::default())),
         agent_runtime,
@@ -409,6 +412,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "w web query artifacts {}",
         server_state.ifc_artifacts_root.display()
+    );
+    println!(
+        "w web cypher worker {} timeout={}ms",
+        server_state.cypher_worker.binary.display(),
+        server_state.cypher_worker.timeout.as_millis()
     );
     println!(
         "w web AI backend {}",
@@ -458,12 +466,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         match listener.accept() {
             Ok((stream, _)) => {
-                if let Err(error) = handle_connection(stream, &server_state) {
-                    console_log(
-                        ConsoleLogKind::Error,
-                        format!("server request failed: {error}"),
-                    );
-                }
+                let request_state = Arc::clone(&server_state);
+                thread::spawn(move || {
+                    if let Err(error) = handle_connection(stream, &request_state) {
+                        console_log(
+                            ConsoleLogKind::Error,
+                            format!("server request failed: {error}"),
+                        );
+                    }
+                });
             }
             Err(error)
                 if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
@@ -492,10 +503,16 @@ struct ServerState {
     root: PathBuf,
     ifc_artifacts_root: PathBuf,
     project_registry: Arc<ProjectResourceRegistry>,
-    ifc_model_cache: Mutex<HashMap<String, CachedIfcModel>>,
+    cypher_worker: CypherWorkerConfig,
     agent_sessions: Arc<Mutex<AgentSessionStore>>,
     agent_turns: Arc<Mutex<AgentTurnStore>>,
     agent_runtime: AgentRuntimeConfig,
+}
+
+#[derive(Debug, Clone)]
+struct CypherWorkerConfig {
+    binary: PathBuf,
+    timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -554,7 +571,6 @@ struct AgentRuntimeConfig {
     levels_by_model: BTreeMap<String, Vec<AgentCapabilityOption>>,
     default_model_id: Option<String>,
     default_level_id: Option<String>,
-    max_queries_per_turn: usize,
     max_rows_per_query: usize,
     query_logger: Arc<AgentQueryLogger>,
     error_logger: Arc<AgentErrorLogger>,
@@ -998,10 +1014,6 @@ impl AgentRuntimeConfig {
             levels_by_model,
             default_model_id,
             default_level_id,
-            max_queries_per_turn: parse_env_usize_with_default(
-                "CC_W_AGENT_MAX_READONLY_QUERIES_PER_TURN",
-                DEFAULT_AGENT_MAX_READONLY_QUERIES_PER_TURN,
-            )?,
             max_rows_per_query: parse_env_usize_with_default(
                 "CC_W_AGENT_MAX_ROWS_PER_QUERY",
                 DEFAULT_AGENT_MAX_ROWS_PER_QUERY,
@@ -1024,32 +1036,15 @@ fn default_agent_error_log_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_ERROR_LOG_PATH))
 }
 
-#[derive(Clone)]
-struct CachedIfcModel {
-    database_stamp: DatabaseStamp,
-    model: Arc<VelrIfcModel>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DatabaseStamp {
-    bytes: u64,
-    modified_unix_seconds: u64,
-    modified_subsec_nanos: u32,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IfcModelCacheStatus {
-    Hit,
-    Miss,
-    Reloaded,
+    ThreadLocal,
 }
 
 impl IfcModelCacheStatus {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Hit => "cache_hit",
-            Self::Miss => "cache_miss",
-            Self::Reloaded => "cache_reloaded",
+            Self::ThreadLocal => "thread_local",
         }
     }
 }
@@ -1068,6 +1063,8 @@ struct CypherApiRequest {
     cypher: String,
     #[serde(default)]
     resource_filter: Vec<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1183,6 +1180,35 @@ struct CypherApiResponse {
 struct CypherResourceError {
     resource: String,
     error: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CypherWorkerRequestPayload<'a> {
+    artifacts_root: &'a Path,
+    model_slug: &'a str,
+    cypher: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum CypherWorkerResponsePayload {
+    Ok {
+        columns: Vec<String>,
+        rows: Vec<Vec<String>>,
+        open_ms: u64,
+        query_ms: u64,
+    },
+    Error {
+        error: String,
+    },
+}
+
+#[derive(Debug)]
+struct CypherWorkerRun {
+    result: CypherQueryResult,
+    open_ms: u128,
+    query_ms: u128,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1678,6 +1704,39 @@ fn parse_env_u64_with_default(key: &str, default: u64) -> Result<u64, Box<dyn Er
             .map_err(|error| format!("{key} must be an unsigned integer: {error}").into()),
         Err(_) => Ok(default),
     }
+}
+
+impl CypherWorkerConfig {
+    fn from_env() -> Result<Self, Box<dyn Error>> {
+        let binary = match env::var("CC_W_CYPHER_WORKER_BINARY") {
+            Ok(path) if !path.trim().is_empty() => PathBuf::from(path),
+            _ => default_cypher_worker_binary()?,
+        };
+        let timeout_ms = parse_env_u64_with_default(
+            "CC_W_CYPHER_WORKER_TIMEOUT_MS",
+            DEFAULT_CYPHER_WORKER_TIMEOUT_MS,
+        )?;
+        Ok(Self {
+            binary,
+            timeout: Duration::from_millis(timeout_ms),
+        })
+    }
+
+    fn timeout_for_request(&self, requested_ms: Option<u64>) -> Duration {
+        requested_ms
+            .map(|value| value.clamp(1_000, MAX_CYPHER_WORKER_TIMEOUT_MS))
+            .map(Duration::from_millis)
+            .unwrap_or(self.timeout)
+    }
+}
+
+fn default_cypher_worker_binary() -> Result<PathBuf, Box<dyn Error>> {
+    let worker_name = if cfg!(windows) {
+        "cc-w-platform-web-cypher-worker.exe"
+    } else {
+        "cc-w-platform-web-cypher-worker"
+    };
+    Ok(env::current_exe()?.with_file_name(worker_name))
 }
 
 impl Args {
@@ -3183,15 +3242,213 @@ fn execute_cypher_api(
         &request.resource_filter,
         &state.ifc_artifacts_root,
     )?;
+    let worker_timeout = state.cypher_worker.timeout_for_request(request.timeout_ms);
     match scope {
         CypherResourceScope::Single(target) => {
-            execute_single_cypher_api(&request.resource, &target, &cypher, state)
+            execute_single_cypher_api(&request.resource, &target, &cypher, state, worker_timeout)
         }
         CypherResourceScope::Project {
             resource,
             label,
             targets,
-        } => execute_project_cypher_api(&resource, &label, &targets, &cypher, state),
+        } => {
+            execute_project_cypher_api(&resource, &label, &targets, &cypher, state, worker_timeout)
+        }
+    }
+}
+
+fn execute_cypher_worker(
+    state: &ServerState,
+    target: &CypherResourceTarget,
+    cypher: &str,
+    timeout: Duration,
+) -> Result<CypherWorkerRun, String> {
+    let payload = CypherWorkerRequestPayload {
+        artifacts_root: &state.ifc_artifacts_root,
+        model_slug: &target.model_slug,
+        cypher,
+    };
+    let input = serde_json::to_vec(&payload)
+        .map_err(|error| format!("could not encode Cypher worker request: {error}"))?;
+    let run_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp_dir = env::temp_dir();
+    let stdout_path = temp_dir.join(format!(
+        "cc-w-cypher-worker-{}-{run_id}.stdout.json",
+        std::process::id()
+    ));
+    let stderr_path = temp_dir.join(format!(
+        "cc-w-cypher-worker-{}-{run_id}.stderr.log",
+        std::process::id()
+    ));
+    let stdout_file = fs::File::create(&stdout_path).map_err(|error| {
+        format!(
+            "could not create Cypher worker stdout file {:?}: {error}",
+            stdout_path
+        )
+    })?;
+    let stderr_file = fs::File::create(&stderr_path).map_err(|error| {
+        format!(
+            "could not create Cypher worker stderr file {:?}: {error}",
+            stderr_path
+        )
+    })?;
+
+    let mut child = Command::new(&state.cypher_worker.binary)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "could not start Cypher worker `{}`: {error}",
+                state.cypher_worker.binary.display()
+            )
+        })?;
+
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Cypher worker stdin was not available".to_owned())
+        .and_then(|mut stdin| {
+            stdin
+                .write_all(&input)
+                .map_err(|error| format!("could not write Cypher worker request: {error}"))
+        });
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        cleanup_cypher_worker_files(&stdout_path, &stderr_path);
+        return Err(error);
+    }
+
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if should_stop_requested() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+                    cleanup_cypher_worker_files(&stdout_path, &stderr_path);
+                    return Err(format!(
+                        "Cypher worker for `{}` was stopped during shutdown{}",
+                        target.model_slug,
+                        format_worker_stderr(&stderr)
+                    ));
+                }
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+                    cleanup_cypher_worker_files(&stdout_path, &stderr_path);
+                    return Err(format!(
+                        "Cypher tool call timed out after {} ms for `{}` and the query process was killed. Refine the query or anchor it to a smaller set of nodes.{}",
+                        timeout.as_millis(),
+                        target.model_slug,
+                        format_worker_stderr(&stderr)
+                    ));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+                cleanup_cypher_worker_files(&stdout_path, &stderr_path);
+                return Err(format!(
+                    "could not poll Cypher worker for `{}`: {error}{}",
+                    target.model_slug,
+                    format_worker_stderr(&stderr)
+                ));
+            }
+        }
+    };
+
+    let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+    cleanup_cypher_worker_files(&stdout_path, &stderr_path);
+    if stdout.trim().is_empty() {
+        return Err(format!(
+            "Cypher worker `{}` for `{}` exited with status {} without JSON output.{}{}",
+            state.cypher_worker.binary.display(),
+            target.model_slug,
+            status,
+            format_worker_stdout(&stdout),
+            format_worker_stderr(&stderr)
+        ));
+    }
+    let response =
+        serde_json::from_str::<CypherWorkerResponsePayload>(stdout.trim()).map_err(|error| {
+            format!(
+                "Cypher worker `{}` for `{}` returned invalid JSON with status {}: {error}.{}{}",
+                state.cypher_worker.binary.display(),
+                target.model_slug,
+                status,
+                format_worker_stdout(&stdout),
+                format_worker_stderr(&stderr)
+            )
+        })?;
+
+    match response {
+        CypherWorkerResponsePayload::Ok {
+            columns,
+            rows,
+            open_ms,
+            query_ms,
+        } if status.success() => Ok(CypherWorkerRun {
+            result: CypherQueryResult { columns, rows },
+            open_ms: u128::from(open_ms),
+            query_ms: u128::from(query_ms),
+        }),
+        CypherWorkerResponsePayload::Ok { .. } => Err(format!(
+            "Cypher worker for `{}` exited with status {}{}",
+            target.model_slug,
+            status,
+            format_worker_stderr(&stderr)
+        )),
+        CypherWorkerResponsePayload::Error { error } => Err(format!(
+            "cypher execution failed for `{}`: {error}{}",
+            target.model_slug,
+            format_worker_stderr(&stderr)
+        )),
+    }
+}
+
+fn cleanup_cypher_worker_files(stdout_path: &Path, stderr_path: &Path) {
+    let _ = fs::remove_file(stdout_path);
+    let _ = fs::remove_file(stderr_path);
+}
+
+fn format_worker_stderr(stderr: &str) -> String {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!(" Worker stderr: {trimmed}")
+    }
+}
+
+fn format_worker_stdout(stdout: &str) -> String {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        " Worker stdout was empty.".to_owned()
+    } else {
+        format!(" Worker stdout: {}", shorten_for_log_line(trimmed, 1_000))
+    }
+}
+
+fn shorten_for_log_line(value: &str, limit: usize) -> String {
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = collapsed.chars();
+    let preview = chars.by_ref().take(limit).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
     }
 }
 
@@ -3200,27 +3457,19 @@ fn execute_single_cypher_api(
     target: &CypherResourceTarget,
     cypher: &str,
     state: &ServerState,
+    timeout: Duration,
 ) -> Result<(CypherApiResponse, CypherApiMetrics), String> {
-    let open_started = Instant::now();
-    let (model, cache_status) = cached_ifc_model(state, &target.model_slug)?;
-    let open_ms = open_started.elapsed().as_millis();
-    let query_started = Instant::now();
-    let query_result = model.execute_cypher_rows(cypher).map_err(|error| {
-        format!(
-            "cypher execution failed for `{}`: {error}",
-            target.model_slug
-        )
-    })?;
-    let query_ms = query_started.elapsed().as_millis();
+    let worker_run = execute_cypher_worker(state, target, cypher, timeout)?;
+    let query_result = worker_run.result;
     let extract_started = Instant::now();
     let semantic_element_ids =
         extract_semantic_element_ids(&query_result.columns, &query_result.rows);
     let extract_ids_ms = extract_started.elapsed().as_millis();
     let metrics = CypherApiMetrics {
         model_slug: target.model_slug.clone(),
-        model_cache_status: cache_status.as_str(),
-        open_ms,
-        query_ms,
+        model_cache_status: "worker",
+        open_ms: worker_run.open_ms,
+        query_ms: worker_run.query_ms,
         extract_ids_ms,
         columns: query_result.columns.len(),
         rows: query_result.rows.len(),
@@ -3245,6 +3494,7 @@ fn execute_project_cypher_api(
     targets: &[CypherResourceTarget],
     cypher: &str,
     state: &ServerState,
+    timeout: Duration,
 ) -> Result<(CypherApiResponse, CypherApiMetrics), String> {
     let mut columns = Vec::<String>::new();
     let mut rows = Vec::<Vec<String>>::new();
@@ -3254,15 +3504,9 @@ fn execute_project_cypher_api(
     let mut cache_statuses = BTreeMap::<&'static str, usize>::new();
 
     for target in targets {
-        let open_started = Instant::now();
-        let model = match cached_ifc_model(state, &target.model_slug) {
-            Ok((model, cache_status)) => {
-                *cache_statuses.entry(cache_status.as_str()).or_insert(0) += 1;
-                open_ms += open_started.elapsed().as_millis();
-                model
-            }
+        let worker_run = match execute_cypher_worker(state, target, cypher, timeout) {
+            Ok(run) => run,
             Err(error) => {
-                open_ms += open_started.elapsed().as_millis();
                 resource_errors.push(CypherResourceError {
                     resource: target.resource.clone(),
                     error,
@@ -3270,22 +3514,10 @@ fn execute_project_cypher_api(
                 continue;
             }
         };
-        let query_started = Instant::now();
-        let query_result = match model.execute_cypher_rows(cypher) {
-            Ok(result) => result,
-            Err(error) => {
-                query_ms += query_started.elapsed().as_millis();
-                resource_errors.push(CypherResourceError {
-                    resource: target.resource.clone(),
-                    error: format!(
-                        "cypher execution failed for `{}`: {error}",
-                        target.model_slug
-                    ),
-                });
-                continue;
-            }
-        };
-        query_ms += query_started.elapsed().as_millis();
+        *cache_statuses.entry("worker").or_insert(0) += 1;
+        open_ms += worker_run.open_ms;
+        query_ms += worker_run.query_ms;
+        let query_result = worker_run.result;
 
         if columns.is_empty() {
             columns.push("source_resource".to_owned());
@@ -4510,27 +4742,6 @@ impl BackendAgentReadonlyCypherRuntime for BoundedReadonlyCypherRuntime<'_> {
         why: Option<&str>,
     ) -> Result<BackendAgentReadonlyCypherResult, String> {
         let query_index = self.queries_executed + 1;
-        if let Err(error) = enforce_agent_runtime_budget(
-            self.queries_executed,
-            self.state.agent_runtime.max_queries_per_turn,
-        ) {
-            append_agent_query_log_entry(
-                self.state.agent_runtime.query_logger.as_ref(),
-                AgentQueryLogEntry::failure(
-                    self.state.agent_runtime.backend.label(),
-                    self.resource,
-                    self.schema_id,
-                    self.question,
-                    why,
-                    query,
-                    query_index,
-                    None,
-                    &error,
-                ),
-            );
-            return Err(error);
-        }
-
         let query = match validate_backend_agent_readonly_cypher(query) {
             Ok(query) => query,
             Err(error) => {
@@ -4672,26 +4883,6 @@ impl BackendAgentReadonlyCypherRuntime for BoundedReadonlyCypherRuntime<'_> {
         resource_filter: &[String],
     ) -> Result<BackendAgentReadonlyCypherResult, String> {
         let query_index = self.queries_executed + 1;
-        if let Err(error) = enforce_agent_runtime_budget(
-            self.queries_executed,
-            self.state.agent_runtime.max_queries_per_turn,
-        ) {
-            append_agent_query_log_entry(
-                self.state.agent_runtime.query_logger.as_ref(),
-                AgentQueryLogEntry::failure(
-                    self.state.agent_runtime.backend.label(),
-                    self.resource,
-                    self.schema_id,
-                    self.question,
-                    why,
-                    query,
-                    query_index,
-                    None,
-                    &error,
-                ),
-            );
-            return Err(error);
-        }
         let query = validate_backend_agent_readonly_cypher(query)?;
         let result = execute_agent_project_readonly_cypher(
             self.resource,
@@ -4752,10 +4943,6 @@ impl BackendAgentReadonlyCypherRuntime for BoundedReadonlyCypherRuntime<'_> {
     }
 
     fn get_schema_context(&mut self) -> Result<BackendAgentSchemaContext, String> {
-        enforce_agent_runtime_budget(
-            self.queries_executed,
-            self.state.agent_runtime.max_queries_per_turn,
-        )?;
         let schema = resolve_agent_resource_schema(self.resource, &self.state.ifc_artifacts_root)?;
         let context = load_schema_context(&self.state.ifc_artifacts_root, &schema)?;
         self.queries_executed = self.queries_executed.saturating_add(1);
@@ -4766,10 +4953,6 @@ impl BackendAgentReadonlyCypherRuntime for BoundedReadonlyCypherRuntime<'_> {
         &mut self,
         entity_names: &[String],
     ) -> Result<Vec<BackendAgentEntityReference>, String> {
-        enforce_agent_runtime_budget(
-            self.queries_executed,
-            self.state.agent_runtime.max_queries_per_turn,
-        )?;
         let schema = resolve_agent_resource_schema(self.resource, &self.state.ifc_artifacts_root)?;
         let references =
             load_entity_references(&self.state.ifc_artifacts_root, &schema, entity_names)?;
@@ -4782,10 +4965,6 @@ impl BackendAgentReadonlyCypherRuntime for BoundedReadonlyCypherRuntime<'_> {
         goal: &str,
         entity_names: &[String],
     ) -> Result<Vec<BackendAgentQueryPlaybook>, String> {
-        enforce_agent_runtime_budget(
-            self.queries_executed,
-            self.state.agent_runtime.max_queries_per_turn,
-        )?;
         let schema = resolve_agent_resource_schema(self.resource, &self.state.ifc_artifacts_root)?;
         let playbooks =
             load_query_playbooks(&self.state.ifc_artifacts_root, &schema, goal, entity_names)?;
@@ -4797,10 +4976,6 @@ impl BackendAgentReadonlyCypherRuntime for BoundedReadonlyCypherRuntime<'_> {
         &mut self,
         relation_names: &[String],
     ) -> Result<Vec<BackendAgentRelationReference>, String> {
-        enforce_agent_runtime_budget(
-            self.queries_executed,
-            self.state.agent_runtime.max_queries_per_turn,
-        )?;
         let schema = resolve_agent_resource_schema(self.resource, &self.state.ifc_artifacts_root)?;
         let references =
             load_relation_references(&self.state.ifc_artifacts_root, &schema, relation_names)?;
@@ -4812,10 +4987,6 @@ impl BackendAgentReadonlyCypherRuntime for BoundedReadonlyCypherRuntime<'_> {
         &mut self,
         db_node_ids: &[i64],
     ) -> Result<Vec<BackendAgentNodeSummary>, String> {
-        enforce_agent_runtime_budget(
-            self.queries_executed,
-            self.state.agent_runtime.max_queries_per_turn,
-        )?;
         let model_slug = validate_agent_resource(self.resource)?;
         let (model, _) = cached_ifc_model(self.state, model_slug)?;
         let nodes = fetch_agent_node_summaries(model.as_ref(), db_node_ids)?;
@@ -4827,10 +4998,6 @@ impl BackendAgentReadonlyCypherRuntime for BoundedReadonlyCypherRuntime<'_> {
         &mut self,
         db_node_id: i64,
     ) -> Result<BackendAgentNodePropertiesResult, String> {
-        enforce_agent_runtime_budget(
-            self.queries_executed,
-            self.state.agent_runtime.max_queries_per_turn,
-        )?;
         let model_slug = validate_agent_resource(self.resource)?;
         let (model, _) = cached_ifc_model(self.state, model_slug)?;
         let details = fetch_agent_node_properties(
@@ -4848,10 +5015,6 @@ impl BackendAgentReadonlyCypherRuntime for BoundedReadonlyCypherRuntime<'_> {
         hops: usize,
         mode: BackendAgentGraphMode,
     ) -> Result<BackendAgentNeighborGraph, String> {
-        enforce_agent_runtime_budget(
-            self.queries_executed,
-            self.state.agent_runtime.max_queries_per_turn,
-        )?;
         let model_slug = validate_agent_resource(self.resource)?;
         let (model, _) = cached_ifc_model(self.state, model_slug)?;
         let graph =
@@ -4868,27 +5031,6 @@ impl BackendAgentReadonlyCypherRuntime for UncachedReadonlyCypherRuntime<'_> {
         why: Option<&str>,
     ) -> Result<BackendAgentReadonlyCypherResult, String> {
         let query_index = self.queries_executed + 1;
-        if let Err(error) = enforce_agent_runtime_budget(
-            self.queries_executed,
-            self.state.agent_runtime.max_queries_per_turn,
-        ) {
-            append_agent_query_log_entry(
-                self.state.agent_runtime.query_logger.as_ref(),
-                AgentQueryLogEntry::failure(
-                    self.state.agent_runtime.backend.label(),
-                    self.resource,
-                    self.schema_id,
-                    self.question,
-                    why,
-                    query,
-                    query_index,
-                    None,
-                    &error,
-                ),
-            );
-            return Err(error);
-        }
-
         let query = match validate_backend_agent_readonly_cypher(query) {
             Ok(query) => query,
             Err(error) => {
@@ -5032,26 +5174,6 @@ impl BackendAgentReadonlyCypherRuntime for UncachedReadonlyCypherRuntime<'_> {
         resource_filter: &[String],
     ) -> Result<BackendAgentReadonlyCypherResult, String> {
         let query_index = self.queries_executed + 1;
-        if let Err(error) = enforce_agent_runtime_budget(
-            self.queries_executed,
-            self.state.agent_runtime.max_queries_per_turn,
-        ) {
-            append_agent_query_log_entry(
-                self.state.agent_runtime.query_logger.as_ref(),
-                AgentQueryLogEntry::failure(
-                    self.state.agent_runtime.backend.label(),
-                    self.resource,
-                    self.schema_id,
-                    self.question,
-                    why,
-                    query,
-                    query_index,
-                    None,
-                    &error,
-                ),
-            );
-            return Err(error);
-        }
         let query = validate_backend_agent_readonly_cypher(query)?;
         let result = execute_agent_project_readonly_cypher(
             self.resource,
@@ -5116,10 +5238,6 @@ impl BackendAgentReadonlyCypherRuntime for UncachedReadonlyCypherRuntime<'_> {
     }
 
     fn get_schema_context(&mut self) -> Result<BackendAgentSchemaContext, String> {
-        enforce_agent_runtime_budget(
-            self.queries_executed,
-            self.state.agent_runtime.max_queries_per_turn,
-        )?;
         let schema = resolve_agent_resource_schema(self.resource, &self.state.ifc_artifacts_root)?;
         let context = load_schema_context(&self.state.ifc_artifacts_root, &schema)?;
         self.queries_executed = self.queries_executed.saturating_add(1);
@@ -5130,10 +5248,6 @@ impl BackendAgentReadonlyCypherRuntime for UncachedReadonlyCypherRuntime<'_> {
         &mut self,
         entity_names: &[String],
     ) -> Result<Vec<BackendAgentEntityReference>, String> {
-        enforce_agent_runtime_budget(
-            self.queries_executed,
-            self.state.agent_runtime.max_queries_per_turn,
-        )?;
         let schema = resolve_agent_resource_schema(self.resource, &self.state.ifc_artifacts_root)?;
         let references =
             load_entity_references(&self.state.ifc_artifacts_root, &schema, entity_names)?;
@@ -5146,10 +5260,6 @@ impl BackendAgentReadonlyCypherRuntime for UncachedReadonlyCypherRuntime<'_> {
         goal: &str,
         entity_names: &[String],
     ) -> Result<Vec<BackendAgentQueryPlaybook>, String> {
-        enforce_agent_runtime_budget(
-            self.queries_executed,
-            self.state.agent_runtime.max_queries_per_turn,
-        )?;
         let schema = resolve_agent_resource_schema(self.resource, &self.state.ifc_artifacts_root)?;
         let playbooks =
             load_query_playbooks(&self.state.ifc_artifacts_root, &schema, goal, entity_names)?;
@@ -5161,10 +5271,6 @@ impl BackendAgentReadonlyCypherRuntime for UncachedReadonlyCypherRuntime<'_> {
         &mut self,
         relation_names: &[String],
     ) -> Result<Vec<BackendAgentRelationReference>, String> {
-        enforce_agent_runtime_budget(
-            self.queries_executed,
-            self.state.agent_runtime.max_queries_per_turn,
-        )?;
         let schema = resolve_agent_resource_schema(self.resource, &self.state.ifc_artifacts_root)?;
         let references =
             load_relation_references(&self.state.ifc_artifacts_root, &schema, relation_names)?;
@@ -5176,10 +5282,6 @@ impl BackendAgentReadonlyCypherRuntime for UncachedReadonlyCypherRuntime<'_> {
         &mut self,
         db_node_ids: &[i64],
     ) -> Result<Vec<BackendAgentNodeSummary>, String> {
-        enforce_agent_runtime_budget(
-            self.queries_executed,
-            self.state.agent_runtime.max_queries_per_turn,
-        )?;
         let model_slug = validate_agent_resource(self.resource)?;
         let layout = IfcArtifactLayout::new(&self.state.ifc_artifacts_root, model_slug);
         let model = VelrIfcModel::open(layout)
@@ -5193,10 +5295,6 @@ impl BackendAgentReadonlyCypherRuntime for UncachedReadonlyCypherRuntime<'_> {
         &mut self,
         db_node_id: i64,
     ) -> Result<BackendAgentNodePropertiesResult, String> {
-        enforce_agent_runtime_budget(
-            self.queries_executed,
-            self.state.agent_runtime.max_queries_per_turn,
-        )?;
         let model_slug = validate_agent_resource(self.resource)?;
         let layout = IfcArtifactLayout::new(&self.state.ifc_artifacts_root, model_slug);
         let model = VelrIfcModel::open(layout)
@@ -5216,10 +5314,6 @@ impl BackendAgentReadonlyCypherRuntime for UncachedReadonlyCypherRuntime<'_> {
         hops: usize,
         mode: BackendAgentGraphMode,
     ) -> Result<BackendAgentNeighborGraph, String> {
-        enforce_agent_runtime_budget(
-            self.queries_executed,
-            self.state.agent_runtime.max_queries_per_turn,
-        )?;
         let model_slug = validate_agent_resource(self.resource)?;
         let layout = IfcArtifactLayout::new(&self.state.ifc_artifacts_root, model_slug);
         let model = VelrIfcModel::open(layout)
@@ -5307,15 +5401,6 @@ fn agent_ui_action_from_backend(action: BackendAgentUiAction) -> AgentUiAction {
         BackendAgentUiAction::ViewerFrameVisible => AgentUiAction::ViewerFrameVisible,
         BackendAgentUiAction::ViewerClearInspection => AgentUiAction::ViewerClearInspection,
     }
-}
-
-fn enforce_agent_runtime_budget(executed: usize, maximum: usize) -> Result<(), String> {
-    if executed >= maximum {
-        return Err(format!(
-            "agent exceeded the read-only inspection budget for one turn ({maximum})"
-        ));
-    }
-    Ok(())
 }
 
 fn run_stub_agent_turn<F>(
@@ -6784,72 +6869,11 @@ fn cached_ifc_model(
     model_slug: &str,
 ) -> Result<(Arc<VelrIfcModel>, IfcModelCacheStatus), String> {
     let layout = IfcArtifactLayout::new(&state.ifc_artifacts_root, model_slug);
-    let database_stamp = database_stamp(&layout.database)?;
-
-    let cached = {
-        let cache = state
-            .ifc_model_cache
-            .lock()
-            .map_err(|_| "IFC model cache lock poisoned".to_owned())?;
-        cache.get(model_slug).cloned()
-    };
-    let had_cached_entry = cached.is_some();
-
-    if let Some(cached) = cached {
-        if cached.database_stamp == database_stamp {
-            return Ok((cached.model, IfcModelCacheStatus::Hit));
-        }
-    }
-
     let model = Arc::new(
         VelrIfcModel::open(layout)
             .map_err(|error| format!("failed to open IFC model `{model_slug}`: {error}"))?,
     );
-    let cache_status = if had_cached_entry {
-        IfcModelCacheStatus::Reloaded
-    } else {
-        IfcModelCacheStatus::Miss
-    };
-
-    let mut cache = state
-        .ifc_model_cache
-        .lock()
-        .map_err(|_| "IFC model cache lock poisoned".to_owned())?;
-    cache.insert(
-        model_slug.to_owned(),
-        CachedIfcModel {
-            database_stamp,
-            model: Arc::clone(&model),
-        },
-    );
-
-    Ok((model, cache_status))
-}
-
-fn database_stamp(path: &Path) -> Result<DatabaseStamp, String> {
-    let metadata = fs::metadata(path)
-        .map_err(|error| format!("failed to inspect database `{}`: {error}", path.display()))?;
-    let modified = metadata
-        .modified()
-        .map_err(|error| {
-            format!(
-                "failed to inspect database mtime `{}`: {error}",
-                path.display()
-            )
-        })?
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| {
-            format!(
-                "failed to normalize database mtime `{}`: {error}",
-                path.display()
-            )
-        })?;
-
-    Ok(DatabaseStamp {
-        bytes: metadata.len(),
-        modified_unix_seconds: modified.as_secs(),
-        modified_subsec_nanos: modified.subsec_nanos(),
-    })
+    Ok((model, IfcModelCacheStatus::ThreadLocal))
 }
 
 fn summarize_query_for_log(query: &str) -> String {
@@ -7117,9 +7141,10 @@ mod tests {
         AgentActionCandidate, AgentBackendErrorCategory, AgentReadonlyCypherResult, AgentSession,
         AgentSessionApiRequest, AgentTranscriptEvent, AgentTranscriptEventKind,
         AgentTurnApiRequest, AgentUiAction, CypherResourceScope, CypherResourceTarget,
-        GraphSubgraphMode, InspectionUpdateMode, PROJECT_BRIDGE_FOR_MINND_MEMBERS,
-        PROJECT_BUILDING_MEMBERS, PROJECT_GEOMETRY_LOCAL_ID_MASK, PROJECT_INFRA_MEMBERS,
-        ProjectResourceConfigFile, ProjectResourceRegistry, ServerState,
+        CypherWorkerConfig, DEFAULT_CYPHER_WORKER_TIMEOUT_MS, GraphSubgraphMode,
+        InspectionUpdateMode,
+        PROJECT_BRIDGE_FOR_MINND_MEMBERS, PROJECT_BUILDING_MEMBERS, PROJECT_GEOMETRY_LOCAL_ID_MASK,
+        PROJECT_INFRA_MEMBERS, ProjectResourceConfigFile, ProjectResourceRegistry, ServerState,
         add_cypher_source_provenance, agent_capabilities_response, agent_model_provider,
         agent_turn_selection_summary, available_server_resources, candidate_ports,
         content_type_for_path, create_agent_session_api, dedup_sorted_ids, default_level_for_model,
@@ -7136,18 +7161,18 @@ mod tests {
         validate_geometry_batch_id_count, validate_graph_limit, validate_project_member_resource,
     };
     use std::{
-        collections::{BTreeMap, HashMap},
+        collections::BTreeMap,
         fs,
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use crate::opencode_executor::{OpencodeDiscoveredModel, OpencodeExecutorConfig};
     use crate::{
         AgentBackend, AgentCapabilityOption, AgentErrorLogger, AgentQueryLogger,
-        AgentRuntimeConfig, AgentSessionStore, DEFAULT_AGENT_MAX_READONLY_QUERIES_PER_TURN,
-        DEFAULT_AGENT_MAX_ROWS_PER_QUERY, GraphSubgraphNode, NullAgentProgressSink,
+        AgentRuntimeConfig, AgentSessionStore, DEFAULT_AGENT_MAX_ROWS_PER_QUERY, GraphSubgraphNode,
+        NullAgentProgressSink,
     };
     use cc_w_types::{
         Bounds3, ExternalId, GeometryDefinitionBatch, GeometryDefinitionId, GeometryInstanceBatch,
@@ -7181,7 +7206,10 @@ mod tests {
             root: PathBuf::from("."),
             ifc_artifacts_root: ifc_artifacts_root.clone(),
             project_registry: Arc::new(ProjectResourceRegistry::default()),
-            ifc_model_cache: Mutex::new(HashMap::new()),
+            cypher_worker: CypherWorkerConfig {
+                binary: PathBuf::from("cc-w-platform-web-cypher-worker"),
+                timeout: Duration::from_millis(DEFAULT_CYPHER_WORKER_TIMEOUT_MS),
+            },
             agent_sessions: Arc::new(Mutex::new(AgentSessionStore::default())),
             agent_turns: Arc::new(Mutex::new(crate::AgentTurnStore::default())),
             agent_runtime: AgentRuntimeConfig {
@@ -7198,7 +7226,6 @@ mod tests {
                 levels_by_model: BTreeMap::new(),
                 default_model_id: Some("stub/default".to_owned()),
                 default_level_id: Some("standard".to_owned()),
-                max_queries_per_turn: DEFAULT_AGENT_MAX_READONLY_QUERIES_PER_TURN,
                 max_rows_per_query: DEFAULT_AGENT_MAX_ROWS_PER_QUERY,
                 query_logger: Arc::new(AgentQueryLogger::new(
                     ifc_artifacts_root.join("agent-query-log.jsonl"),

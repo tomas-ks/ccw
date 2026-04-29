@@ -1,0 +1,123 @@
+{
+  "schemaId": "IFC2X3_TC1",
+  "schemaSlug": "ifc2x3_tc1",
+  "summary": "Full IFC2X3 runtime bundle for building-centric models. Use it for classic project/site/building/storey decomposition, product containment, and roof-to-slab aggregate traversal. In this schema, IfcRoof exposes ShapeType rather than the later PredefinedType field.",
+  "cautions": [
+    "IfcRoof uses ShapeType in IFC2X3_TC1; do not look for IfcRoof.PredefinedType here.",
+    "IfcRoof and IfcSlab both sit under IfcBuildingElement in this schema, not the later IfcBuiltElement family.",
+    "A direct roof hide may fail if the visible roof geometry is carried by related slabs rather than the IfcRoof node itself.",
+    "Use DB node ids for graph actions and GlobalId values for viewer element actions."
+  ],
+  "queryHabits": [
+    "Use id(n) AS node_id when you want graph seeds or graph explanations.",
+    "Use GlobalId AS global_id when you want hide, show, or select actions in the viewer.",
+    "Start with small local queries and add LIMIT unless the task clearly needs a full scan.",
+    "Inspect aggregate, containment, type, property, and material relations before trusting an enum to explain an element's role.",
+    "Treat IfcRoof as a semantic starting point and inspect related slabs before trying viewer element actions."
+  ],
+  "entities": {
+    "IfcProject": {
+      "summary": "Semantic root for the IFC model. Good default seed when the user wants to orient the graph around the whole project.",
+      "commonRelations": [
+        "IfcRelAggregates",
+        "IfcUnitAssignment",
+        "IfcRepresentationContext"
+      ],
+      "queryPatterns": [
+        "MATCH (p:IfcProject) RETURN id(p) AS node_id LIMIT 1"
+      ]
+    },
+    "IfcBuildingStorey": {
+      "summary": "Spatial structure node used for storey membership and containment explanations.",
+      "commonRelations": [
+        "IfcRelAggregates",
+        "IfcRelContainedInSpatialStructure",
+        "IfcRelReferencedInSpatialStructure"
+      ],
+      "queryPatterns": [
+        "MATCH (s:IfcBuildingStorey) RETURN id(s) AS node_id LIMIT 8"
+      ]
+    },
+    "IfcRoof": {
+      "summary": "Semantic roof product. Often an aggregate parent rather than the node that carries visible roof geometry.",
+      "commonRelations": [
+        "IfcRelAggregates",
+        "IfcRelContainedInSpatialStructure",
+        "IfcRelDefinesByProperties"
+      ],
+      "queryPatterns": [
+        "MATCH (r:IfcRoof) RETURN id(r) AS node_id LIMIT 8",
+        "MATCH (:IfcRoof)<--(:IfcRelAggregates)-->(slab:IfcSlab) RETURN DISTINCT id(slab) AS node_id LIMIT 16"
+      ]
+    },
+    "IfcSlab": {
+      "summary": "General slab product. Often carries visible roof or floor geometry and is usually the better target for viewer actions.",
+      "commonRelations": [
+        "IfcRelAggregates",
+        "IfcRelContainedInSpatialStructure",
+        "IfcRelDefinesByType",
+        "IfcRelDefinesByProperties",
+        "IfcRelAssociatesMaterial"
+      ],
+      "queryPatterns": [
+        "MATCH (slab:IfcSlab) RETURN id(slab) AS node_id LIMIT 8",
+        "MATCH (:IfcRoof)<--(:IfcRelAggregates)-->(slab:IfcSlab) RETURN DISTINCT slab.GlobalId AS global_id LIMIT 32"
+      ]
+    },
+    "IfcRelAggregates": {
+      "summary": "Main decomposition/aggregate relation. Use it for project/site/building/storey hierarchy and for roof-to-slab traversal.",
+      "commonRelations": [
+        "RELATING_OBJECT",
+        "RELATED_OBJECTS"
+      ],
+      "queryPatterns": [
+        "MATCH (:IfcRoof)<--(:IfcRelAggregates)-->(slab:IfcSlab) RETURN DISTINCT id(slab) AS node_id LIMIT 16"
+      ]
+    },
+    "IfcRelContainedInSpatialStructure": {
+      "summary": "Containment relation between products and spatial structure such as storeys and buildings.",
+      "commonRelations": [
+        "RELATED_ELEMENTS",
+        "RELATING_STRUCTURE"
+      ],
+      "queryPatterns": [
+        "MATCH (e:IfcWall)<--(:IfcRelContainedInSpatialStructure)-->(s:IfcBuildingStorey) RETURN id(e) AS node_id, id(s) AS storey_node_id LIMIT 16"
+      ]
+    },
+    "IfcRelDefinesByType": {
+      "summary": "Type attachment relation. Useful when the product label is too weak to explain the element's role cleanly.",
+      "commonRelations": [
+        "RELATED_OBJECTS",
+        "RELATING_TYPE"
+      ]
+    },
+    "IfcRelDefinesByProperties": {
+      "summary": "Property-set attachment relation. Use it when type or enum values are too opaque to answer in human terms.",
+      "commonRelations": [
+        "RELATED_OBJECTS",
+        "RELATING_PROPERTY_DEFINITION"
+      ]
+    },
+    "IfcRelAssociatesMaterial": {
+      "summary": "Material attachment relation. Useful for questions about what a wall or slab is made from.",
+      "commonRelations": [
+        "RELATED_OBJECTS",
+        "RELATING_MATERIAL"
+      ]
+    }
+  },
+  "queryPlaybooks": {
+    "projectSeed": [
+      "MATCH (p:IfcProject) RETURN id(p) AS node_id LIMIT 1"
+    ],
+    "wallNeighborhood": [
+      "MATCH (w:IfcWall) RETURN id(w) AS node_id LIMIT 8"
+    ],
+    "roofToSlabsGraph": [
+      "MATCH (:IfcRoof)<--(:IfcRelAggregates)-->(slab:IfcSlab) RETURN DISTINCT id(slab) AS node_id LIMIT 16"
+    ],
+    "roofToSlabsViewer": [
+      "MATCH (:IfcRoof)<--(:IfcRelAggregates)-->(slab:IfcSlab) RETURN DISTINCT slab.GlobalId AS global_id LIMIT 32"
+    ]
+  }
+}

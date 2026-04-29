@@ -8,7 +8,7 @@ use cc_w_types::{
     GeometryStreamPlanReason, GeometryStreamingBudget, PreparedGeometryDefinition,
     PreparedGeometryElement, PreparedGeometryInstance, PreparedGeometryPackage, PreparedMaterial,
     PreparedRenderDefinition, PreparedRenderInstance, PreparedRenderRole, PreparedRenderScene,
-    ResidencyState, ResolvedGeometryStartView, SemanticElementId,
+    ResidencyState, ResolvedGeometryStartView, SectionState, SemanticElementId,
 };
 use glam::{DVec3, DVec4};
 use std::collections::{HashMap, HashSet};
@@ -136,6 +136,7 @@ pub struct RuntimeSceneState {
     resident_definitions: HashMap<GeometryDefinitionId, PreparedGeometryDefinition>,
     start_view: GeometryStartViewRequest,
     base_visible_element_ids: HashSet<SemanticElementId>,
+    section: Option<SectionState>,
 }
 
 impl RuntimeSceneState {
@@ -205,6 +206,7 @@ impl RuntimeSceneState {
             resident_definitions: HashMap::new(),
             start_view: GeometryStartViewRequest::Default,
             base_visible_element_ids: HashSet::new(),
+            section: None,
         };
         scene.apply_start_view(start_view);
         Ok(scene)
@@ -762,6 +764,20 @@ impl RuntimeSceneState {
             }
         }
         changed
+    }
+
+    pub fn set_section(&mut self, section: SectionState) {
+        self.section = Some(section);
+    }
+
+    pub fn clear_section(&mut self) -> bool {
+        let had_section = self.section.is_some();
+        self.section = None;
+        had_section
+    }
+
+    pub fn section_state(&self) -> Option<&SectionState> {
+        self.section.as_ref()
     }
 
     pub fn visible_bounds(&self) -> Option<Bounds3> {
@@ -2486,6 +2502,37 @@ mod tests {
             vec![right_id.clone()]
         );
         assert_eq!(runtime_scene.remove_inspection_focus([&left_id]), 0);
+    }
+
+    #[test]
+    fn runtime_scene_tracks_section_state() {
+        let mut runtime_scene = RuntimeSceneState::from_prepared_package(mapped_triangle_package(
+            "Synthetic Mapped Triangle",
+            "synthetic/mapped/left",
+        ))
+        .expect("scene");
+
+        assert!(runtime_scene.section_state().is_none());
+        assert!(!runtime_scene.clear_section());
+
+        let pose = cc_w_types::SectionPose::new(
+            DVec3::new(12.0, 4.0, 0.0),
+            DVec3::Y,
+            DVec3::X,
+            DVec3::Z,
+        );
+        let mut section = SectionState::new("ifc/bridge-for-minnd", pose);
+        section.alignment_id = Some("alignment/global-id".to_string());
+        section.station = Some(120.0);
+        section.provenance = vec![
+            "IfcAlignment global id alignment/global-id".to_string(),
+            "Station resolved from explicit IFC placement facts".to_string(),
+        ];
+
+        runtime_scene.set_section(section.clone());
+        assert_eq!(runtime_scene.section_state(), Some(&section));
+        assert!(runtime_scene.clear_section());
+        assert!(runtime_scene.section_state().is_none());
     }
 
     #[test]

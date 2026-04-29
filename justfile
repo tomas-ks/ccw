@@ -154,17 +154,18 @@ web-viewer-build-release:
 
 web-viewer:
     just web-viewer-build
+    cargo build -p cc-w-platform-web --features native-server --bin cc-w-platform-web-cypher-worker
     cargo run -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server -- --root crates/cc-w-platform-web/artifacts/viewer --port 8001
 
 web-viewer-electron-build:
     just web-viewer-build
     if [[ ! -d crates/cc-w-platform-web/web/node_modules/electron ]]; then npm ci --prefix crates/cc-w-platform-web/web; fi
-    cargo build -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server
+    cargo build -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server --bin cc-w-platform-web-cypher-worker
 
 web-viewer-electron-build-release:
     just web-viewer-build-release
     if [[ ! -d crates/cc-w-platform-web/web/node_modules/electron ]]; then npm ci --prefix crates/cc-w-platform-web/web; fi
-    cargo build --release -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server
+    cargo build --release -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server --bin cc-w-platform-web-cypher-worker
 
 web-viewer-electron:
     just web-viewer-electron-build
@@ -210,8 +211,12 @@ opencode-login:
     mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
     HOME="$PWD/.tools/opencode/home" XDG_CACHE_HOME="$PWD/.tools/opencode/cache" XDG_DATA_HOME="$PWD/.tools/opencode/data" XDG_CONFIG_HOME="$PWD/.tools/opencode/config" XDG_STATE_HOME="$PWD/.tools/opencode/state" OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" .tools/opencode/bin/opencode auth login
 
-web-viewer-opencode:
+opencode-sync-agents:
+    node tools/opencode/sync-agents.mjs
+
+web-viewer-opencode: opencode-sync-agents
     just web-viewer-build
+    cargo build -p cc-w-platform-web --features native-server --bin cc-w-platform-web-cypher-worker
     test -x .tools/opencode/bin/opencode
     mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
     # Model discovery stays narrowed by tools/opencode/provider-whitelist.json.
@@ -231,6 +236,7 @@ web-viewer-opencode:
         XDG_CONFIG_HOME="$PWD/.tools/opencode/config" \
         XDG_STATE_HOME="$PWD/.tools/opencode/state" \
         OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
+        CC_W_CYPHER_WORKER_BINARY="$PWD/target/debug/cc-w-platform-web-cypher-worker" \
         CC_W_AGENT_BACKEND=opencode \
         CC_W_OPENCODE_EXECUTABLE="$PWD/.tools/opencode/bin/opencode" \
         CC_W_OPENCODE_WORKDIR="$PWD" \
@@ -238,10 +244,10 @@ web-viewer-opencode:
         CC_W_OPENCODE_AGENT="$agent_default" \
         CC_W_OPENCODE_MODEL="$model_default" \
         CC_W_OPENCODE_DISCOVER_MODELS="${CC_W_OPENCODE_DISCOVER_MODELS:-1}" \
-        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-45000}" \
+        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-180000}" \
         cargo run -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server -- --root crates/cc-w-platform-web/artifacts/viewer --port 8001
 
-web-viewer-opencode-electron:
+web-viewer-opencode-electron: opencode-sync-agents
     just web-viewer-electron-build
     test -x .tools/opencode/bin/opencode
     mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
@@ -260,6 +266,7 @@ web-viewer-opencode-electron:
         XDG_CONFIG_HOME="$PWD/.tools/opencode/config" \
         XDG_STATE_HOME="$PWD/.tools/opencode/state" \
         OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
+        CC_W_CYPHER_WORKER_BINARY="$PWD/target/debug/cc-w-platform-web-cypher-worker" \
         CC_W_AGENT_BACKEND=opencode \
         CC_W_OPENCODE_EXECUTABLE="$PWD/.tools/opencode/bin/opencode" \
         CC_W_OPENCODE_WORKDIR="$PWD" \
@@ -267,10 +274,10 @@ web-viewer-opencode-electron:
         CC_W_OPENCODE_AGENT="$agent_default" \
         CC_W_OPENCODE_MODEL="$model_default" \
         CC_W_OPENCODE_DISCOVER_MODELS="${CC_W_OPENCODE_DISCOVER_MODELS:-1}" \
-        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-45000}" \
+        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-180000}" \
         npm run electron --prefix crates/cc-w-platform-web/web
 
-web-viewer-opencode-electron-release:
+web-viewer-opencode-electron-release: opencode-sync-agents
     just web-viewer-electron-build-release
     test -x .tools/opencode/bin/opencode
     mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
@@ -290,6 +297,7 @@ web-viewer-opencode-electron-release:
         XDG_STATE_HOME="$PWD/.tools/opencode/state" \
         OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" \
         CC_W_WEB_SERVER_BINARY="$PWD/target/release/cc-w-platform-web-server" \
+        CC_W_CYPHER_WORKER_BINARY="$PWD/target/release/cc-w-platform-web-cypher-worker" \
         CC_W_AGENT_BACKEND=opencode \
         CC_W_OPENCODE_EXECUTABLE="$PWD/.tools/opencode/bin/opencode" \
         CC_W_OPENCODE_WORKDIR="$PWD" \
@@ -297,11 +305,12 @@ web-viewer-opencode-electron-release:
         CC_W_OPENCODE_AGENT="$agent_default" \
         CC_W_OPENCODE_MODEL="$model_default" \
         CC_W_OPENCODE_DISCOVER_MODELS="${CC_W_OPENCODE_DISCOVER_MODELS:-1}" \
-        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-45000}" \
+        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-180000}" \
         npm run electron --prefix crates/cc-w-platform-web/web
 
-web-viewer-opencode-strict:
+web-viewer-opencode-strict: opencode-sync-agents
     just web-viewer-build
+    cargo build -p cc-w-platform-web --features native-server --bin cc-w-platform-web-cypher-worker
     test -x .tools/opencode/bin/opencode
     mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
     # Strict IFC agent profile for Gemma-like models: canonical `ifc_*` tools only.
@@ -321,11 +330,12 @@ web-viewer-opencode-strict:
         CC_W_OPENCODE_AGENT="${CC_W_OPENCODE_AGENT:-ifc-explorer-strict}" \
         CC_W_OPENCODE_MODEL="${CC_W_OPENCODE_MODEL:-ollama/gemma4:e4b}" \
         CC_W_OPENCODE_DISCOVER_MODELS="${CC_W_OPENCODE_DISCOVER_MODELS:-1}" \
-        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-45000}" \
+        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-180000}" \
         cargo run -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server -- --root crates/cc-w-platform-web/artifacts/viewer --port 8001
 
-web-viewer-opencode-42:
+web-viewer-opencode-42: opencode-sync-agents
     just web-viewer-build
+    cargo build -p cc-w-platform-web --features native-server --bin cc-w-platform-web-cypher-worker
     test -x .tools/opencode/bin/opencode
     mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
     # Debug agent: literal `42` smoke test with no tools.
@@ -345,11 +355,12 @@ web-viewer-opencode-42:
         CC_W_OPENCODE_AGENT="${CC_W_OPENCODE_AGENT:-ifc-answer-42}" \
         CC_W_OPENCODE_MODEL="${CC_W_OPENCODE_MODEL:-ollama/gemma4:e4b}" \
         CC_W_OPENCODE_DISCOVER_MODELS="${CC_W_OPENCODE_DISCOVER_MODELS:-1}" \
-        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-45000}" \
+        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-180000}" \
         cargo run -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server -- --root crates/cc-w-platform-web/artifacts/viewer --port 8001
 
-web-viewer-opencode-cypher-only:
+web-viewer-opencode-cypher-only: opencode-sync-agents
     just web-viewer-build
+    cargo build -p cc-w-platform-web --features native-server --bin cc-w-platform-web-cypher-worker
     test -x .tools/opencode/bin/opencode
     mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
     # Debug agent: only `ifc_readonly_cypher` is allowed.
@@ -369,11 +380,12 @@ web-viewer-opencode-cypher-only:
         CC_W_OPENCODE_AGENT="${CC_W_OPENCODE_AGENT:-ifc-readonly-cypher-only}" \
         CC_W_OPENCODE_MODEL="${CC_W_OPENCODE_MODEL:-ollama/gemma4:e4b}" \
         CC_W_OPENCODE_DISCOVER_MODELS="${CC_W_OPENCODE_DISCOVER_MODELS:-1}" \
-        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-45000}" \
+        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-180000}" \
         cargo run -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server -- --root crates/cc-w-platform-web/artifacts/viewer --port 8001
 
-web-viewer-opencode-playbook-cypher:
+web-viewer-opencode-playbook-cypher: opencode-sync-agents
     just web-viewer-build
+    cargo build -p cc-w-platform-web --features native-server --bin cc-w-platform-web-cypher-worker
     test -x .tools/opencode/bin/opencode
     mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
     # Debug agent: only query playbooks and read-only Cypher are allowed.
@@ -393,10 +405,10 @@ web-viewer-opencode-playbook-cypher:
         CC_W_OPENCODE_AGENT="${CC_W_OPENCODE_AGENT:-ifc-playbook-cypher-only}" \
         CC_W_OPENCODE_MODEL="${CC_W_OPENCODE_MODEL:-ollama/gemma4:e4b}" \
         CC_W_OPENCODE_DISCOVER_MODELS="${CC_W_OPENCODE_DISCOVER_MODELS:-1}" \
-        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-45000}" \
+        CC_W_OPENCODE_TIMEOUT_MS="${CC_W_OPENCODE_TIMEOUT_MS:-180000}" \
         cargo run -p cc-w-platform-web --features native-server --bin cc-w-platform-web-server -- --root crates/cc-w-platform-web/artifacts/viewer --port 8001
 
-opencode-smoke:
+opencode-smoke: opencode-sync-agents
     test -x .tools/opencode/bin/opencode
     mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
     log_file="$PWD/.tools/opencode/state/opencode-smoke.log"; \
@@ -419,7 +431,7 @@ opencode-smoke:
     wait "$pid" || true; \
     cat "$log_file"
 
-opencode-acp:
+opencode-acp: opencode-sync-agents
     test -x .tools/opencode/bin/opencode
     mkdir -p .tools/opencode/home .tools/opencode/cache .tools/opencode/data .tools/opencode/config .tools/opencode/state
     HOME="$PWD/.tools/opencode/home" XDG_CACHE_HOME="$PWD/.tools/opencode/cache" XDG_DATA_HOME="$PWD/.tools/opencode/data" XDG_CONFIG_HOME="$PWD/.tools/opencode/config" XDG_STATE_HOME="$PWD/.tools/opencode/state" OPENCODE_CONFIG="$PWD/tools/opencode/opencode.json" CC_W_OPENCODE_ACP_HOSTNAME="${CC_W_OPENCODE_ACP_HOSTNAME:-127.0.0.1}" CC_W_OPENCODE_ACP_PORT="${CC_W_OPENCODE_ACP_PORT:-0}" .tools/opencode/bin/opencode acp --pure --hostname "${CC_W_OPENCODE_ACP_HOSTNAME:-127.0.0.1}" --port "${CC_W_OPENCODE_ACP_PORT:-0}"

@@ -23,6 +23,16 @@ export function resolvePropertiesBalloonDom(doc = globalThis.document) {
     pickAnchorMarker: doc?.getElementById?.("pick-anchor-marker") || null,
     propertiesBalloon: doc?.getElementById?.("properties-balloon") || null,
     propertiesCloseButton: doc?.getElementById?.("properties-close-button") || null,
+    propertiesGraphButton: doc?.getElementById?.("properties-graph-button") || null,
+    propertiesTitle: doc?.getElementById?.("properties-title") || null,
+    propertiesSubtitle: doc?.getElementById?.("properties-subtitle") || null,
+    propertiesEmptyState: doc?.getElementById?.("properties-empty-state") || null,
+    propertiesCoreSection: doc?.getElementById?.("properties-core-section") || null,
+    propertiesCoreGrid: doc?.getElementById?.("properties-core-grid") || null,
+    propertiesExtraSection: doc?.getElementById?.("properties-extra-section") || null,
+    propertiesExtraGrid: doc?.getElementById?.("properties-extra-grid") || null,
+    propertiesRelationsSection: doc?.getElementById?.("properties-relations-section") || null,
+    propertiesRelationsList: doc?.getElementById?.("properties-relations-list") || null,
   };
 }
 
@@ -42,102 +52,6 @@ export function applyHiddenPropertiesBalloon({
   hidePickAnchorMarker(pickAnchorMarker);
 }
 
-export function propertiesBalloonClientAnchor(
-  clientX,
-  clientY,
-  {
-    kind = "client",
-    anchored = false,
-    marker = false,
-  } = {}
-) {
-  return {
-    kind,
-    clientX,
-    clientY,
-    anchored,
-    marker,
-  };
-}
-
-export function propertiesBalloonOpenAction({
-  source = "none",
-  anchor = null,
-} = {}) {
-  return {
-    type: "balloon/open",
-    source,
-    anchor,
-  };
-}
-
-export function propertiesBalloonCloseAction({ dismissed = undefined } = {}) {
-  return {
-    type: "balloon/close",
-    dismissed,
-  };
-}
-
-export function propertiesBalloonDismissAction() {
-  return { type: "balloon/dismiss" };
-}
-
-export function openPropertiesBalloonAtClientPoint(
-  appStateStore,
-  clientX,
-  clientY,
-  {
-    anchored = false,
-    marker = false,
-    source = "none",
-    kind = "client",
-  } = {}
-) {
-  return appStateStore.dispatch(
-    propertiesBalloonOpenAction({
-      source,
-      anchor: propertiesBalloonClientAnchor(clientX, clientY, {
-        kind,
-        anchored,
-        marker,
-      }),
-    })
-  );
-}
-
-export function openPropertiesBalloonAtViewportCenter(
-  appStateStore,
-  viewport,
-  { source = "none" } = {}
-) {
-  if (!viewport) {
-    return null;
-  }
-  const rect = viewport.getBoundingClientRect();
-  return openPropertiesBalloonAtClientPoint(
-    appStateStore,
-    rect.left + rect.width / 2,
-    rect.top + rect.height / 2,
-    {
-      source,
-      kind: "viewport-center",
-      anchored: false,
-      marker: false,
-    }
-  );
-}
-
-export function closePropertiesBalloon(appStateStore, options = {}) {
-  return appStateStore.dispatch(propertiesBalloonCloseAction(options));
-}
-
-export function dismissPropertiesBalloon(appStateStore, state = null) {
-  if (state) {
-    state.propertiesBalloonDismissed = true;
-  }
-  return appStateStore.dispatch(propertiesBalloonDismissAction());
-}
-
 export function positionPropertiesBalloonAtClientPoint(
   {
     viewport = null,
@@ -149,14 +63,10 @@ export function positionPropertiesBalloonAtClientPoint(
   {
     anchored = false,
     marker = false,
-    state = null,
   } = {}
 ) {
   if (!propertiesBalloon || !viewport) {
     return false;
-  }
-  if (state) {
-    state.propertiesBalloonDismissed = false;
   }
 
   const viewportRect = viewport.getBoundingClientRect();
@@ -216,124 +126,187 @@ export function positionPropertiesBalloonAtClientPoint(
   return true;
 }
 
-export function syncPropertiesBalloonFromAppState(
-  app,
-  {
-    dom = {},
-    state = null,
-    applyHidden = () => applyHiddenPropertiesBalloon(dom),
-    positionAtClientPoint = (clientX, clientY, options = {}) =>
-      positionPropertiesBalloonAtClientPoint(dom, clientX, clientY, {
-        ...options,
-        state,
-      }),
-  } = {}
-) {
-  const balloon = app?.balloon || {};
-  if (state) {
-    state.propertiesBalloonDismissed = Boolean(balloon.dismissed);
-  }
-  if (!balloon.open || !balloon.anchor) {
-    applyHidden();
+export function positionPropertiesBalloonFromAnchor(dom = {}, anchor = null) {
+  if (
+    !anchor ||
+    !(
+      anchor.kind === "client" ||
+      anchor.kind === "viewport-center" ||
+      (Number.isFinite(anchor.clientX) && Number.isFinite(anchor.clientY))
+    )
+  ) {
+    applyHiddenPropertiesBalloon(dom);
     return false;
   }
-  const anchor = balloon.anchor || {};
-  if (
-    anchor.kind === "client" ||
-    anchor.kind === "viewport-center" ||
-    (Number.isFinite(anchor.clientX) && Number.isFinite(anchor.clientY))
-  ) {
-    return positionAtClientPoint(anchor.clientX, anchor.clientY, {
-      anchored: Boolean(anchor.anchored),
-      marker: Boolean(anchor.marker),
-    });
-  }
-  applyHidden();
-  return false;
+  return positionPropertiesBalloonAtClientPoint(dom, anchor.clientX, anchor.clientY, {
+    anchored: Boolean(anchor.anchored),
+    marker: Boolean(anchor.marker),
+  });
 }
 
-export function createPropertiesBalloonController({
-  appStateStore,
-  state = {},
-  document: doc = globalThis.document,
-  dom = resolvePropertiesBalloonDom(doc),
-  subscribe = true,
-} = {}) {
-  if (!appStateStore) {
-    throw new Error("createPropertiesBalloonController requires appStateStore.");
+export function formatPropertyLabel(label) {
+  return String(label || "")
+    .replace(/_/g, " ")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function propertyValueText(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+  return typeof value === "object" ? JSON.stringify(value) : String(value);
+}
+
+function ownerDocumentForDom(dom = {}) {
+  return (
+    dom.propertiesBalloon?.ownerDocument ||
+    dom.propertiesCoreGrid?.ownerDocument ||
+    globalThis.document
+  );
+}
+
+function rowLabel(row) {
+  return Array.isArray(row) ? row[0] : row?.label;
+}
+
+function rowValue(row) {
+  return Array.isArray(row) ? row[1] : row?.value;
+}
+
+export function createPropertyRow(label, value, doc = globalThis.document) {
+  const fragment = doc.createDocumentFragment();
+  const dt = doc.createElement("div");
+  dt.className = "property-label";
+  dt.textContent = formatPropertyLabel(label);
+  const dd = doc.createElement("div");
+  dd.className = "property-value";
+  dd.textContent = value;
+  fragment.append(dt, dd);
+  return fragment;
+}
+
+function createPropertyRows(rows, doc) {
+  return (Array.isArray(rows) ? rows : [])
+    .map((row) => [rowLabel(row), propertyValueText(rowValue(row))])
+    .filter(([, value]) => value !== null)
+    .map(([label, value]) => createPropertyRow(label, value, doc));
+}
+
+function relationTitle(relation) {
+  return (
+    relation?.title ||
+    relation?.type ||
+    relation?.label ||
+    relation?.name ||
+    relation?.relationshipType ||
+    "Relation"
+  );
+}
+
+function relationDetail(relation) {
+  return (
+    relation?.detail ||
+    relation?.targetLabel ||
+    relation?.target ||
+    relation?.description ||
+    relation?.to ||
+    ""
+  );
+}
+
+export function createRelationRow(relation, doc = globalThis.document) {
+  const row = doc.createElement("div");
+  row.className = "relation-row";
+  const title = doc.createElement("strong");
+  title.textContent = relationTitle(relation);
+  const detail = doc.createElement("span");
+  detail.textContent = relationDetail(relation);
+  row.append(title, detail);
+  return row;
+}
+
+function replaceSectionRows(section, container, rows, rowFactory) {
+  if (!container || !section) {
+    return 0;
+  }
+  const renderedRows = rowFactory(rows);
+  container.replaceChildren(...renderedRows);
+  section.hidden = renderedRows.length === 0;
+  return renderedRows.length;
+}
+
+export function resetPropertiesBalloonContent(dom = {}) {
+  dom.propertiesCoreGrid?.replaceChildren();
+  if (dom.propertiesCoreSection) {
+    dom.propertiesCoreSection.hidden = true;
+  }
+  dom.propertiesExtraGrid?.replaceChildren();
+  if (dom.propertiesExtraSection) {
+    dom.propertiesExtraSection.hidden = true;
+  }
+  dom.propertiesRelationsList?.replaceChildren();
+  if (dom.propertiesRelationsSection) {
+    dom.propertiesRelationsSection.hidden = true;
+  }
+}
+
+export function setPropertiesGraphButtonVisible(dom = {}, visible = false) {
+  if (dom.propertiesGraphButton) {
+    dom.propertiesGraphButton.hidden = !visible;
+  }
+}
+
+export function renderPropertiesBalloonView(dom = {}, view = {}) {
+  const doc = ownerDocumentForDom(dom);
+  if (dom.propertiesTitle && view.title !== undefined) {
+    dom.propertiesTitle.textContent = view.title;
+  }
+  if (dom.propertiesSubtitle && view.subtitle !== undefined) {
+    dom.propertiesSubtitle.textContent = view.subtitle;
   }
 
-  const applyHidden = () => applyHiddenPropertiesBalloon(dom);
+  const coreRows = Array.isArray(view.coreRows) ? view.coreRows : [];
+  const extraRows = Array.isArray(view.extraRows) ? view.extraRows : [];
+  const relations = Array.isArray(view.relations) ? view.relations : [];
+  const coreCount = replaceSectionRows(
+    dom.propertiesCoreSection,
+    dom.propertiesCoreGrid,
+    coreRows,
+    (rows) => createPropertyRows(rows, doc)
+  );
+  const extraCount = replaceSectionRows(
+    dom.propertiesExtraSection,
+    dom.propertiesExtraGrid,
+    extraRows,
+    (rows) => createPropertyRows(rows, doc)
+  );
+  const relationCount = replaceSectionRows(
+    dom.propertiesRelationsSection,
+    dom.propertiesRelationsList,
+    relations,
+    (rows) => rows.map((relation) => createRelationRow(relation, doc))
+  );
 
-  const close = (options = {}) => closePropertiesBalloon(appStateStore, options);
+  const emptyText = view.emptyText ?? view.empty?.text ?? "";
+  const emptyVisible = Boolean(
+    view.emptyVisible ?? view.empty?.visible ?? (!coreCount && !extraCount && !relationCount)
+  );
+  if (dom.propertiesEmptyState) {
+    dom.propertiesEmptyState.hidden = !emptyVisible;
+    dom.propertiesEmptyState.textContent = emptyText;
+  }
 
-  const dismiss = () => dismissPropertiesBalloon(appStateStore, state);
-
-  const hideMarker = () => hidePickAnchorMarker(dom.pickAnchorMarker);
-
-  const positionAtClientPoint = (clientX, clientY, options = {}) =>
-    positionPropertiesBalloonAtClientPoint(dom, clientX, clientY, {
-      ...options,
-      state,
-    });
-
-  const showAtClientPoint = (
-    clientX,
-    clientY,
-    {
-      anchored = false,
-      marker = false,
-      source = state.selectionOrigin || "none",
-    } = {}
-  ) =>
-    openPropertiesBalloonAtClientPoint(appStateStore, clientX, clientY, {
-      source,
-      anchored,
-      marker,
-    });
-
-  const showAtViewportCenter = ({ source = state.selectionOrigin || "none" } = {}) =>
-    openPropertiesBalloonAtViewportCenter(appStateStore, dom.viewport, {
-      source,
-    });
-
-  const syncFromAppState = (app) =>
-    syncPropertiesBalloonFromAppState(app, {
-      dom,
-      state,
-      applyHidden,
-      positionAtClientPoint,
-    });
-
-  const onCloseClick = () => {
-    dismiss();
-  };
-
-  dom.propertiesCloseButton?.addEventListener("click", onCloseClick);
-  const unsubscribe = subscribe
-    ? appStateStore.subscribe((app) => {
-        syncFromAppState(app);
-      })
-    : null;
+  setPropertiesGraphButtonVisible(
+    dom,
+    Boolean(view.graphButtonVisible ?? view.graphButton?.visible)
+  );
 
   return {
-    dom,
-    state,
-    applyHidden,
-    close,
-    hide: close,
-    dismiss,
-    hideMarker,
-    positionAtClientPoint,
-    openAtClientPoint: showAtClientPoint,
-    showAtClientPoint,
-    openAtViewportCenter: showAtViewportCenter,
-    showAtViewportCenter,
-    syncFromAppState,
-    pickRegionClientCenter: (detail) => pickRegionClientCenter(detail, dom.viewerCanvas),
-    dispose: () => {
-      dom.propertiesCloseButton?.removeEventListener("click", onCloseClick);
-      unsubscribe?.();
-    },
+    coreRows: coreCount,
+    extraRows: extraCount,
+    relations: relationCount,
+    emptyVisible,
   };
 }

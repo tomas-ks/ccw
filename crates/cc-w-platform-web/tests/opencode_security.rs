@@ -128,7 +128,7 @@ fn opencode_config_is_deny_by_default_and_seeded_with_gpt_5_4() {
 
 #[test]
 fn ifc_agent_config_is_deny_by_default_and_allows_compatibility_aliases() {
-    let agent = read_repo_file(".opencode/agents/ifc-explorer.md");
+    let agent = read_repo_file("agent/agents/ifc-explorer.md");
     let (frontmatter, body) = split_frontmatter(&agent);
     let permissions = parse_permission_map(frontmatter);
 
@@ -182,7 +182,7 @@ fn ifc_agent_config_is_deny_by_default_and_allows_compatibility_aliases() {
 
 #[test]
 fn strict_ifc_agent_config_is_deny_by_default_and_mentions_only_canonical_ifc_tools() {
-    let agent = read_repo_file(".opencode/agents/ifc-explorer-strict.md");
+    let agent = read_repo_file("agent/agents/ifc-explorer-strict.md");
     let (frontmatter, body) = split_frontmatter(&agent);
     let permissions = parse_permission_map(frontmatter);
 
@@ -253,7 +253,7 @@ fn strict_ifc_agent_config_is_deny_by_default_and_mentions_only_canonical_ifc_to
 
 #[test]
 fn answer_42_debug_agent_is_deny_by_default_and_forces_literal_42() {
-    let agent = read_repo_file(".opencode/agents/ifc-answer-42.md");
+    let agent = read_repo_file("agent/agents/ifc-answer-42.md");
     let (frontmatter, body) = split_frontmatter(&agent);
     let permissions = parse_permission_map(frontmatter);
 
@@ -288,7 +288,7 @@ fn answer_42_debug_agent_is_deny_by_default_and_forces_literal_42() {
 
 #[test]
 fn readonly_cypher_only_debug_agent_is_deny_by_default_and_uses_one_tool() {
-    let agent = read_repo_file(".opencode/agents/ifc-readonly-cypher-only.md");
+    let agent = read_repo_file("agent/agents/ifc-readonly-cypher-only.md");
     let (frontmatter, body) = split_frontmatter(&agent);
     let permissions = parse_permission_map(frontmatter);
 
@@ -334,7 +334,7 @@ fn readonly_cypher_only_debug_agent_is_deny_by_default_and_uses_one_tool() {
 
 #[test]
 fn playbook_and_cypher_debug_agent_is_deny_by_default_and_uses_two_tools() {
-    let agent = read_repo_file(".opencode/agents/ifc-playbook-cypher-only.md");
+    let agent = read_repo_file("agent/agents/ifc-playbook-cypher-only.md");
     let (frontmatter, body) = split_frontmatter(&agent);
     let permissions = parse_permission_map(frontmatter);
 

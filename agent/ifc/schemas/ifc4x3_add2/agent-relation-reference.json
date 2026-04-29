@@ -1,0 +1,77 @@
+{
+  "schemaId": "IFC4X3_ADD2",
+  "schemaSlug": "ifc4x3_add2",
+  "references": {
+    "IfcRelAggregates": {
+      "summary": "Decomposition relation connecting a semantic parent to aggregated children such as roof slabs, project hierarchy nodes, or infrastructure parts.",
+      "commonConnections": ["RELATING_OBJECT", "RELATED_OBJECTS"],
+      "queryPatterns": [
+        "MATCH (parent)<--(rel:IfcRelAggregates)-->(child) RETURN id(rel) AS node_id, parent.Name AS parent_name, child.Name AS child_name LIMIT 24"
+      ],
+      "cautions": [
+        "The relation itself is structural, not renderable geometry."
+      ]
+    },
+    "IfcRelContainedInSpatialStructure": {
+      "summary": "Containment relation between products and spatial containers such as buildings or storeys.",
+      "commonConnections": ["RELATING_STRUCTURE", "RELATED_ELEMENTS"],
+      "queryPatterns": [
+        "MATCH (container)<--(rel:IfcRelContainedInSpatialStructure)-->(element) RETURN id(rel) AS node_id, container.Name AS container_name, element.Name AS element_name LIMIT 24"
+      ],
+      "cautions": [
+        "Use it for hierarchy explanations, not as direct evidence of visibility."
+      ]
+    },
+    "IfcRelDefinesByType": {
+      "summary": "Type attachment relation, useful when an instance label is weak and the attached type carries the meaning.",
+      "commonConnections": ["RELATING_TYPE", "RELATED_OBJECTS"],
+      "queryPatterns": [
+        "MATCH (instance)<--(rel:IfcRelDefinesByType)-->(type) RETURN id(rel) AS node_id, instance.Name AS instance_name, type.Name AS type_name LIMIT 24"
+      ],
+      "cautions": [
+        "Prefer this when raw instance properties are generic or opaque."
+      ]
+    },
+    "IfcRelDefinesByProperties": {
+      "summary": "Property-set attachment relation between objects and property definitions.",
+      "commonConnections": ["RELATING_PROPERTY_DEFINITION", "RELATED_OBJECTS"],
+      "queryPatterns": [
+        "MATCH (instance)<--(rel:IfcRelDefinesByProperties)-->(definition) RETURN id(rel) AS node_id, instance.Name AS instance_name, definition.Name AS definition_name LIMIT 24"
+      ],
+      "cautions": [
+        "Property definitions may need a second inspection step for details."
+      ]
+    },
+    "IfcRelAssociatesMaterial": {
+      "summary": "Material association relation between products and materials or intermediate material-definition nodes.",
+      "commonConnections": ["RELATING_MATERIAL", "RELATED_OBJECTS"],
+      "queryPatterns": [
+        "MATCH (rel:IfcRelAssociatesMaterial)--(other) RETURN DISTINCT labels(other)[0] AS node_label, count(*) AS connections ORDER BY connections DESC LIMIT 24",
+        "MATCH (:IfcRelAssociatesMaterial)--(material:IfcMaterial) RETURN DISTINCT material.Name AS material_name LIMIT 24"
+      ],
+      "cautions": [
+        "A direct IfcMaterial hop may be absent even when intermediate material-definition nodes exist."
+      ]
+    },
+    "RELATED_OBJECTS": {
+      "summary": "Common role from aggregate, type, property, and material relations toward the participating product objects.",
+      "commonConnections": ["IfcRelAggregates", "IfcRelDefinesByType", "IfcRelDefinesByProperties", "IfcRelAssociatesMaterial"],
+      "queryPatterns": [
+        "MATCH (rel)-[:RELATED_OBJECTS]->(other) RETURN labels(rel)[0] AS relation_label, labels(other)[0] AS other_label, count(*) AS connections ORDER BY connections DESC LIMIT 24"
+      ],
+      "cautions": [
+        "Inspect the relation node label too; the role name alone is too broad."
+      ]
+    },
+    "RELATED_ELEMENTS": {
+      "summary": "Containment/connectivity role from relation nodes toward participating product elements.",
+      "commonConnections": ["IfcRelContainedInSpatialStructure", "IfcRelConnects"],
+      "queryPatterns": [
+        "MATCH (rel)-[:RELATED_ELEMENTS]->(other) RETURN labels(rel)[0] AS relation_label, labels(other)[0] AS other_label, count(*) AS connections ORDER BY connections DESC LIMIT 24"
+      ],
+      "cautions": [
+        "Use the relation node label to distinguish containment from connectivity."
+      ]
+    }
+  }
+}

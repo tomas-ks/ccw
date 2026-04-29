@@ -1534,8 +1534,8 @@ use cc_w_backend::available_demo_resources;
 #[cfg(target_arch = "wasm32")]
 use cc_w_render::{
     Camera, DepthTarget, MeshRenderer, PICK_DEPTH_BITS_FORMAT, PICK_INDEX_FORMAT, RenderDefaults,
-    RenderProfileDescriptor, RenderProfileId, ViewportSize, fit_camera_to_bounds_with_scene_context,
-    fit_camera_to_render_scene, interpolate_camera,
+    RenderProfileDescriptor, RenderProfileId, ViewportSize,
+    fit_camera_to_bounds_with_scene_context, fit_camera_to_render_scene, interpolate_camera,
 };
 #[cfg(target_arch = "wasm32")]
 use cc_w_types::{
@@ -2707,8 +2707,11 @@ fn count_show_visibility_probe_ratio(
     full_scene_pick_targets: &[PickHit],
     target_ids: &[SemanticElementId],
 ) -> ShowVisibilityProbeResult {
-    let unoccluded_target_pixels =
-        count_target_pick_pixels(target_only_pick_indices, target_only_pick_targets, target_ids);
+    let unoccluded_target_pixels = count_target_pick_pixels(
+        target_only_pick_indices,
+        target_only_pick_targets,
+        target_ids,
+    );
     let visible_target_pixels =
         count_target_pick_pixels(full_scene_pick_indices, full_scene_pick_targets, target_ids);
 
@@ -2769,10 +2772,7 @@ fn u32_values_from_bytes(bytes: &[u8], label: &str) -> Result<Vec<u32>, String> 
     if bytes.len() % 4 != 0 {
         return Err(format!("{label} had a non-u32 byte length"));
     }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(decode_pick_index_u32)
-        .collect())
+    Ok(bytes.chunks_exact(4).map(decode_pick_index_u32).collect())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -4270,14 +4270,13 @@ impl WebViewerState {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("w web pick encoder"),
             });
-        self.renderer
-            .render_pick_region(
-                &mut encoder,
-                &pick_index_view,
-                &pick_depth_bits_view,
-                &depth_view,
-                region,
-            );
+        self.renderer.render_pick_region(
+            &mut encoder,
+            &pick_index_view,
+            &pick_depth_bits_view,
+            &depth_view,
+            region,
+        );
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &pick_index_texture,
@@ -4461,8 +4460,13 @@ impl WebViewerState {
                 );
             }
             None => {
-                self.renderer
-                    .render_pick_region(&mut encoder, &view, &depth_bits_view, &depth_view, region);
+                self.renderer.render_pick_region(
+                    &mut encoder,
+                    &view,
+                    &depth_bits_view,
+                    &depth_view,
+                    region,
+                );
             }
         }
         encoder.copy_texture_to_buffer(

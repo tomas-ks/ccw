@@ -56,6 +56,11 @@ Naming convention:
     render from committed snapshots instead of keeping competing local truth. The detailed contract
     lives in [state-management.md](./state-management.md).
 
+11. Station-based section views must be explicit.
+    A station such as `120` is only meaningful when resolved through IFC alignment or linear
+    placement facts. The section-state contract lives in
+    [sections-and-stations.md](./sections-and-stations.md).
+
 ## Coordinate Frame
 
 The internal engine coordinate frame is:

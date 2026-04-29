@@ -1,5 +1,17 @@
 import { tool } from "@opencode-ai/plugin";
 import { spawnSync } from "node:child_process";
+import {
+  ifcBridgeStructureSummary,
+  ifcElementSearch,
+} from "../tool-helpers/ifc_search_helpers.ts";
+import {
+  ifcScopeInspect,
+  ifcScopeSummary,
+} from "../tool-helpers/ifc_scope_helpers.ts";
+import {
+  ifcQuantityTakeoff,
+  ifcSectionAtPointOrStation,
+} from "../tool-helpers/ifc_quantity_section_helpers.ts";
 
 type ToolContext = {
   worktree?: string;
@@ -8,6 +20,7 @@ type ToolContext = {
 
 const DEFAULT_SCHEMA = "IFC4X3_ADD2";
 const DEFAULT_API_BASE = "http://127.0.0.1:8001";
+const DEFAULT_VIEWER_TOOL_TIMEOUT_MS = 35_000;
 const FALLBACK_API_BASES = ["http://127.0.0.1:8001", "http://localhost:8001"];
 
 function validViewerApiBase(value?: string): string | null {
@@ -39,8 +52,59 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function viewerToolTimeoutMs(): number {
+  const parsed = Number.parseInt(process.env.CC_W_VIEWER_TOOL_TIMEOUT_MS ?? "", 10);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return parsed;
+  }
+  return DEFAULT_VIEWER_TOOL_TIMEOUT_MS;
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function countMatches(value: string, pattern: RegExp): number {
+  return Array.from(value.matchAll(pattern)).length;
+}
+
+function riskyProjectCypherReason(cypher: string): string | null {
+  const normalized = cypher.replace(/\s+/g, " ").trim();
+  const optionalMatches = countMatches(normalized, /\bOPTIONAL\s+MATCH\b/gi);
+  const startsFromProject = /\bMATCH\s*\(\s*\w+\s*:\s*IfcProject\b[^)]*\)/i.test(normalized);
+  const aggregatesAcrossBranches = /\b(count|collect)\s*\(/i.test(normalized);
+
+  if (startsFromProject && aggregatesAcrossBranches && optionalMatches >= 3) {
+    return [
+      "Project overview queries with several independent OPTIONAL MATCH aggregate branches can explode into a Cartesian product.",
+      "Use one entity histogram query instead, for example:",
+      "MATCH (n) WHERE n.declared_entity IS NOT NULL RETURN n.declared_entity AS entity, count(*) AS count ORDER BY count DESC LIMIT 20",
+      "Or split the requested counts into separate small label-first queries.",
+    ].join(" ");
+  }
+
+  const bridgePartContainmentCount =
+    /\bIfcBridge\b/i.test(normalized) &&
+    /\bIfcBridgePart\b/i.test(normalized) &&
+    /\bIfcRelContainedInSpatialStructure\b/i.test(normalized) &&
+    /\b(count|collect)\s*\(/i.test(normalized) &&
+    !/\bid\s*\(\s*part\s*\)\s*=/.test(normalized);
+
+  if (bridgePartContainmentCount) {
+    return [
+      "Bridge-part containment aggregate queries must be anchored per bridge part; the unanchored all-parts shape is known to be slow.",
+      "First list bridge part ids with:",
+      "MATCH (bridge:IfcBridge)--(:IfcRelAggregates)-->(part:IfcBridgePart) RETURN id(part) AS part_node_id, part.Name AS part_name LIMIT 20",
+      "Then query one part id at a time, for example:",
+      "MATCH (part:IfcBridgePart)<--(:IfcRelContainedInSpatialStructure)-->(prod) WHERE id(part) = 123 RETURN prod.declared_entity AS entity, count(*) AS count ORDER BY count DESC LIMIT 24",
+    ].join(" ");
+  }
+
+  return null;
 }
 
 function repoRoot(context: ToolContext): string {
@@ -114,6 +178,21 @@ async function runProjectReadonlyCypher(
   resourceFilter?: string[],
   apiBase?: string,
 ): Promise<string> {
+  const riskyReason = riskyProjectCypherReason(cypher);
+  if (riskyReason) {
+    return JSON.stringify(
+      {
+        ok: false,
+        tool: "ifc_project_readonly_cypher",
+        resource: projectResource,
+        error: riskyReason,
+        cypher,
+      },
+      null,
+      2,
+    );
+  }
+
   return postViewerJson(apiBase, "/api/cypher", {
     resource: projectResource,
     cypher,
@@ -129,15 +208,40 @@ async function postViewerJson(
 ): Promise<string> {
   const bases = viewerApiBaseCandidates(apiBase);
   const failures: string[] = [];
+  const toolTimeoutMs = viewerToolTimeoutMs();
+  const cypherServerTimeoutMs = Math.max(1_000, toolTimeoutMs - 1_000);
+  const requestBody =
+    path === "/api/cypher" && body.timeoutMs === undefined
+      ? { ...body, timeoutMs: cypherServerTimeoutMs }
+      : body;
+  const deadline = Date.now() + toolTimeoutMs;
+
   for (let attempt = 0; attempt < 3; attempt += 1) {
     for (const base of bases) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        return JSON.stringify(
+          {
+            ok: false,
+            path,
+            error: `viewer API request timed out after ${toolTimeoutMs} ms`,
+            tried: failures,
+          },
+          null,
+          2,
+        );
+      }
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), remainingMs);
       try {
         const response = await fetch(new URL(path, base), {
           method: "POST",
           headers: {
             "content-type": "application/json",
           },
-          body: JSON.stringify(body),
+          body: JSON.stringify(requestBody),
+          signal: controller.signal,
         });
 
         const text = await response.text();
@@ -157,7 +261,21 @@ async function postViewerJson(
 
         return text.trim();
       } catch (error) {
+        if (isAbortError(error)) {
+          return JSON.stringify(
+            {
+              ok: false,
+              path,
+              base,
+              error: `viewer API request timed out after ${toolTimeoutMs} ms`,
+            },
+            null,
+            2,
+          );
+        }
         failures.push(`${base}: ${errorMessage(error)}`);
+      } finally {
+        clearTimeout(timer);
       }
     }
     await sleep(80 * (attempt + 1));
@@ -274,6 +392,259 @@ export const project_readonly_cypher = tool({
       args.why,
       args.resource_filter,
       args.api_base,
+    );
+  },
+});
+
+export const element_search = tool({
+  description:
+    "Find IFC elements or candidate products using small label-first searches with source provenance. Use this before broad custom Cypher when looking for named or typed bridge/model content.",
+  args: {
+    resource: tool.schema.string().describe("Selected IFC or project resource, for example ifc/infra-road or project/infra"),
+    text: tool.schema.string().optional().describe("Optional free-text term to look for in name, object type, description, tag, or GlobalId"),
+    keywords: tool.schema
+      .array(tool.schema.string())
+      .default([])
+      .describe("Optional search terms"),
+    entity_names: tool.schema
+      .array(tool.schema.string())
+      .default([])
+      .describe("Optional IFC entity labels to search first, for example IfcBeam or IfcElementAssembly"),
+    renderable_only: tool.schema
+      .boolean()
+      .optional()
+      .describe("When true, only return candidates with GlobalId values suitable for viewer element actions"),
+    bridge_part_node_ids: tool.schema
+      .array(tool.schema.number())
+      .default([])
+      .describe("Optional local IfcBridgePart DB node ids to anchor contained-product searches"),
+    material_names: tool.schema
+      .array(tool.schema.string())
+      .default([])
+      .describe("Optional material names to anchor material-associated product searches"),
+    limit: tool.schema.number().optional().describe("Maximum rows per focused query"),
+    all_matches: tool.schema
+      .boolean()
+      .optional()
+      .describe(
+        "When true, return every match for a focused action query instead of a preview. Requires entity_names, bridge_part_node_ids, or material_names; do not use for broad text-only scans.",
+      ),
+    resource_filter: tool.schema
+      .array(tool.schema.string())
+      .default([])
+      .describe("Optional IFC members to query when resource is a project"),
+    api_base: tool.schema.string().optional().describe("Viewer API base URL"),
+  },
+  async execute(args) {
+    return ifcElementSearch(
+      {
+        resource: args.resource,
+        text: args.text,
+        keywords: args.keywords,
+        entityNames: args.entity_names,
+        renderableOnly: args.renderable_only,
+        bridgePartNodeIds: args.bridge_part_node_ids,
+        materialNames: args.material_names,
+        limit: args.limit,
+        allMatches: args.all_matches,
+        resourceFilter: args.resource_filter,
+        apiBase: args.api_base,
+      },
+      postViewerJson,
+    );
+  },
+});
+
+export const scope_summary = tool({
+  description:
+    "Summarize a known scope of IFC DB node ids or renderable semantic ids by entity, materials, and lightweight geometry catalog facts.",
+  args: {
+    resource: tool.schema
+      .string()
+      .optional()
+      .describe("Selected IFC or project resource. Required for DB node ids and unscoped semantic ids"),
+    semantic_ids: tool.schema
+      .array(tool.schema.string())
+      .default([])
+      .describe("Renderable semantic ids, optionally source-scoped as ifc/resource::GlobalId"),
+    db_node_ids: tool.schema
+      .array(tool.schema.number())
+      .default([])
+      .describe("Local DB node ids to summarize"),
+    include_materials: tool.schema
+      .boolean()
+      .optional()
+      .describe("Include explicit IfcRelAssociatesMaterial facts when available"),
+    include_geometry: tool.schema
+      .boolean()
+      .optional()
+      .describe("Include lightweight geometry catalog counts. Does not infer missing geometry quantities"),
+    limit: tool.schema.number().optional().describe("Maximum ids/rows to inspect"),
+    api_base: tool.schema.string().optional().describe("Viewer API base URL"),
+  },
+  async execute(args) {
+    return ifcScopeSummary({
+      resource: args.resource,
+      semanticIds: args.semantic_ids,
+      dbNodeIds: args.db_node_ids,
+      includeMaterials: args.include_materials,
+      includeGeometry: args.include_geometry,
+      limit: args.limit,
+      apiBase: args.api_base,
+      postViewerJson,
+    });
+  },
+});
+
+export const scope_inspect = tool({
+  description:
+    "Update the viewer inspection focus for known renderable semantic ids. Use replace for a new focus, add for additive wording, and remove for subtractive wording.",
+  args: {
+    resource: tool.schema
+      .string()
+      .optional()
+      .describe("IFC resource the semantic ids came from, for example ifc/infra-road"),
+    semantic_ids: tool.schema
+      .array(tool.schema.string())
+      .min(1)
+      .describe("Renderable semantic ids to inspect. In project mode these may be source-scoped as ifc/resource::GlobalId"),
+    mode: tool.schema
+      .string()
+      .optional()
+      .describe("Inspection update mode: replace, add, or remove"),
+    select: tool.schema
+      .boolean()
+      .optional()
+      .describe("Whether to also prepare a selection note for these ids"),
+    frame_visible: tool.schema
+      .boolean()
+      .optional()
+      .describe("Whether to also prepare a frame-visible note"),
+    why: tool.schema.string().optional().describe("Short reason for the viewer action"),
+  },
+  async execute(args) {
+    return ifcScopeInspect({
+      resource: args.resource,
+      semanticIds: args.semantic_ids,
+      mode: args.mode,
+      select: args.select,
+      frameVisible: args.frame_visible,
+      why: args.why,
+    });
+  },
+});
+
+export const bridge_structure_summary = tool({
+  description:
+    "Summarize bridge roots, bridge parts, nested parts, and contained product-family counts using anchored per-part queries.",
+  args: {
+    resource: tool.schema.string().describe("Selected IFC or project resource, for example project/bridge-for-minnd"),
+    limit: tool.schema.number().optional().describe("Maximum rows for bridge root/part discovery queries"),
+    max_parts: tool.schema.number().optional().describe("Maximum bridge parts to inspect with anchored queries"),
+    resource_filter: tool.schema
+      .array(tool.schema.string())
+      .default([])
+      .describe("Optional IFC members to query when resource is a project"),
+    api_base: tool.schema.string().optional().describe("Viewer API base URL"),
+  },
+  async execute(args) {
+    return ifcBridgeStructureSummary(
+      {
+        resource: args.resource,
+        limit: args.limit,
+        maxParts: args.max_parts,
+        resourceFilter: args.resource_filter,
+        apiBase: args.api_base,
+      },
+      postViewerJson,
+    );
+  },
+});
+
+export const quantity_takeoff = tool({
+  description:
+    "Create a truthful count/material/BOM-style takeoff with provenance. Geometry-derived quantities are reported unsupported unless explicit facts exist.",
+  args: {
+    resource: tool.schema.string().describe("Selected IFC or project resource"),
+    group_by: tool.schema
+      .string()
+      .optional()
+      .describe("Grouping: entity, material, bridge_part, or source_resource"),
+    entity_names: tool.schema
+      .array(tool.schema.string())
+      .default([])
+      .describe("Optional IFC entity labels to constrain the takeoff"),
+    semantic_ids: tool.schema
+      .array(tool.schema.string())
+      .default([])
+      .describe("Optional renderable semantic ids to constrain the takeoff"),
+    source: tool.schema
+      .string()
+      .optional()
+      .describe("Source preference: count_only, ifc_quantities, or geometry"),
+    limit: tool.schema.number().optional().describe("Maximum rows"),
+    api_base: tool.schema.string().optional().describe("Viewer API base URL"),
+  },
+  async execute(args) {
+    return ifcQuantityTakeoff(
+      {
+        resource: args.resource,
+        group_by: args.group_by,
+        entity_names: args.entity_names,
+        semantic_ids: args.semantic_ids,
+        source: args.source,
+        limit: args.limit,
+        api_base: args.api_base,
+      },
+      postViewerJson,
+    );
+  },
+});
+
+export const section_at_point_or_station = tool({
+  description:
+    "Prepare a section query from an explicit station, point, or semantic ids. Does not invent section geometry when alignment/plane facts are missing.",
+  args: {
+    resource: tool.schema.string().describe("Selected IFC or project resource"),
+    station: tool.schema
+      .union([tool.schema.string(), tool.schema.number()])
+      .optional()
+      .describe("Explicit alignment station when available"),
+    point: tool.schema
+      .array(tool.schema.number())
+      .optional()
+      .describe("Explicit world-space point as [x,y] or [x,y,z]"),
+    orientation: tool.schema.string().optional().describe("Requested section orientation, for example cross or longitudinal"),
+    width: tool.schema.number().optional().describe("Requested section width"),
+    depth: tool.schema.number().optional().describe("Requested section depth"),
+    semantic_ids: tool.schema
+      .array(tool.schema.string())
+      .default([])
+      .describe("Optional semantic ids to constrain section candidate discovery"),
+    limit: tool.schema.number().optional().describe("Maximum rows"),
+    api_base: tool.schema.string().optional().describe("Viewer API base URL"),
+  },
+  async execute(args) {
+    const point = Array.isArray(args.point)
+      ? args.point.length === 2
+        ? ([args.point[0], args.point[1]] as [number, number])
+        : args.point.length >= 3
+          ? ([args.point[0], args.point[1], args.point[2]] as [number, number, number])
+          : undefined
+      : undefined;
+    return ifcSectionAtPointOrStation(
+      {
+        resource: args.resource,
+        station: args.station,
+        point,
+        orientation: args.orientation,
+        width: args.width,
+        depth: args.depth,
+        semantic_ids: args.semantic_ids,
+        limit: args.limit,
+        api_base: args.api_base,
+      },
+      postViewerJson,
     );
   },
 });
