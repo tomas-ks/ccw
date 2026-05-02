@@ -8,7 +8,8 @@ use cc_w_types::{
     GeometryStreamPlanReason, GeometryStreamingBudget, PreparedGeometryDefinition,
     PreparedGeometryElement, PreparedGeometryInstance, PreparedGeometryPackage, PreparedMaterial,
     PreparedRenderDefinition, PreparedRenderInstance, PreparedRenderRole, PreparedRenderScene,
-    ResidencyState, ResolvedGeometryStartView, SectionState, SemanticElementId,
+    ResidencyState, ResolvedGeometryStartView, SceneAnnotationLayer, SceneAnnotationLayerId,
+    SceneAnnotationPrimitive, SectionState, SemanticElementId,
 };
 use glam::{DVec3, DVec4};
 use std::collections::{HashMap, HashSet};
@@ -137,6 +138,7 @@ pub struct RuntimeSceneState {
     start_view: GeometryStartViewRequest,
     base_visible_element_ids: HashSet<SemanticElementId>,
     section: Option<SectionState>,
+    annotation_layers: HashMap<SceneAnnotationLayerId, SceneAnnotationLayer>,
 }
 
 impl RuntimeSceneState {
@@ -207,6 +209,7 @@ impl RuntimeSceneState {
             start_view: GeometryStartViewRequest::Default,
             base_visible_element_ids: HashSet::new(),
             section: None,
+            annotation_layers: HashMap::new(),
         };
         scene.apply_start_view(start_view);
         Ok(scene)
@@ -780,6 +783,61 @@ impl RuntimeSceneState {
         self.section.as_ref()
     }
 
+    pub fn set_annotation_layer(&mut self, layer: SceneAnnotationLayer) {
+        self.annotation_layers.insert(layer.id.clone(), layer);
+    }
+
+    pub fn merge_annotation_layer(&mut self, mut incoming: SceneAnnotationLayer) {
+        let Some(existing) = self.annotation_layers.get_mut(&incoming.id) else {
+            self.set_annotation_layer(incoming);
+            return;
+        };
+
+        let mut primitive_index = existing
+            .primitives
+            .iter()
+            .enumerate()
+            .map(|(index, primitive)| (annotation_primitive_id(primitive).to_owned(), index))
+            .collect::<HashMap<String, usize>>();
+
+        for primitive in incoming.primitives.drain(..) {
+            let primitive_id = annotation_primitive_id(&primitive).to_owned();
+            if let Some(index) = primitive_index.get(&primitive_id).copied() {
+                existing.primitives[index] = primitive;
+            } else {
+                primitive_index.insert(primitive_id, existing.primitives.len());
+                existing.primitives.push(primitive);
+            }
+        }
+
+        if incoming.source.is_some() {
+            existing.source = incoming.source;
+        }
+        existing.visible = incoming.visible;
+        existing.lifecycle = incoming.lifecycle;
+        for provenance in incoming.provenance {
+            if !existing.provenance.contains(&provenance) {
+                existing.provenance.push(provenance);
+            }
+        }
+    }
+
+    pub fn clear_annotation_layer(&mut self, layer_id: &SceneAnnotationLayerId) -> bool {
+        self.annotation_layers.remove(layer_id).is_some()
+    }
+
+    pub fn clear_annotation_layers(&mut self) -> bool {
+        let had_layers = !self.annotation_layers.is_empty();
+        self.annotation_layers.clear();
+        had_layers
+    }
+
+    pub fn annotation_layers(&self) -> Vec<&SceneAnnotationLayer> {
+        let mut layers = self.annotation_layers.values().collect::<Vec<_>>();
+        layers.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        layers
+    }
+
     pub fn visible_bounds(&self) -> Option<Bounds3> {
         self.bounds_for_elements(self.visible_element_ids().iter())
     }
@@ -1014,6 +1072,14 @@ impl RuntimeSceneState {
             &self.resident_instances,
             &self.resident_definitions,
         );
+    }
+}
+
+fn annotation_primitive_id(primitive: &SceneAnnotationPrimitive) -> &str {
+    match primitive {
+        SceneAnnotationPrimitive::Polyline(polyline) => polyline.id.as_str(),
+        SceneAnnotationPrimitive::Marker(marker) => marker.id.as_str(),
+        SceneAnnotationPrimitive::Text(label) => label.id.as_str(),
     }
 }
 
@@ -1397,6 +1463,7 @@ mod tests {
         Bounds3, DefaultRenderClass, DisplayColor, ExternalId, GeometryDefinitionId,
         GeometryInstanceId, GeometryStartViewRequest, PreparedGeometryDefinition,
         PreparedGeometryElement, PreparedGeometryInstance, PreparedMesh, PreparedVertex,
+        SceneAnnotationDepthMode, SceneAnnotationPrimitive, SceneMarker, ScenePolyline,
         SemanticElementId,
     };
     use glam::{DMat4, DVec3};
@@ -2515,12 +2582,8 @@ mod tests {
         assert!(runtime_scene.section_state().is_none());
         assert!(!runtime_scene.clear_section());
 
-        let pose = cc_w_types::SectionPose::new(
-            DVec3::new(12.0, 4.0, 0.0),
-            DVec3::Y,
-            DVec3::X,
-            DVec3::Z,
-        );
+        let pose =
+            cc_w_types::SectionPose::new(DVec3::new(12.0, 4.0, 0.0), DVec3::Y, DVec3::X, DVec3::Z);
         let mut section = SectionState::new("ifc/bridge-for-minnd", pose);
         section.alignment_id = Some("alignment/global-id".to_string());
         section.station = Some(120.0);
@@ -2533,6 +2596,194 @@ mod tests {
         assert_eq!(runtime_scene.section_state(), Some(&section));
         assert!(runtime_scene.clear_section());
         assert!(runtime_scene.section_state().is_none());
+    }
+
+    #[test]
+    fn runtime_scene_tracks_annotation_layers_by_id() {
+        let mut runtime_scene = RuntimeSceneState::from_prepared_package(mapped_triangle_package(
+            "Synthetic Mapped Triangle",
+            "synthetic/mapped/left",
+        ))
+        .expect("scene");
+
+        let mut layer = cc_w_types::SceneAnnotationLayer::new("measurements");
+        layer
+            .primitives
+            .push(cc_w_types::SceneAnnotationPrimitive::Marker(
+                cc_w_types::SceneMarker::new("m1", DVec3::new(1.0, 2.0, 3.0)),
+            ));
+        let replacement = cc_w_types::SceneAnnotationLayer::new("measurements");
+        let layer_id = cc_w_types::SceneAnnotationLayerId::new("measurements");
+
+        assert!(runtime_scene.annotation_layers().is_empty());
+        assert!(!runtime_scene.clear_annotation_layer(&layer_id));
+        assert!(!runtime_scene.clear_annotation_layers());
+
+        runtime_scene.set_annotation_layer(layer);
+        assert_eq!(runtime_scene.annotation_layers()[0].primitive_count(), 1);
+
+        runtime_scene.set_annotation_layer(replacement);
+        assert_eq!(runtime_scene.annotation_layers()[0].primitive_count(), 0);
+        assert!(runtime_scene.clear_annotation_layer(&layer_id));
+        assert!(runtime_scene.annotation_layers().is_empty());
+    }
+
+    #[test]
+    fn runtime_scene_merges_annotation_layers_without_reparsing_existing_primitives() {
+        let mut runtime_scene = RuntimeSceneState::from_prepared_package(mapped_triangle_package(
+            "Synthetic Mapped Triangle",
+            "synthetic/mapped/left",
+        ))
+        .expect("scene");
+
+        let mut first_line = ScenePolyline::new(
+            "line-60-120",
+            vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)],
+        );
+        first_line.width_px = 6.0;
+        first_line.depth_mode = SceneAnnotationDepthMode::XRay;
+
+        let mut layer = cc_w_types::SceneAnnotationLayer::new("alignment");
+        layer.source = Some("path:ifc_alignment:curve:42".to_owned());
+        layer
+            .provenance
+            .push("basis=explicit_ifc_gradient_curve".to_owned());
+        layer
+            .primitives
+            .push(SceneAnnotationPrimitive::Polyline(first_line));
+        runtime_scene.set_annotation_layer(layer);
+
+        let mut second_line = ScenePolyline::new(
+            "line-150-200",
+            vec![DVec3::new(2.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)],
+        );
+        second_line.width_px = 6.0;
+        second_line.depth_mode = SceneAnnotationDepthMode::XRay;
+
+        let mut incoming = cc_w_types::SceneAnnotationLayer::new("alignment");
+        incoming
+            .primitives
+            .push(SceneAnnotationPrimitive::Polyline(second_line));
+        incoming.provenance.push("update=add".to_owned());
+        runtime_scene.merge_annotation_layer(incoming);
+
+        let layer = runtime_scene.annotation_layers()[0];
+        assert_eq!(layer.primitive_count(), 2);
+        for primitive in &layer.primitives {
+            let SceneAnnotationPrimitive::Polyline(polyline) = primitive else {
+                panic!("expected polyline primitive");
+            };
+            assert_eq!(polyline.width_px, 6.0);
+            assert_eq!(polyline.depth_mode, SceneAnnotationDepthMode::XRay);
+        }
+        assert_eq!(layer.source.as_deref(), Some("path:ifc_alignment:curve:42"));
+        assert_eq!(
+            layer.provenance,
+            vec![
+                "basis=explicit_ifc_gradient_curve".to_owned(),
+                "update=add".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_scene_composes_path_annotation_segments_without_default_full_line() {
+        fn path_line(id: &str, x0: f64, x1: f64) -> SceneAnnotationPrimitive {
+            let mut line =
+                ScenePolyline::new(id, vec![DVec3::new(x0, 0.0, 0.0), DVec3::new(x1, 0.0, 0.0)]);
+            line.width_px = 6.0;
+            line.depth_mode = SceneAnnotationDepthMode::XRay;
+            SceneAnnotationPrimitive::Polyline(line)
+        }
+
+        fn marker(id: &str, x: f64) -> SceneAnnotationPrimitive {
+            let mut marker = SceneMarker::new(id, DVec3::new(x, 0.0, 0.0));
+            marker.depth_mode = SceneAnnotationDepthMode::XRay;
+            SceneAnnotationPrimitive::Marker(marker)
+        }
+
+        fn path_line_ids(layer: &cc_w_types::SceneAnnotationLayer) -> Vec<String> {
+            layer
+                .primitives
+                .iter()
+                .filter_map(|primitive| match primitive {
+                    SceneAnnotationPrimitive::Polyline(polyline)
+                        if polyline.id.as_str().starts_with("path-line-") =>
+                    {
+                        Some(polyline.id.as_str().to_owned())
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let mut runtime_scene = RuntimeSceneState::from_prepared_package(mapped_triangle_package(
+            "Synthetic Mapped Triangle",
+            "synthetic/mapped/left",
+        ))
+        .expect("scene");
+
+        let mut initial = cc_w_types::SceneAnnotationLayer::new("path-annotations-215711");
+        initial.source = Some("path:ifc_alignment:curve:215711".to_owned());
+        initial
+            .primitives
+            .push(path_line("path-line-line0-100-200", 100.0, 200.0));
+        runtime_scene.set_annotation_layer(initial);
+
+        let mut marker_only = cc_w_types::SceneAnnotationLayer::new("path-annotations-215711");
+        marker_only
+            .primitives
+            .push(marker("path-marker-marker0-400-500-400", 400.0));
+        marker_only
+            .primitives
+            .push(marker("path-marker-marker0-400-500-450", 450.0));
+        runtime_scene.merge_annotation_layer(marker_only);
+
+        let layer = runtime_scene.annotation_layers()[0];
+        assert_eq!(path_line_ids(layer), vec!["path-line-line0-100-200"]);
+
+        let mut second = cc_w_types::SceneAnnotationLayer::new("path-annotations-215711");
+        second
+            .primitives
+            .push(path_line("path-line-line0-300-400", 300.0, 400.0));
+        second
+            .primitives
+            .push(marker("path-marker-marker1-300-400-300", 300.0));
+        runtime_scene.merge_annotation_layer(second);
+
+        let mut to_end = cc_w_types::SceneAnnotationLayer::new("path-annotations-215711");
+        to_end
+            .primitives
+            .push(path_line("path-line-line0-400-500", 400.0, 500.0));
+        to_end
+            .primitives
+            .push(marker("path-marker-marker0-400-500-500", 500.0));
+        runtime_scene.merge_annotation_layer(to_end);
+
+        let layer = runtime_scene.annotation_layers()[0];
+        let line_ids = path_line_ids(layer);
+        assert_eq!(
+            line_ids,
+            vec![
+                "path-line-line0-100-200",
+                "path-line-line0-300-400",
+                "path-line-line0-400-500"
+            ]
+        );
+        assert!(!line_ids.iter().any(|id| id == "path-line-line0-0-500"));
+        for primitive in &layer.primitives {
+            let SceneAnnotationPrimitive::Polyline(polyline) = primitive else {
+                continue;
+            };
+            if polyline.id.as_str().starts_with("path-line-") {
+                assert_eq!(polyline.width_px, 6.0);
+                assert_eq!(polyline.depth_mode, SceneAnnotationDepthMode::XRay);
+            }
+        }
+        assert_eq!(
+            layer.source.as_deref(),
+            Some("path:ifc_alignment:curve:215711")
+        );
     }
 
     #[test]

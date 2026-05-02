@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 
 const MAX_AGENT_ACTIONS: usize = 16;
@@ -281,6 +282,29 @@ pub enum AgentUiAction {
     ViewerFrameVisible,
     #[serde(rename = "viewer.clear_inspection")]
     ViewerClearInspection,
+    #[serde(rename = "viewer.section.set")]
+    ViewerSectionSet { section: Value },
+    #[serde(rename = "viewer.section.clear")]
+    ViewerSectionClear,
+    #[serde(rename = "viewer.annotations.show_path")]
+    ViewerAnnotationsShowPath {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+        path: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        markers: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_samples: Option<Value>,
+    },
+    #[serde(rename = "viewer.annotations.clear")]
+    ViewerAnnotationsClear {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -293,6 +317,10 @@ pub struct AgentActionCandidate {
     pub resource: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inspection_mode: Option<InspectionUpdateMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<Value>,
 }
 
 fn is_default_inspection_mode(mode: &InspectionUpdateMode) -> bool {
@@ -307,6 +335,8 @@ impl AgentActionCandidate {
             db_node_ids,
             resource: None,
             inspection_mode: None,
+            section: None,
+            annotation: None,
         }
     }
 
@@ -317,6 +347,8 @@ impl AgentActionCandidate {
             db_node_ids: Vec::new(),
             resource: None,
             inspection_mode: None,
+            section: None,
+            annotation: None,
         }
     }
 
@@ -327,6 +359,8 @@ impl AgentActionCandidate {
             db_node_ids: Vec::new(),
             resource: None,
             inspection_mode: None,
+            section: None,
+            annotation: None,
         }
     }
 
@@ -337,6 +371,8 @@ impl AgentActionCandidate {
             db_node_ids: Vec::new(),
             resource: None,
             inspection_mode: None,
+            section: None,
+            annotation: None,
         }
     }
 
@@ -354,6 +390,8 @@ impl AgentActionCandidate {
             db_node_ids: Vec::new(),
             resource: None,
             inspection_mode: Some(mode),
+            section: None,
+            annotation: None,
         }
     }
 
@@ -364,6 +402,8 @@ impl AgentActionCandidate {
             db_node_ids: vec![db_node_id],
             resource: None,
             inspection_mode: None,
+            section: None,
+            annotation: None,
         }
     }
 
@@ -374,6 +414,8 @@ impl AgentActionCandidate {
             db_node_ids: Vec::new(),
             resource: None,
             inspection_mode: None,
+            section: None,
+            annotation: None,
         }
     }
 
@@ -384,6 +426,56 @@ impl AgentActionCandidate {
             db_node_ids: Vec::new(),
             resource: None,
             inspection_mode: None,
+            section: None,
+            annotation: None,
+        }
+    }
+
+    pub fn viewer_section_set(section: Value) -> Self {
+        Self {
+            kind: "viewer.section.set".to_owned(),
+            semantic_ids: Vec::new(),
+            db_node_ids: Vec::new(),
+            resource: None,
+            inspection_mode: None,
+            section: Some(section),
+            annotation: None,
+        }
+    }
+
+    pub fn viewer_section_clear() -> Self {
+        Self {
+            kind: "viewer.section.clear".to_owned(),
+            semantic_ids: Vec::new(),
+            db_node_ids: Vec::new(),
+            resource: None,
+            inspection_mode: None,
+            section: None,
+            annotation: None,
+        }
+    }
+
+    pub fn viewer_annotations_show_path(annotation: Value) -> Self {
+        Self {
+            kind: "viewer.annotations.show_path".to_owned(),
+            semantic_ids: Vec::new(),
+            db_node_ids: Vec::new(),
+            resource: None,
+            inspection_mode: None,
+            section: None,
+            annotation: Some(annotation),
+        }
+    }
+
+    pub fn viewer_annotations_clear() -> Self {
+        Self {
+            kind: "viewer.annotations.clear".to_owned(),
+            semantic_ids: Vec::new(),
+            db_node_ids: Vec::new(),
+            resource: None,
+            inspection_mode: None,
+            section: None,
+            annotation: None,
         }
     }
 
@@ -784,8 +876,286 @@ pub fn validate_agent_action_candidate(
             }
             Ok(AgentUiAction::ViewerClearInspection)
         }
+        "viewer.section.set" => {
+            if !candidate.semantic_ids.is_empty() || !candidate.db_node_ids.is_empty() {
+                return Err("viewer.section.set does not accept ids".to_owned());
+            }
+            let section = candidate
+                .section
+                .ok_or_else(|| "viewer.section.set requires a section object".to_owned())?;
+            if !section.is_object() {
+                return Err("viewer.section.set requires a section object".to_owned());
+            }
+            Ok(AgentUiAction::ViewerSectionSet { section })
+        }
+        "viewer.section.clear" => {
+            if !candidate.semantic_ids.is_empty() || !candidate.db_node_ids.is_empty() {
+                return Err("viewer.section.clear does not accept ids".to_owned());
+            }
+            Ok(AgentUiAction::ViewerSectionClear)
+        }
+        "viewer.annotations.show_path" => {
+            if !candidate.semantic_ids.is_empty() || !candidate.db_node_ids.is_empty() {
+                return Err("viewer.annotations.show_path does not accept ids".to_owned());
+            }
+            let annotation = candidate.annotation.ok_or_else(|| {
+                "viewer.annotations.show_path requires an annotation object".to_owned()
+            })?;
+            let annotation = normalize_path_annotation(annotation, candidate.resource.as_deref())?;
+            Ok(AgentUiAction::ViewerAnnotationsShowPath {
+                resource: annotation.resource,
+                path: annotation.path,
+                line: annotation.line,
+                markers: annotation.markers,
+                mode: annotation.mode,
+                max_samples: annotation.max_samples,
+            })
+        }
+        "viewer.annotations.clear" => {
+            if !candidate.semantic_ids.is_empty() || !candidate.db_node_ids.is_empty() {
+                return Err("viewer.annotations.clear does not accept ids".to_owned());
+            }
+            Ok(AgentUiAction::ViewerAnnotationsClear {
+                resource: candidate.resource,
+            })
+        }
         other => Err(format!("unsupported agent UI action kind `{other}`")),
     }
+}
+
+struct PathAnnotationAction {
+    resource: Option<String>,
+    path: Value,
+    line: Option<Value>,
+    markers: Option<Value>,
+    mode: Option<Value>,
+    max_samples: Option<Value>,
+}
+
+fn normalize_path_annotation(
+    value: Value,
+    fallback_resource: Option<&str>,
+) -> Result<PathAnnotationAction, String> {
+    let Value::Object(object) = value else {
+        return Err("viewer.annotations.show_path requires an annotation object".to_owned());
+    };
+    if object.contains_key("points")
+        || object.contains_key("polyline")
+        || object.contains_key("polylines")
+        || object.contains_key("vertices")
+        || object.contains_key("coordinates")
+    {
+        return Err("viewer.annotations.show_path does not accept raw geometry arrays".to_owned());
+    }
+    let path = normalize_annotation_value(&object, &["path"])
+        .filter(|path| path.is_object())
+        .ok_or_else(|| "viewer.annotations.show_path requires path".to_owned())?;
+    let resource = get_object_string(&object, &["resource", "source_resource", "sourceResource"])
+        .or_else(|| {
+            fallback_resource
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        });
+    let line = normalize_path_annotation_line(&object);
+    let markers = normalize_path_annotation_markers(&object);
+    let mode = normalize_annotation_value(&object, &["mode", "operation", "update", "behavior"]);
+    let line = if should_drop_default_path_line_for_marker_add(
+        mode.as_ref(),
+        markers.as_ref(),
+        line.as_ref(),
+    ) {
+        None
+    } else {
+        line
+    };
+    Ok(PathAnnotationAction {
+        resource,
+        path,
+        line,
+        markers,
+        mode,
+        max_samples: normalize_annotation_interval(&object, &["max_samples", "maxSamples"])?,
+    })
+}
+
+fn should_drop_default_path_line_for_marker_add(
+    mode: Option<&Value>,
+    markers: Option<&Value>,
+    line: Option<&Value>,
+) -> bool {
+    annotation_update_mode_is_add(mode)
+        && annotation_markers_are_nonempty(markers)
+        && line.is_some_and(annotation_line_is_default_path)
+}
+
+fn normalize_path_annotation_line(object: &serde_json::Map<String, Value>) -> Option<Value> {
+    normalize_annotation_value(object, &["line"])
+        .map(canonical_path_annotation_line)
+        .or_else(|| {
+            normalize_annotation_value(
+                object,
+                &[
+                    "line_range",
+                    "lineRange",
+                    "line_ranges",
+                    "lineRanges",
+                    "ranges",
+                ],
+            )
+            .map(canonical_path_annotation_line)
+        })
+}
+
+fn normalize_path_annotation_markers(object: &serde_json::Map<String, Value>) -> Option<Value> {
+    normalize_annotation_value(object, &["markers", "marker_groups", "markerGroups"])
+}
+
+fn canonical_path_annotation_line(value: Value) -> Value {
+    match value {
+        Value::Array(ranges) => serde_json::json!({ "ranges": ranges }),
+        Value::Object(object) if object.get("ranges").is_none() => {
+            if let Some(range) = object.get("range").cloned() {
+                return serde_json::json!({ "ranges": [range] });
+            }
+            let mut line = serde_json::Map::new();
+            line.insert(
+                "ranges".to_owned(),
+                Value::Array(vec![Value::Object(object)]),
+            );
+            Value::Object(line)
+        }
+        other => other,
+    }
+}
+
+fn annotation_update_mode_is_add(mode: Option<&Value>) -> bool {
+    let Some(Value::String(mode)) = mode else {
+        return false;
+    };
+    matches!(
+        mode.trim().to_ascii_lowercase().as_str(),
+        "add" | "append" | "include" | "plus"
+    )
+}
+
+fn annotation_markers_are_nonempty(markers: Option<&Value>) -> bool {
+    matches!(markers, Some(Value::Array(markers)) if !markers.is_empty())
+}
+
+fn annotation_line_is_default_path(line: &Value) -> bool {
+    let Value::Object(line) = line else {
+        return false;
+    };
+    if line.is_empty() {
+        return true;
+    }
+    if line.len() == 1 {
+        return line
+            .get("ranges")
+            .is_some_and(annotation_line_ranges_are_default_path);
+    }
+    false
+}
+
+fn annotation_line_ranges_are_default_path(ranges: &Value) -> bool {
+    match ranges {
+        Value::Null => true,
+        Value::Array(ranges) => {
+            ranges.is_empty() || ranges.iter().all(annotation_measure_range_is_default_path)
+        }
+        _ => false,
+    }
+}
+
+fn annotation_measure_range_is_default_path(range: &Value) -> bool {
+    match range {
+        Value::Null => true,
+        Value::Object(range) => ![
+            "from",
+            "start",
+            "from_measure",
+            "fromMeasure",
+            "to",
+            "end",
+            "to_measure",
+            "toMeasure",
+            "from_offset",
+            "fromOffset",
+            "start_offset",
+            "startOffset",
+            "to_offset",
+            "toOffset",
+            "end_offset",
+            "endOffset",
+            "to_end",
+            "toEnd",
+            "path_end",
+            "pathEnd",
+        ]
+        .iter()
+        .any(|key| range.get(*key).is_some_and(|value| !value.is_null())),
+        _ => false,
+    }
+}
+
+fn get_object_string(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        object.get(*key).and_then(|value| match value {
+            Value::String(value) => {
+                let trimmed = value.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_owned())
+            }
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        })
+    })
+}
+
+fn normalize_annotation_interval(
+    object: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Result<Option<Value>, String> {
+    let Some((key, value)) = keys
+        .iter()
+        .find_map(|key| object.get(*key).map(|value| (*key, value)))
+    else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::Number(number) => {
+            let Some(value) = number.as_f64() else {
+                return Err(format!("viewer.annotations.show_path {key} must be finite"));
+            };
+            if !value.is_finite() || value <= 0.0 {
+                return Err(format!(
+                    "viewer.annotations.show_path {key} must be positive"
+                ));
+            }
+            Ok(Some(Value::Number(number.clone())))
+        }
+        Value::String(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err(format!(
+                    "viewer.annotations.show_path {key} must be non-empty"
+                ));
+            }
+            Ok(Some(Value::String(trimmed.to_owned())))
+        }
+        _ => Err(format!(
+            "viewer.annotations.show_path {key} must be a number or string"
+        )),
+    }
+}
+
+fn normalize_annotation_value(
+    object: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<Value> {
+    keys.iter()
+        .find_map(|key| object.get(*key).filter(|value| !value.is_null()).cloned())
 }
 
 fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction> {
@@ -809,6 +1179,20 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
     let mut inspect_modes_present = HashSet::new();
     let mut frame_visible_present = false;
     let mut clear_inspection_present = false;
+    let mut section_set_present = false;
+    let mut section_clear_present = false;
+    let mut latest_section = None::<Value>;
+    let mut annotations_show_present = false;
+    let mut annotations_clear_present = false;
+    let mut latest_path_annotation = None::<(
+        Option<String>,
+        Value,
+        Option<Value>,
+        Option<Value>,
+        Option<Value>,
+        Option<Value>,
+    )>;
+    let mut latest_annotations_clear_resource = None::<Option<String>>;
     let mut order = Vec::new();
 
     for action in actions {
@@ -925,6 +1309,40 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                     clear_inspection_present = true;
                 }
             }
+            AgentUiAction::ViewerSectionSet { section } => {
+                if !section_set_present {
+                    order.push(10u8);
+                    section_set_present = true;
+                }
+                latest_section = Some(section);
+            }
+            AgentUiAction::ViewerSectionClear => {
+                if !section_clear_present {
+                    order.push(11u8);
+                    section_clear_present = true;
+                }
+            }
+            AgentUiAction::ViewerAnnotationsShowPath {
+                resource,
+                path,
+                line,
+                markers,
+                mode,
+                max_samples,
+            } => {
+                if !annotations_show_present {
+                    order.push(12u8);
+                    annotations_show_present = true;
+                }
+                latest_path_annotation = Some((resource, path, line, markers, mode, max_samples));
+            }
+            AgentUiAction::ViewerAnnotationsClear { resource } => {
+                if !annotations_clear_present {
+                    order.push(13u8);
+                    annotations_clear_present = true;
+                }
+                latest_annotations_clear_resource = Some(resource);
+            }
         }
     }
 
@@ -1011,6 +1429,29 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
             }
             8 => normalized.push(AgentUiAction::ViewerFrameVisible),
             9 => normalized.push(AgentUiAction::ViewerClearInspection),
+            10 => {
+                if let Some(section) = latest_section.clone() {
+                    normalized.push(AgentUiAction::ViewerSectionSet { section });
+                }
+            }
+            11 => normalized.push(AgentUiAction::ViewerSectionClear),
+            12 => {
+                if let Some((resource, path, line, markers, mode, max_samples)) =
+                    latest_path_annotation.clone()
+                {
+                    normalized.push(AgentUiAction::ViewerAnnotationsShowPath {
+                        resource,
+                        path,
+                        line,
+                        markers,
+                        mode,
+                        max_samples,
+                    });
+                }
+            }
+            13 => normalized.push(AgentUiAction::ViewerAnnotationsClear {
+                resource: latest_annotations_clear_resource.clone().flatten(),
+            }),
             _ => {}
         }
     }
@@ -1245,6 +1686,8 @@ mod tests {
             db_node_ids: Vec::new(),
             resource: None,
             inspection_mode: None,
+            section: None,
+            annotation: None,
         }])
         .unwrap_err();
 
@@ -1266,6 +1709,19 @@ mod tests {
                 .with_resource("ifc/building-hvac"),
             AgentActionCandidate::viewer_frame_visible(),
             AgentActionCandidate::viewer_clear_inspection(),
+            AgentActionCandidate::viewer_section_set(serde_json::json!({
+                "pose": {
+                    "origin": [0.0, 0.0, 0.0],
+                    "tangent": [1.0, 0.0, 0.0],
+                    "normal": [0.0, 1.0, 0.0],
+                    "up": [0.0, 0.0, 1.0]
+                },
+                "width": 10.0,
+                "height": 5.0,
+                "thickness": 0.2,
+                "mode": "3d-overlay"
+            })),
+            AgentActionCandidate::viewer_section_clear(),
         ])
         .unwrap();
 
@@ -1291,8 +1747,206 @@ mod tests {
                 },
                 AgentUiAction::ViewerFrameVisible,
                 AgentUiAction::ViewerClearInspection,
+                AgentUiAction::ViewerSectionSet {
+                    section: serde_json::json!({
+                        "pose": {
+                            "origin": [0.0, 0.0, 0.0],
+                            "tangent": [1.0, 0.0, 0.0],
+                            "normal": [0.0, 1.0, 0.0],
+                            "up": [0.0, 0.0, 1.0]
+                        },
+                        "width": 10.0,
+                        "height": 5.0,
+                        "thickness": 0.2,
+                        "mode": "3d-overlay"
+                    }),
+                },
+                AgentUiAction::ViewerSectionClear,
             ]
         );
+    }
+
+    #[test]
+    fn viewer_section_set_accepts_section_pose_payload_without_ids() {
+        let section = serde_json::json!({
+            "pose": {
+                "origin": [12.0, 34.0, 5.0],
+                "tangent": [1.0, 0.0, 0.0],
+                "normal": [0.0, 1.0, 0.0],
+                "up": [0.0, 0.0, 1.0]
+            },
+            "width": 18.0,
+            "height": 7.5,
+            "thickness": 0.35
+        });
+
+        let actions =
+            validate_agent_action_candidates(vec![AgentActionCandidate::viewer_section_set(
+                section.clone(),
+            )])
+            .unwrap();
+
+        assert_eq!(
+            actions,
+            vec![AgentUiAction::ViewerSectionSet {
+                section: section.clone()
+            }]
+        );
+        assert_eq!(
+            serde_json::to_value(&actions[0]).unwrap(),
+            serde_json::json!({
+                "kind": "viewer.section.set",
+                "section": section
+            })
+        );
+
+        let error = validate_agent_action_candidates(vec![AgentActionCandidate {
+            kind: "viewer.section.set".to_owned(),
+            semantic_ids: vec!["wall-a".to_owned()],
+            db_node_ids: vec![12],
+            resource: None,
+            inspection_mode: None,
+            section: Some(serde_json::json!({})),
+            annotation: None,
+        }])
+        .unwrap_err();
+
+        assert!(error.contains("viewer.section.set does not accept ids"));
+    }
+
+    #[test]
+    fn viewer_annotations_show_path_accepts_composable_payload() {
+        let actions = validate_agent_action_candidates(vec![
+            AgentActionCandidate::viewer_annotations_show_path(serde_json::json!({
+                "resource": "ifc/infra-road",
+                "mode": "add",
+                "path": { "kind": "ifc_alignment", "id": "curve:42", "measure": "station" },
+                "line": {
+                    "ranges": [
+                        { "from": 0.0, "to": 120.0 },
+                        { "from": 120.0, "to_end": true }
+                    ]
+                },
+                "markers": [
+                    { "range": { "from": 0.0, "to": 120.0 }, "every": 20.0, "label": "measure" },
+                    { "range": { "from": 120.0, "to_end": true }, "every": 50.0, "label": "measure" }
+                ]
+            })),
+            AgentActionCandidate::viewer_annotations_clear().with_resource("ifc/infra-road"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            actions,
+            vec![
+                AgentUiAction::ViewerAnnotationsShowPath {
+                    resource: Some("ifc/infra-road".to_owned()),
+                    path: serde_json::json!({
+                        "kind": "ifc_alignment",
+                        "id": "curve:42",
+                        "measure": "station"
+                    }),
+                    line: Some(serde_json::json!({
+                        "ranges": [
+                            { "from": 0.0, "to": 120.0 },
+                            { "from": 120.0, "to_end": true }
+                        ]
+                    })),
+                    markers: Some(serde_json::json!([
+                        { "range": { "from": 0.0, "to": 120.0 }, "every": 20.0, "label": "measure" },
+                        { "range": { "from": 120.0, "to_end": true }, "every": 50.0, "label": "measure" }
+                    ])),
+                    mode: Some(serde_json::json!("add")),
+                    max_samples: None,
+                },
+                AgentUiAction::ViewerAnnotationsClear {
+                    resource: Some("ifc/infra-road".to_owned()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn viewer_annotations_show_path_accepts_line_range_shorthand() {
+        let actions = validate_agent_action_candidates(vec![
+            AgentActionCandidate::viewer_annotations_show_path(serde_json::json!({
+                "resource": "ifc/infra-road",
+                "path": { "kind": "ifc_alignment", "id": "curve:42", "measure": "station" },
+                "line_ranges": [{ "from": 100.0, "to": 200.0 }]
+            })),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            actions,
+            vec![AgentUiAction::ViewerAnnotationsShowPath {
+                resource: Some("ifc/infra-road".to_owned()),
+                path: serde_json::json!({
+                    "kind": "ifc_alignment",
+                    "id": "curve:42",
+                    "measure": "station"
+                }),
+                line: Some(serde_json::json!({
+                    "ranges": [{ "from": 100.0, "to": 200.0 }]
+                })),
+                markers: None,
+                mode: None,
+                max_samples: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn viewer_annotations_show_path_drops_default_line_for_marker_adds() {
+        for line in [
+            serde_json::json!({}),
+            serde_json::json!({ "ranges": [] }),
+            serde_json::json!({ "ranges": [{}] }),
+        ] {
+            let actions = validate_agent_action_candidates(vec![
+                AgentActionCandidate::viewer_annotations_show_path(serde_json::json!({
+                    "resource": "ifc/infra-road",
+                    "mode": "add",
+                    "path": { "kind": "ifc_alignment", "id": "curve:42", "measure": "station" },
+                    "line": line,
+                    "markers": [
+                        { "range": { "from": 120.0 }, "every": 50.0, "label": "measure" }
+                    ]
+                })),
+            ])
+            .unwrap();
+
+            assert_eq!(
+                actions,
+                vec![AgentUiAction::ViewerAnnotationsShowPath {
+                    resource: Some("ifc/infra-road".to_owned()),
+                    path: serde_json::json!({
+                        "kind": "ifc_alignment",
+                        "id": "curve:42",
+                        "measure": "station"
+                    }),
+                    line: None,
+                    markers: Some(serde_json::json!([
+                        { "range": { "from": 120.0 }, "every": 50.0, "label": "measure" }
+                    ])),
+                    mode: Some(serde_json::json!("add")),
+                    max_samples: None,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn viewer_annotations_show_path_rejects_geometry_payloads() {
+        let error = validate_agent_action_candidates(vec![
+            AgentActionCandidate::viewer_annotations_show_path(serde_json::json!({
+                "path": { "kind": "ifc_alignment", "id": "curve:42" },
+                "polyline": [[0, 0, 0], [1, 0, 0]]
+            })),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("does not accept raw geometry arrays"));
     }
 
     #[test]

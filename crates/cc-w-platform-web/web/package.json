@@ -4,7 +4,9 @@
   "version": "0.1.0",
   "scripts": {
     "electron": "electron ./electron/main.cjs",
-    "electron:dev": "electron ./electron/main.cjs"
+    "electron:dev": "electron ./electron/main.cjs",
+    "test:path-annotations": "node --test js/viewer/path-annotations.test.mjs",
+    "test:playwright:annotations": "playwright test -c playwright.annotation.config.cjs"
   },
   "dependencies": {
     "@sigma/edge-curve": "^3.1.0",

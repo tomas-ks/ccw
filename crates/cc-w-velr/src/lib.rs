@@ -2773,28 +2773,29 @@ RETURN id(lp) AS placement_id, id(curve) AS curve_id, distance.payload_value AS 
     ) -> Result<HashMap<u64, IfcGradientCurveRecord>, VelrIfcError> {
         let horizontal_rows = self.execute_cypher_rows(
             r#"
-MATCH (curve:IfcGradientCurve)-[:BASE_CURVE]->(:IfcCompositeCurve)-[:SEGMENTS]->(seg:IfcCurveSegment)-[:PLACEMENT]->(place:IfcAxis2Placement2D)-[:LOCATION]->(point:IfcCartesianPoint)
-MATCH (place)-[:REF_DIRECTION]->(dir:IfcDirection)
-MATCH (seg)-[:SEGMENT_LENGTH]->(length)
-OPTIONAL MATCH (seg)-[:PARENT_CURVE]->(parent_curve)
-RETURN id(curve) AS curve_id, id(seg) AS segment_id, point.Coordinates AS start_point, dir.DirectionRatios AS direction, length.payload_value AS segment_length, parent_curve.declared_entity AS parent_curve_entity, parent_curve.Radius AS radius, parent_curve.ClothoidConstant AS clothoid_constant
-ORDER BY curve_id, segment_id
-"#,
-        )?;
+	MATCH (curve:IfcGradientCurve)-[:BASE_CURVE]->(:IfcCompositeCurve)-[segment_edge:SEGMENTS]->(seg:IfcCurveSegment)-[:PLACEMENT]->(place:IfcAxis2Placement2D)-[:LOCATION]->(point:IfcCartesianPoint)
+	MATCH (place)-[:REF_DIRECTION]->(dir:IfcDirection)
+	MATCH (seg)-[:SEGMENT_LENGTH]->(length)
+	OPTIONAL MATCH (seg)-[:PARENT_CURVE]->(parent_curve)
+	RETURN id(curve) AS curve_id, id(seg) AS segment_id, segment_edge.ordinal AS segment_ordinal, point.Coordinates AS start_point, dir.DirectionRatios AS direction, length.payload_value AS segment_length, parent_curve.declared_entity AS parent_curve_entity, parent_curve.Radius AS radius, parent_curve.ClothoidConstant AS clothoid_constant
+	ORDER BY curve_id, segment_ordinal, segment_id
+	"#,
+	        )?;
         let vertical_rows = self.execute_cypher_rows(
-            r#"
-MATCH (curve:IfcGradientCurve)-[:SEGMENTS]->(seg:IfcCurveSegment)-[:PLACEMENT]->(place:IfcAxis2Placement2D)-[:LOCATION]->(point:IfcCartesianPoint)
-MATCH (place)-[:REF_DIRECTION]->(dir:IfcDirection)
-MATCH (seg)-[:SEGMENT_LENGTH]->(length)
-OPTIONAL MATCH (seg)-[:PARENT_CURVE]->(parent_curve)
-RETURN id(curve) AS curve_id, id(seg) AS segment_id, point.Coordinates AS start_point, dir.DirectionRatios AS direction, length.payload_value AS segment_length, parent_curve.declared_entity AS parent_curve_entity, parent_curve.Radius AS radius, parent_curve.ClothoidConstant AS clothoid_constant
-ORDER BY curve_id, segment_id
-"#,
-        )?;
+	            r#"
+	MATCH (curve:IfcGradientCurve)-[segment_edge:SEGMENTS]->(seg:IfcCurveSegment)-[:PLACEMENT]->(place:IfcAxis2Placement2D)-[:LOCATION]->(point:IfcCartesianPoint)
+	MATCH (place)-[:REF_DIRECTION]->(dir:IfcDirection)
+	MATCH (seg)-[:SEGMENT_LENGTH]->(length)
+	OPTIONAL MATCH (seg)-[:PARENT_CURVE]->(parent_curve)
+	RETURN id(curve) AS curve_id, id(seg) AS segment_id, segment_edge.ordinal AS segment_ordinal, point.Coordinates AS start_point, dir.DirectionRatios AS direction, length.payload_value AS segment_length, parent_curve.declared_entity AS parent_curve_entity, parent_curve.Radius AS radius, parent_curve.ClothoidConstant AS clothoid_constant
+	ORDER BY curve_id, segment_ordinal, segment_id
+	"#,
+	        )?;
 
         #[derive(Clone, Debug)]
         struct SegmentRow {
             segment_id: u64,
+            ordinal: u64,
             start_point: DVec2,
             direction: DVec2,
             signed_length: f64,
@@ -2809,14 +2810,15 @@ ORDER BY curve_id, segment_id
                     let curve_id = parse_u64_cell(row.first(), "curve_id")?;
                     rows_by_curve.entry(curve_id).or_default().push(SegmentRow {
                         segment_id: parse_u64_cell(row.get(1), "segment_id")?,
-                        start_point: parse_dvec2_cell(row.get(2), "start_point")?,
+                        ordinal: parse_u64_cell(row.get(2), "segment_ordinal")?,
+                        start_point: parse_dvec2_cell(row.get(3), "start_point")?,
                         direction: normalized_2d_or(
-                            parse_dvec2_cell(row.get(3), "direction")?,
+                            parse_dvec2_cell(row.get(4), "direction")?,
                             DVec2::X,
                         ),
-                        signed_length: parse_f64_cell(row.get(4), "segment_length")?,
-                        parent_curve_entity: parse_optional_string_cell(row.get(5)),
-                        radius: parse_optional_f64_cell(row.get(6), "radius")?,
+                        signed_length: parse_f64_cell(row.get(5), "segment_length")?,
+                        parent_curve_entity: parse_optional_string_cell(row.get(6)),
+                        radius: parse_optional_f64_cell(row.get(7), "radius")?,
                     });
                 }
                 Ok(rows_by_curve)
@@ -2827,8 +2829,17 @@ ORDER BY curve_id, segment_id
 
         let build_segments = |mut rows: Vec<SegmentRow>,
                               use_explicit_station: bool|
-         -> Vec<IfcGradientCurveSegment> {
-            rows.sort_by_key(|row| row.segment_id);
+         -> Result<Vec<IfcGradientCurveSegment>, VelrIfcError> {
+            rows.sort_by_key(|row| (row.ordinal, row.segment_id));
+            if let Some(window) = rows
+                .windows(2)
+                .find(|window| window[0].ordinal == window[1].ordinal)
+            {
+                return Err(VelrIfcError::IfcGeometryData(format!(
+                    "IfcGradientCurve segment list has duplicate SEGMENTS ordinal `{}` for segment ids `{}` and `{}`",
+                    window[0].ordinal, window[0].segment_id, window[1].segment_id
+                )));
+            }
             let mut cumulative_station = 0.0;
             let mut segments = Vec::with_capacity(rows.len());
             for index in 0..rows.len() {
@@ -2872,15 +2883,16 @@ ORDER BY curve_id, segment_id
                 });
                 cumulative_station += length;
             }
-            segments
+            Ok(segments)
         };
 
         let mut records = HashMap::with_capacity(horizontal_rows_by_curve.len());
         for (curve_id, horizontal_rows) in horizontal_rows_by_curve.drain() {
-            let horizontal_segments = build_segments(horizontal_rows, false);
+            let horizontal_segments = build_segments(horizontal_rows, false)?;
             let vertical_segments = vertical_rows_by_curve
                 .remove(&curve_id)
                 .map(|rows| build_segments(rows, true))
+                .transpose()?
                 .unwrap_or_default();
             records.insert(
                 curve_id,

@@ -1533,17 +1533,20 @@ fn map_geometry_backend_error(error: GeometryBackendError) -> GeometryPackageSou
 use cc_w_backend::available_demo_resources;
 #[cfg(target_arch = "wasm32")]
 use cc_w_render::{
-    Camera, DepthTarget, MeshRenderer, PICK_DEPTH_BITS_FORMAT, PICK_INDEX_FORMAT, RenderDefaults,
-    RenderProfileDescriptor, RenderProfileId, ViewportSize,
+    Camera, ClipPlaneSide, DepthTarget, MeshRenderer, PICK_DEPTH_BITS_FORMAT, PICK_INDEX_FORMAT,
+    RenderDefaults, RenderProfileDescriptor, RenderProfileId, SectionOverlay, ViewportSize,
     fit_camera_to_bounds_with_scene_context, fit_camera_to_render_scene, interpolate_camera,
 };
 #[cfg(target_arch = "wasm32")]
 use cc_w_types::{
-    PickHit, PickRegion, PreparedRenderRole, PreparedRenderScene, WORLD_FORWARD, WORLD_RIGHT,
-    WORLD_UP,
+    PickHit, PickRegion, PreparedRenderRole, PreparedRenderScene, SceneAnnotationDepthMode,
+    SceneAnnotationLayer, SceneAnnotationLayerId, SceneAnnotationLifecycle,
+    SceneAnnotationPrimitive, SceneMarker, SceneMarkerKind, ScenePolyline,
+    SceneTextHorizontalAlign, SceneTextLabel, SceneTextVerticalAlign, SectionClipMode,
+    SectionDisplayMode, SectionPose, SectionState, WORLD_FORWARD, WORLD_RIGHT, WORLD_UP,
 };
 #[cfg(target_arch = "wasm32")]
-use glam::{DMat4, DQuat, DVec3, DVec4, Vec2};
+use glam::{DMat4, DQuat, DVec2, DVec3, DVec4, Vec2};
 #[cfg(target_arch = "wasm32")]
 use js_sys::{Array, JSON, Promise, decode_uri_component};
 #[cfg(target_arch = "wasm32")]
@@ -1574,6 +1577,7 @@ struct WebViewerViewState {
     render_profile: String,
     reference_grid_visible: bool,
     available_render_profiles: Vec<WebRenderProfileDescriptor>,
+    scene_bounds: WebBoundsSnapshot,
     total_elements: usize,
     total_instances: usize,
     total_definitions: usize,
@@ -1587,12 +1591,209 @@ struct WebViewerViewState {
     hidden_element_ids: Vec<String>,
     shown_element_ids: Vec<String>,
     suppressed_element_ids: Vec<String>,
+    section: WebSectionStateSnapshot,
+    annotations: WebAnnotationStateSnapshot,
     resident_instances: usize,
     resident_definitions: usize,
     missing_instance_ids: Vec<u64>,
     missing_definition_ids: Vec<u64>,
     triangles: usize,
     draws: usize,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebSectionSetRequest {
+    resource: Option<String>,
+    alignment_id: Option<String>,
+    station: Option<f64>,
+    pose: WebSectionPoseRequest,
+    width: Option<f64>,
+    height: Option<f64>,
+    thickness: Option<f64>,
+    mode: Option<String>,
+    clip: Option<String>,
+    provenance: Option<Vec<String>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebAnnotationLayerSetRequest {
+    id: String,
+    source: Option<String>,
+    visible: Option<bool>,
+    lifecycle: Option<String>,
+    primitives: Vec<WebAnnotationPrimitiveRequest>,
+    provenance: Option<Vec<String>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebAnnotationPrimitiveRequest {
+    #[serde(rename = "type", alias = "kind")]
+    primitive_type: String,
+    id: String,
+    points: Option<Vec<[f64; 3]>>,
+    position: Option<[f64; 3]>,
+    anchor: Option<[f64; 3]>,
+    text: Option<String>,
+    direction: Option<[f64; 3]>,
+    normal: Option<[f64; 3]>,
+    color: Option<serde_json::Value>,
+    alpha: Option<f32>,
+    width_px: Option<f32>,
+    size_px: Option<f32>,
+    #[serde(alias = "shape")]
+    marker_kind: Option<String>,
+    depth_mode: Option<String>,
+    screen_offset_px: Option<[f64; 2]>,
+    horizontal_align: Option<String>,
+    vertical_align: Option<String>,
+    style: Option<WebAnnotationTextStyleRequest>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebAnnotationTextStyleRequest {
+    color: Option<serde_json::Value>,
+    background_color: Option<serde_json::Value>,
+    outline_color: Option<serde_json::Value>,
+    size_px: Option<f32>,
+    #[serde(alias = "boldPx", alias = "weightPx")]
+    embolden_px: Option<f32>,
+    padding_px: Option<f32>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebBoundsSnapshot {
+    min: [f64; 3],
+    max: [f64; 3],
+    center: [f64; 3],
+    size: [f64; 3],
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebSectionPoseRequest {
+    origin: [f64; 3],
+    tangent: [f64; 3],
+    normal: [f64; 3],
+    up: [f64; 3],
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebSectionStateSnapshot {
+    active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alignment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    station: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pose: Option<WebSectionPoseSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thickness: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clip: Option<&'static str>,
+    provenance: Vec<String>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebSectionPoseSnapshot {
+    origin: [f64; 3],
+    tangent: [f64; 3],
+    normal: [f64; 3],
+    up: [f64; 3],
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebAnnotationStateSnapshot {
+    count: usize,
+    layers: Vec<WebAnnotationLayerSnapshot>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebAnnotationLayerSnapshot {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    visible: bool,
+    lifecycle: &'static str,
+    primitives: Vec<WebAnnotationPrimitiveSnapshot>,
+    provenance: Vec<String>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum WebAnnotationPrimitiveSnapshot {
+    Polyline {
+        id: String,
+        points: Vec<[f64; 3]>,
+        color: [f32; 3],
+        alpha: f32,
+        width_px: f32,
+        depth_mode: &'static str,
+    },
+    Marker {
+        id: String,
+        position: [f64; 3],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        direction: Option<[f64; 3]>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        normal: Option<[f64; 3]>,
+        color: [f32; 3],
+        alpha: f32,
+        size_px: f32,
+        marker_kind: &'static str,
+        depth_mode: &'static str,
+    },
+    Text {
+        id: String,
+        text: String,
+        anchor: [f64; 3],
+        screen_offset_px: [f64; 2],
+        horizontal_align: &'static str,
+        vertical_align: &'static str,
+        depth_mode: &'static str,
+        style: WebAnnotationTextStyleSnapshot,
+    },
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebAnnotationTextStyleSnapshot {
+    color: [f32; 4],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    background_color: Option<[f32; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outline_color: Option<[f32; 4]>,
+    size_px: f32,
+    embolden_px: f32,
+    padding_px: f32,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2127,6 +2328,107 @@ pub fn viewer_set_clear_color(red: f64, green: f64, blue: f64) -> Result<String,
         state.render()?;
         state.view_state_json()
     })
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_section_state_json() -> Result<String, JsValue> {
+    with_web_viewer_state(|state| state.section_state_json())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_section_set_json(spec_json: String) -> Result<String, JsValue> {
+    let request = parse_web_section_set_request(&spec_json)
+        .map_err(|error| JsValue::from_str(&format!("failed to parse section request: {error}")))?;
+    let (json, events) = with_web_viewer_state_mut(|state| {
+        let section = web_section_request_to_state(request, &state.current_resource)?;
+        state.set_section(section)?;
+        Ok((
+            state.section_state_json()?,
+            vec![state.viewer_state_change_event("section")?],
+        ))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(json)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_section_clear_json() -> Result<String, JsValue> {
+    let (json, events) = with_web_viewer_state_mut(|state| {
+        let changed = state.clear_section()?;
+        let events = changed
+            .then(|| state.viewer_state_change_event("section"))
+            .transpose()?
+            .into_iter()
+            .collect();
+        Ok((state.section_state_json()?, events))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(json)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_annotations_state_json() -> Result<String, JsValue> {
+    with_web_viewer_state(|state| state.annotation_state_json())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_annotations_set_json(spec_json: String) -> Result<String, JsValue> {
+    let request = parse_web_annotation_layer_set_request(&spec_json).map_err(|error| {
+        JsValue::from_str(&format!(
+            "failed to parse annotation layer request: {error}"
+        ))
+    })?;
+    let (json, events) = with_web_viewer_state_mut(|state| {
+        let layer = web_annotation_layer_request_to_state(request)?;
+        state.set_annotation_layer(layer)?;
+        Ok((
+            state.annotation_state_json()?,
+            vec![state.viewer_state_change_event("annotations")?],
+        ))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(json)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_annotations_merge_json(spec_json: String) -> Result<String, JsValue> {
+    let request = parse_web_annotation_layer_set_request(&spec_json).map_err(|error| {
+        JsValue::from_str(&format!(
+            "failed to parse annotation layer merge request: {error}"
+        ))
+    })?;
+    let (json, events) = with_web_viewer_state_mut(|state| {
+        let layer = web_annotation_layer_request_to_state(request)?;
+        state.merge_annotation_layer(layer)?;
+        Ok((
+            state.annotation_state_json()?,
+            vec![state.viewer_state_change_event("annotations")?],
+        ))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(json)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_annotations_clear_json(layer_id: Option<String>) -> Result<String, JsValue> {
+    let (json, events) = with_web_viewer_state_mut(|state| {
+        let changed = state.clear_annotation_layers(layer_id.as_deref())?;
+        let events = changed
+            .then(|| state.viewer_state_change_event("annotations"))
+            .transpose()?
+            .into_iter()
+            .collect();
+        Ok((state.annotation_state_json()?, events))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(json)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -3587,6 +3889,8 @@ impl WebViewerState {
         self.inspection_generation = self.inspection_generation.wrapping_add(1);
         self.renderer
             .set_inspection_context_alpha_multiplier(&self.queue, 1.0);
+        self.renderer.clear_section_overlays();
+        self.renderer.clear_clip_plane(&self.queue);
         Ok(vec![
             self.upload_runtime_scene(true)?,
             self.viewer_state_change_event("resource")?,
@@ -3618,6 +3922,72 @@ impl WebViewerState {
         };
     }
 
+    fn set_section(&mut self, section: SectionState) -> Result<(), String> {
+        let overlay = section_overlay_from_state(&section)?;
+        self.renderer
+            .set_section_overlays(&self.device, &[overlay])
+            .map_err(|error| format!("failed to upload section overlay: {error}"))?;
+        match clip_side_from_section_clip_mode(section.clip) {
+            ClipPlaneSide::None => self.renderer.clear_clip_plane(&self.queue),
+            side => self
+                .renderer
+                .set_clip_plane(&self.queue, section.pose.origin, section.pose.normal, side)
+                .map_err(|error| format!("failed to set section clip plane: {error}"))?,
+        }
+        self.runtime_scene.set_section(section);
+        self.refresh_status();
+        self.render()
+    }
+
+    fn clear_section(&mut self) -> Result<bool, String> {
+        let changed = self.runtime_scene.clear_section();
+        self.renderer.clear_section_overlays();
+        self.renderer.clear_clip_plane(&self.queue);
+        self.refresh_status();
+        self.render()?;
+        Ok(changed)
+    }
+
+    fn section_state_json(&self) -> Result<String, String> {
+        serde_json::to_string(&web_section_state_snapshot(
+            self.runtime_scene.section_state(),
+        ))
+        .map_err(|error| format!("failed to encode section state JSON: {error}"))
+    }
+
+    fn set_annotation_layer(&mut self, layer: SceneAnnotationLayer) -> Result<(), String> {
+        self.runtime_scene.set_annotation_layer(layer);
+        let _ = self.upload_runtime_scene(false)?;
+        self.render()
+    }
+
+    fn merge_annotation_layer(&mut self, layer: SceneAnnotationLayer) -> Result<(), String> {
+        self.runtime_scene.merge_annotation_layer(layer);
+        let _ = self.upload_runtime_scene(false)?;
+        self.render()
+    }
+
+    fn clear_annotation_layers(&mut self, layer_id: Option<&str>) -> Result<bool, String> {
+        let changed = match layer_id {
+            Some(layer_id) if !layer_id.trim().is_empty() => self
+                .runtime_scene
+                .clear_annotation_layer(&SceneAnnotationLayerId::new(layer_id.trim())),
+            _ => self.runtime_scene.clear_annotation_layers(),
+        };
+        if changed {
+            let _ = self.upload_runtime_scene(false)?;
+            self.render()?;
+        }
+        Ok(changed)
+    }
+
+    fn annotation_state_json(&self) -> Result<String, String> {
+        serde_json::to_string(&web_annotation_state_snapshot(
+            self.runtime_scene.annotation_layers(),
+        ))
+        .map_err(|error| format!("failed to encode annotation state JSON: {error}"))
+    }
+
     fn resize_to_window(&mut self) -> Result<Option<DeferredWebEvent>, String> {
         let (width, height) =
             resize_canvases_to_window(&self.window, &self.canvas, &self.axes_overlay)?;
@@ -3645,6 +4015,15 @@ impl WebViewerState {
         let render_scene = self.runtime_scene.compose_render_scene();
         self.renderer
             .upload_prepared_scene(&self.device, &self.queue, &render_scene);
+        let annotation_layers = self
+            .runtime_scene
+            .annotation_layers()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.renderer
+            .set_annotation_layers(&self.device, &self.queue, &annotation_layers)
+            .map_err(|error| format!("failed to upload annotation layers: {error}"))?;
         if reset_camera {
             self.camera_transition = None;
             let camera = fit_camera_to_render_scene(&render_scene);
@@ -4761,6 +5140,7 @@ impl WebViewerState {
             available_render_profiles: web_render_profile_descriptors(
                 self.renderer.available_profiles(),
             ),
+            scene_bounds: web_bounds_snapshot(render_scene.bounds),
             total_elements: catalog.elements.len(),
             total_instances: catalog.instances.len(),
             total_definitions: catalog.definitions.len(),
@@ -4784,6 +5164,8 @@ impl WebViewerState {
             suppressed_element_ids: semantic_ids_to_strings(
                 self.runtime_scene.suppressed_element_ids(),
             ),
+            section: web_section_state_snapshot(self.runtime_scene.section_state()),
+            annotations: web_annotation_state_snapshot(self.runtime_scene.annotation_layers()),
             resident_instances: residency.instances,
             resident_definitions: residency.definitions,
             missing_instance_ids: missing.instance_ids.iter().map(|id| id.0).collect(),
@@ -5423,6 +5805,768 @@ fn parse_render_profile_id(
 }
 
 #[cfg(target_arch = "wasm32")]
+fn parse_web_section_set_request(spec_json: &str) -> Result<WebSectionSetRequest, String> {
+    serde_json::from_str(spec_json)
+        .map_err(|error| format!("invalid section request JSON: {error}"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_section_request_to_state(
+    request: WebSectionSetRequest,
+    current_resource: &str,
+) -> Result<SectionState, String> {
+    let pose = request.pose.to_section_pose()?;
+    let resource = request
+        .resource
+        .filter(|resource| !resource.trim().is_empty())
+        .unwrap_or_else(|| current_resource.to_string());
+    let mut section = SectionState::new(resource, pose);
+    section.alignment_id = request
+        .alignment_id
+        .filter(|alignment_id| !alignment_id.trim().is_empty());
+    section.station = request
+        .station
+        .map(require_finite_section_scalar)
+        .transpose()?;
+    section.width = request
+        .width
+        .map(|value| require_positive_section_scalar("width", value))
+        .transpose()?
+        .unwrap_or(section.width);
+    section.height = request
+        .height
+        .map(|value| require_positive_section_scalar("height", value))
+        .transpose()?
+        .unwrap_or(section.height);
+    section.thickness = request
+        .thickness
+        .map(|value| require_positive_section_scalar("thickness", value))
+        .transpose()?
+        .unwrap_or(section.thickness);
+    section.mode = parse_section_display_mode(request.mode.as_deref())?;
+    section.clip = parse_section_clip_mode(request.clip.as_deref())?;
+    section.provenance = request.provenance.unwrap_or_default();
+
+    if section.mode != SectionDisplayMode::ThreeDOverlay {
+        return Err(format!(
+            "section display mode `{}` is not implemented yet; use `3d-overlay`",
+            section_display_mode_name(section.mode)
+        ));
+    }
+
+    Ok(section)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_web_annotation_layer_set_request(
+    spec_json: &str,
+) -> Result<WebAnnotationLayerSetRequest, String> {
+    serde_json::from_str(spec_json)
+        .map_err(|error| format!("invalid annotation layer request JSON: {error}"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_annotation_layer_request_to_state(
+    request: WebAnnotationLayerSetRequest,
+) -> Result<SceneAnnotationLayer, String> {
+    let id = require_non_empty_annotation_id("layer id", request.id)?;
+    let mut layer = SceneAnnotationLayer::new(id);
+    layer.source = request.source.filter(|source| !source.trim().is_empty());
+    layer.visible = request.visible.unwrap_or(true);
+    layer.lifecycle = parse_annotation_lifecycle(request.lifecycle.as_deref())?;
+    layer.provenance = request.provenance.unwrap_or_default();
+    layer.primitives = request
+        .primitives
+        .into_iter()
+        .map(web_annotation_primitive_request_to_state)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(layer)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_annotation_primitive_request_to_state(
+    request: WebAnnotationPrimitiveRequest,
+) -> Result<SceneAnnotationPrimitive, String> {
+    let primitive_type = normalize_annotation_token(&request.primitive_type);
+    match primitive_type.as_str() {
+        "polyline" | "line" | "path" => {
+            let id = require_non_empty_annotation_id("polyline id", request.id)?;
+            let points = request
+                .points
+                .ok_or_else(|| "annotation polyline requires `points`".to_string())?
+                .into_iter()
+                .enumerate()
+                .map(|(index, point)| annotation_dvec3_from_array("polyline point", index, point))
+                .collect::<Result<Vec<_>, _>>()?;
+            if points.len() < 2 {
+                return Err("annotation polyline requires at least two points".to_string());
+            }
+            let mut polyline = ScenePolyline::new(id, points);
+            if let Some(color) = request.color {
+                polyline.color = parse_annotation_color("polyline color", &color)?;
+            }
+            if let Some(alpha) = request.alpha {
+                polyline.alpha = require_annotation_unit_scalar("polyline alpha", alpha)?;
+            }
+            if let Some(width_px) = request.width_px {
+                polyline.width_px =
+                    require_positive_annotation_scalar("polyline widthPx", width_px)?;
+            }
+            polyline.depth_mode = parse_annotation_depth_mode(request.depth_mode.as_deref())?;
+            Ok(SceneAnnotationPrimitive::Polyline(polyline))
+        }
+        "marker" | "point" => {
+            let id = require_non_empty_annotation_id("marker id", request.id)?;
+            let position = annotation_required_dvec3("marker position", request.position)?;
+            let mut marker = SceneMarker::new(id, position);
+            marker.direction = request
+                .direction
+                .map(|direction| annotation_dvec3_from_array("marker direction", 0, direction))
+                .transpose()?;
+            marker.normal = request
+                .normal
+                .map(|normal| annotation_dvec3_from_array("marker normal", 0, normal))
+                .transpose()?;
+            if let Some(color) = request.color {
+                marker.color = parse_annotation_color("marker color", &color)?;
+            }
+            if let Some(alpha) = request.alpha {
+                marker.alpha = require_annotation_unit_scalar("marker alpha", alpha)?;
+            }
+            if let Some(size_px) = request.size_px {
+                marker.size_px = require_positive_annotation_scalar("marker sizePx", size_px)?;
+            }
+            marker.kind = parse_marker_kind(request.marker_kind.as_deref())?;
+            marker.depth_mode = parse_annotation_depth_mode(request.depth_mode.as_deref())?;
+            Ok(SceneAnnotationPrimitive::Marker(marker))
+        }
+        "text" | "label" => {
+            let id = require_non_empty_annotation_id("text id", request.id)?;
+            let text = request
+                .text
+                .ok_or_else(|| "annotation text requires `text`".to_string())?;
+            let anchor = annotation_required_dvec3("text anchor", request.anchor)?;
+            let mut label = SceneTextLabel::new(id, text, anchor);
+            if let Some(offset) = request.screen_offset_px {
+                if !offset[0].is_finite() || !offset[1].is_finite() {
+                    return Err(
+                        "annotation text screenOffsetPx must contain finite values".to_string()
+                    );
+                }
+                label.screen_offset_px = DVec2::new(offset[0], offset[1]);
+            }
+            label.horizontal_align =
+                parse_text_horizontal_align(request.horizontal_align.as_deref())?;
+            label.vertical_align = parse_text_vertical_align(request.vertical_align.as_deref())?;
+            label.depth_mode = parse_annotation_depth_mode(request.depth_mode.as_deref())?.into();
+            if let Some(color) = request.color {
+                let (color, alpha) = parse_annotation_color_with_alpha("text color", &color)?;
+                label.style.color = color;
+                label.style.color_alpha = alpha;
+            }
+            if let Some(size_px) = request.size_px {
+                label.style.size_px = require_positive_annotation_scalar("text sizePx", size_px)?;
+            }
+            if let Some(style) = request.style {
+                if let Some(color) = style.color {
+                    let (color, alpha) =
+                        parse_annotation_color_with_alpha("text style color", &color)?;
+                    label.style.color = color;
+                    label.style.color_alpha = alpha;
+                }
+                if let Some(color) = style.background_color {
+                    let (color, alpha) =
+                        parse_annotation_color_with_alpha("text style backgroundColor", &color)?;
+                    label.style.background_color = Some(color);
+                    label.style.background_alpha = alpha;
+                }
+                if let Some(color) = style.outline_color {
+                    let (color, alpha) =
+                        parse_annotation_color_with_alpha("text style outlineColor", &color)?;
+                    label.style.outline_color = Some(color);
+                    label.style.outline_alpha = alpha;
+                }
+                if let Some(size_px) = style.size_px {
+                    label.style.size_px =
+                        require_positive_annotation_scalar("text style sizePx", size_px)?;
+                }
+                if let Some(embolden_px) = style.embolden_px {
+                    label.style.embolden_px = require_non_negative_annotation_scalar(
+                        "text style emboldenPx",
+                        embolden_px,
+                    )?;
+                }
+                if let Some(padding_px) = style.padding_px {
+                    label.style.padding_px =
+                        require_non_negative_annotation_scalar("text style paddingPx", padding_px)?;
+                }
+            }
+            Ok(SceneAnnotationPrimitive::Text(label))
+        }
+        other => Err(format!("unknown annotation primitive type `{other}`")),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl WebSectionPoseRequest {
+    fn to_section_pose(self) -> Result<SectionPose, String> {
+        let origin = dvec3_from_array("origin", self.origin)?;
+        let tangent = normalized_dvec3_from_array("tangent", self.tangent)?;
+        let normal = normalized_dvec3_from_array("normal", self.normal)?;
+        let up = normalized_dvec3_from_array("up", self.up)?;
+        Ok(SectionPose::new(origin, tangent, normal, up))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn dvec3_from_array(label: &str, value: [f64; 3]) -> Result<DVec3, String> {
+    if !value.into_iter().all(f64::is_finite) {
+        return Err(format!(
+            "section pose `{label}` contains a non-finite coordinate"
+        ));
+    }
+    Ok(DVec3::new(value[0], value[1], value[2]))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn normalized_dvec3_from_array(label: &str, value: [f64; 3]) -> Result<DVec3, String> {
+    let vector = dvec3_from_array(label, value)?;
+    let length = vector.length();
+    if length <= f64::EPSILON {
+        return Err(format!("section pose `{label}` must be a non-zero vector"));
+    }
+    Ok(vector / length)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn require_finite_section_scalar(value: f64) -> Result<f64, String> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err("section station must be finite".to_string())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn require_positive_section_scalar(label: &str, value: f64) -> Result<f64, String> {
+    if value.is_finite() && value > 0.0 {
+        Ok(value)
+    } else {
+        Err(format!(
+            "section `{label}` must be a finite positive number"
+        ))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn normalize_annotation_token(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', '-', ' '], "")
+}
+
+#[cfg(target_arch = "wasm32")]
+fn require_non_empty_annotation_id(label: &str, value: String) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err(format!("annotation {label} must not be empty"))
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn annotation_required_dvec3(label: &str, value: Option<[f64; 3]>) -> Result<DVec3, String> {
+    annotation_dvec3_from_array(
+        label,
+        0,
+        value.ok_or_else(|| format!("annotation {label} is required"))?,
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn annotation_dvec3_from_array(
+    label: &str,
+    index: usize,
+    value: [f64; 3],
+) -> Result<DVec3, String> {
+    if !value.into_iter().all(f64::is_finite) {
+        return Err(format!(
+            "annotation {label} #{index} contains a non-finite coordinate"
+        ));
+    }
+    Ok(DVec3::new(value[0], value[1], value[2]))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn require_positive_annotation_scalar(label: &str, value: f32) -> Result<f32, String> {
+    if value.is_finite() && value > 0.0 {
+        Ok(value)
+    } else {
+        Err(format!(
+            "annotation {label} must be a finite positive number"
+        ))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn require_non_negative_annotation_scalar(label: &str, value: f32) -> Result<f32, String> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(value)
+    } else {
+        Err(format!(
+            "annotation {label} must be a finite non-negative number"
+        ))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn require_annotation_unit_scalar(label: &str, value: f32) -> Result<f32, String> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "annotation {label} must be a finite number from 0 to 1"
+        ))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_annotation_color(label: &str, value: &serde_json::Value) -> Result<DisplayColor, String> {
+    parse_annotation_color_with_alpha(label, value).map(|(color, _alpha)| color)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_annotation_color_with_alpha(
+    label: &str,
+    value: &serde_json::Value,
+) -> Result<(DisplayColor, f32), String> {
+    if let Some(array) = value.as_array() {
+        if array.len() < 3 {
+            return Err(format!("annotation {label} requires at least three values"));
+        }
+        let rgb = [
+            annotation_color_component(label, array[0].as_f64())?,
+            annotation_color_component(label, array[1].as_f64())?,
+            annotation_color_component(label, array[2].as_f64())?,
+        ];
+        let alpha = array
+            .get(3)
+            .map(|value| annotation_alpha_component(label, value.as_f64()))
+            .transpose()?
+            .unwrap_or(1.0);
+        return Ok((DisplayColor { rgb }, alpha));
+    } else if let Some(object) = value.as_object() {
+        let component = |long: &str, short: &str| {
+            object
+                .get(long)
+                .or_else(|| object.get(short))
+                .and_then(serde_json::Value::as_f64)
+        };
+        let rgb = [
+            annotation_color_component(label, component("red", "r"))?,
+            annotation_color_component(label, component("green", "g"))?,
+            annotation_color_component(label, component("blue", "b"))?,
+        ];
+        let alpha = component("alpha", "a")
+            .map(|value| annotation_alpha_component(label, Some(value)))
+            .transpose()?
+            .unwrap_or(1.0);
+        return Ok((DisplayColor { rgb }, alpha));
+    } else {
+        return Err(format!("annotation {label} must be an RGB array or object"));
+    };
+}
+
+#[cfg(target_arch = "wasm32")]
+fn annotation_color_component(label: &str, value: Option<f64>) -> Result<f32, String> {
+    let value = value.ok_or_else(|| format!("annotation {label} is missing an RGB component"))?;
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(value as f32)
+    } else {
+        Err(format!(
+            "annotation {label} RGB components must be finite numbers from 0 to 1"
+        ))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn annotation_alpha_component(label: &str, value: Option<f64>) -> Result<f32, String> {
+    let value = value.ok_or_else(|| format!("annotation {label} alpha is not a number"))?;
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(value as f32)
+    } else {
+        Err(format!(
+            "annotation {label} alpha components must be finite numbers from 0 to 1"
+        ))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_annotation_lifecycle(value: Option<&str>) -> Result<SceneAnnotationLifecycle, String> {
+    match value
+        .map(normalize_annotation_token)
+        .as_deref()
+        .unwrap_or("")
+    {
+        "" | "temporary" | "temp" => Ok(SceneAnnotationLifecycle::Temporary),
+        "pinned" | "pin" | "persistent" => Ok(SceneAnnotationLifecycle::Pinned),
+        "diagnostic" | "debug" => Ok(SceneAnnotationLifecycle::Diagnostic),
+        other => Err(format!("unknown annotation lifecycle `{other}`")),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_annotation_depth_mode(value: Option<&str>) -> Result<SceneAnnotationDepthMode, String> {
+    match value
+        .map(normalize_annotation_token)
+        .as_deref()
+        .unwrap_or("")
+    {
+        "" | "overlay" | "screen" => Ok(SceneAnnotationDepthMode::Overlay),
+        "depthtested" | "depth" | "scene" => Ok(SceneAnnotationDepthMode::DepthTested),
+        "xray" | "through" => Ok(SceneAnnotationDepthMode::XRay),
+        other => Err(format!("unknown annotation depth mode `{other}`")),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_marker_kind(value: Option<&str>) -> Result<SceneMarkerKind, String> {
+    match value
+        .map(normalize_annotation_token)
+        .as_deref()
+        .unwrap_or("")
+    {
+        "" | "dot" | "point" => Ok(SceneMarkerKind::Dot),
+        "cross" | "x" => Ok(SceneMarkerKind::Cross),
+        "tick" | "check" => Ok(SceneMarkerKind::Tick),
+        "arrow" => Ok(SceneMarkerKind::Arrow),
+        other => Err(format!("unknown annotation marker kind `{other}`")),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_text_horizontal_align(value: Option<&str>) -> Result<SceneTextHorizontalAlign, String> {
+    match value
+        .map(normalize_annotation_token)
+        .as_deref()
+        .unwrap_or("")
+    {
+        "" | "center" | "middle" => Ok(SceneTextHorizontalAlign::Center),
+        "left" | "start" => Ok(SceneTextHorizontalAlign::Left),
+        "right" | "end" => Ok(SceneTextHorizontalAlign::Right),
+        other => Err(format!(
+            "unknown annotation text horizontal align `{other}`"
+        )),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_text_vertical_align(value: Option<&str>) -> Result<SceneTextVerticalAlign, String> {
+    match value
+        .map(normalize_annotation_token)
+        .as_deref()
+        .unwrap_or("")
+    {
+        "" | "middle" | "center" => Ok(SceneTextVerticalAlign::Middle),
+        "top" => Ok(SceneTextVerticalAlign::Top),
+        "bottom" => Ok(SceneTextVerticalAlign::Bottom),
+        "baseline" => Ok(SceneTextVerticalAlign::Baseline),
+        other => Err(format!("unknown annotation text vertical align `{other}`")),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_section_display_mode(value: Option<&str>) -> Result<SectionDisplayMode, String> {
+    match value
+        .unwrap_or("3d-overlay")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "3d-overlay" | "3doverlay" | "three-d-overlay" | "threedoverlay" => {
+            Ok(SectionDisplayMode::ThreeDOverlay)
+        }
+        "2d-section" | "2dsection" | "two-d-section" | "twodsection" => {
+            Ok(SectionDisplayMode::TwoDSection)
+        }
+        "both" => Ok(SectionDisplayMode::Both),
+        other => Err(format!("unknown section display mode `{other}`")),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_section_clip_mode(value: Option<&str>) -> Result<SectionClipMode, String> {
+    match value.unwrap_or("none").trim().to_ascii_lowercase().as_str() {
+        "" | "none" | "plane" | "section-plane" | "sectionplane" | "overlay" | "3d-overlay"
+        | "3doverlay" => Ok(SectionClipMode::None),
+        "slice" | "section" | "cross-section" | "crosssection" | "cross_section" | "cut"
+        | "cut-plane" | "cutplane" => Ok(SectionClipMode::ClipPositiveNormal),
+        "positive" | "clip-positive" | "clip-positive-normal" | "clippositivenormal" => {
+            Ok(SectionClipMode::ClipPositiveNormal)
+        }
+        "negative" | "clip-negative" | "clip-negative-normal" | "clipnegativenormal" => {
+            Ok(SectionClipMode::ClipNegativeNormal)
+        }
+        other => Err(format!("unknown section clip mode `{other}`")),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn section_overlay_from_state(section: &SectionState) -> Result<SectionOverlay, String> {
+    if section.mode != SectionDisplayMode::ThreeDOverlay {
+        return Err(format!(
+            "section overlay cannot render mode `{}`",
+            section_display_mode_name(section.mode)
+        ));
+    }
+    let tangent = normalized_section_direction("tangent", section.pose.tangent)?;
+    let up = normalized_section_direction("up", section.pose.up)?;
+    let half_width = require_positive_section_scalar("width", section.width)? * 0.5;
+    let half_height = require_positive_section_scalar("height", section.height)? * 0.5;
+    let right = tangent * half_width;
+    let vertical = up * half_height;
+    let origin = section.pose.origin;
+    Ok(SectionOverlay::new([
+        origin - right - vertical,
+        origin + right - vertical,
+        origin + right + vertical,
+        origin - right + vertical,
+    ]))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_bounds_snapshot(bounds: Bounds3) -> WebBoundsSnapshot {
+    WebBoundsSnapshot {
+        min: bounds.min.to_array(),
+        max: bounds.max.to_array(),
+        center: bounds.center().to_array(),
+        size: bounds.size().to_array(),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn normalized_section_direction(label: &str, vector: DVec3) -> Result<DVec3, String> {
+    if !vector.is_finite() {
+        return Err(format!("section `{label}` vector is not finite"));
+    }
+    let length = vector.length();
+    if length <= f64::EPSILON {
+        return Err(format!("section `{label}` vector must be non-zero"));
+    }
+    Ok(vector / length)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_section_state_snapshot(section: Option<&SectionState>) -> WebSectionStateSnapshot {
+    let Some(section) = section else {
+        return WebSectionStateSnapshot {
+            active: false,
+            resource: None,
+            alignment_id: None,
+            station: None,
+            pose: None,
+            width: None,
+            height: None,
+            thickness: None,
+            mode: None,
+            clip: None,
+            provenance: Vec::new(),
+        };
+    };
+
+    WebSectionStateSnapshot {
+        active: true,
+        resource: Some(section.resource.clone()),
+        alignment_id: section.alignment_id.clone(),
+        station: section.station,
+        pose: Some(WebSectionPoseSnapshot {
+            origin: section.pose.origin.to_array(),
+            tangent: section.pose.tangent.to_array(),
+            normal: section.pose.normal.to_array(),
+            up: section.pose.up.to_array(),
+        }),
+        width: Some(section.width),
+        height: Some(section.height),
+        thickness: Some(section.thickness),
+        mode: Some(section_display_mode_name(section.mode)),
+        clip: Some(section_clip_mode_name(section.clip)),
+        provenance: section.provenance.clone(),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_annotation_state_snapshot(layers: Vec<&SceneAnnotationLayer>) -> WebAnnotationStateSnapshot {
+    WebAnnotationStateSnapshot {
+        count: layers.len(),
+        layers: layers
+            .into_iter()
+            .map(web_annotation_layer_snapshot)
+            .collect(),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_annotation_layer_snapshot(layer: &SceneAnnotationLayer) -> WebAnnotationLayerSnapshot {
+    WebAnnotationLayerSnapshot {
+        id: layer.id.as_str().to_string(),
+        source: layer.source.clone(),
+        visible: layer.visible,
+        lifecycle: annotation_lifecycle_name(layer.lifecycle),
+        primitives: layer
+            .primitives
+            .iter()
+            .map(web_annotation_primitive_snapshot)
+            .collect(),
+        provenance: layer.provenance.clone(),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_annotation_primitive_snapshot(
+    primitive: &SceneAnnotationPrimitive,
+) -> WebAnnotationPrimitiveSnapshot {
+    match primitive {
+        SceneAnnotationPrimitive::Polyline(polyline) => WebAnnotationPrimitiveSnapshot::Polyline {
+            id: polyline.id.as_str().to_string(),
+            points: polyline
+                .points
+                .iter()
+                .map(|point| point.to_array())
+                .collect(),
+            color: polyline.color.as_rgb(),
+            alpha: polyline.alpha,
+            width_px: polyline.width_px,
+            depth_mode: annotation_depth_mode_name(polyline.depth_mode),
+        },
+        SceneAnnotationPrimitive::Marker(marker) => WebAnnotationPrimitiveSnapshot::Marker {
+            id: marker.id.as_str().to_string(),
+            position: marker.position.to_array(),
+            direction: marker.direction.map(|direction| direction.to_array()),
+            normal: marker.normal.map(|normal| normal.to_array()),
+            color: marker.color.as_rgb(),
+            alpha: marker.alpha,
+            size_px: marker.size_px,
+            marker_kind: marker_kind_name(marker.kind),
+            depth_mode: annotation_depth_mode_name(marker.depth_mode),
+        },
+        SceneAnnotationPrimitive::Text(label) => WebAnnotationPrimitiveSnapshot::Text {
+            id: label.id.as_str().to_string(),
+            text: label.text.clone(),
+            anchor: label.anchor.to_array(),
+            screen_offset_px: label.screen_offset_px.to_array(),
+            horizontal_align: text_horizontal_align_name(label.horizontal_align),
+            vertical_align: text_vertical_align_name(label.vertical_align),
+            depth_mode: text_depth_mode_name(label.depth_mode),
+            style: WebAnnotationTextStyleSnapshot {
+                color: display_color_rgba(label.style.color, label.style.color_alpha),
+                background_color: label
+                    .style
+                    .background_color
+                    .map(|color| display_color_rgba(color, label.style.background_alpha)),
+                outline_color: label
+                    .style
+                    .outline_color
+                    .map(|color| display_color_rgba(color, label.style.outline_alpha)),
+                size_px: label.style.size_px,
+                embolden_px: label.style.embolden_px,
+                padding_px: label.style.padding_px,
+            },
+        },
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn display_color_rgba(color: DisplayColor, alpha: f32) -> [f32; 4] {
+    let [red, green, blue] = color.as_rgb();
+    [red, green, blue, alpha.clamp(0.0, 1.0)]
+}
+
+#[cfg(target_arch = "wasm32")]
+fn section_display_mode_name(mode: SectionDisplayMode) -> &'static str {
+    match mode {
+        SectionDisplayMode::ThreeDOverlay => "3d-overlay",
+        SectionDisplayMode::TwoDSection => "2d-section",
+        SectionDisplayMode::Both => "both",
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn section_clip_mode_name(mode: SectionClipMode) -> &'static str {
+    match mode {
+        SectionClipMode::None => "none",
+        SectionClipMode::ClipPositiveNormal => "clip-positive-normal",
+        SectionClipMode::ClipNegativeNormal => "clip-negative-normal",
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn annotation_lifecycle_name(lifecycle: SceneAnnotationLifecycle) -> &'static str {
+    match lifecycle {
+        SceneAnnotationLifecycle::Temporary => "temporary",
+        SceneAnnotationLifecycle::Pinned => "pinned",
+        SceneAnnotationLifecycle::Diagnostic => "diagnostic",
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn annotation_depth_mode_name(mode: SceneAnnotationDepthMode) -> &'static str {
+    match mode {
+        SceneAnnotationDepthMode::Overlay => "overlay",
+        SceneAnnotationDepthMode::DepthTested => "depth-tested",
+        SceneAnnotationDepthMode::XRay => "xray",
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn marker_kind_name(kind: SceneMarkerKind) -> &'static str {
+    match kind {
+        SceneMarkerKind::Dot => "dot",
+        SceneMarkerKind::Cross => "cross",
+        SceneMarkerKind::Tick => "tick",
+        SceneMarkerKind::Arrow => "arrow",
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn text_horizontal_align_name(align: SceneTextHorizontalAlign) -> &'static str {
+    match align {
+        SceneTextHorizontalAlign::Center => "center",
+        SceneTextHorizontalAlign::Left => "left",
+        SceneTextHorizontalAlign::Right => "right",
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn text_vertical_align_name(align: SceneTextVerticalAlign) -> &'static str {
+    match align {
+        SceneTextVerticalAlign::Middle => "middle",
+        SceneTextVerticalAlign::Top => "top",
+        SceneTextVerticalAlign::Bottom => "bottom",
+        SceneTextVerticalAlign::Baseline => "baseline",
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn text_depth_mode_name(mode: cc_w_types::SceneTextDepthMode) -> &'static str {
+    match mode {
+        cc_w_types::SceneTextDepthMode::Overlay => "overlay",
+        cc_w_types::SceneTextDepthMode::DepthTested => "depth-tested",
+        cc_w_types::SceneTextDepthMode::XRay => "xray",
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn clip_side_from_section_clip_mode(mode: SectionClipMode) -> ClipPlaneSide {
+    match mode {
+        SectionClipMode::None => ClipPlaneSide::None,
+        SectionClipMode::ClipPositiveNormal => ClipPlaneSide::PositiveNormal,
+        SectionClipMode::ClipNegativeNormal => ClipPlaneSide::NegativeNormal,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 fn web_render_profile_descriptors(
     profiles: &[RenderProfileDescriptor],
 ) -> Vec<WebRenderProfileDescriptor> {
@@ -5760,8 +6904,17 @@ fn web_viewer_status_line(runtime_scene: &RuntimeSceneState, profile: RenderProf
     } else {
         format!(" · {inspected_elements} inspected")
     };
+    let section_status = runtime_scene
+        .section_state()
+        .map(|section| {
+            section
+                .station
+                .map(|station| format!(" · section station {station}"))
+                .unwrap_or_else(|| " · section".to_string())
+        })
+        .unwrap_or_default();
     format!(
-        "{} · {view_mode} · {} meshes · {} tris · {} draws · {visible_elements}/{total_elements} visible · {selected_elements} selected{inspection_status} · {stream_status}",
+        "{} · {view_mode} · {} meshes · {} tris · {} draws · {visible_elements}/{total_elements} visible · {selected_elements} selected{inspection_status}{section_status} · {stream_status}",
         profile.label(),
         render_scene.definitions.len(),
         render_scene.triangle_count(),

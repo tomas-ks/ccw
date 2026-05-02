@@ -297,6 +297,29 @@ pub enum PlannedUiAction {
     ViewerFrameVisible,
     #[serde(rename = "viewer.clear_inspection")]
     ViewerClearInspection,
+    #[serde(rename = "viewer.section.set")]
+    ViewerSectionSet { section: Value },
+    #[serde(rename = "viewer.section.clear")]
+    ViewerSectionClear,
+    #[serde(rename = "viewer.annotations.show_path")]
+    ViewerAnnotationsShowPath {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+        path: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        markers: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_samples: Option<Value>,
+    },
+    #[serde(rename = "viewer.annotations.clear")]
+    ViewerAnnotationsClear {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
 }
 
 fn is_default_inspection_mode(mode: &InspectionUpdateMode) -> bool {
@@ -2472,7 +2495,9 @@ fn native_tool_name(part: &Value) -> Option<String> {
     part.get("tool")
         .and_then(Value::as_str)
         .or_else(|| part.get("name").and_then(Value::as_str))
-        .map(|value| canonical_native_tool_name(value).to_owned())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn native_tool_call_id(part: &Value) -> Option<String> {
@@ -2483,9 +2508,11 @@ fn native_tool_call_id(part: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn canonical_native_tool_name(tool_name: &str) -> &str {
+fn native_ifc_tool_suffix(tool_name: &str) -> Option<&str> {
     let trimmed = tool_name.trim();
-    trimmed.strip_prefix("ifc_").unwrap_or(trimmed)
+    trimmed
+        .strip_prefix("ifc_")
+        .filter(|suffix| !suffix.is_empty())
 }
 
 fn split_provider_model_id(model_id: &str) -> Option<(&str, &str)> {
@@ -2496,34 +2523,13 @@ fn split_provider_model_id(model_id: &str) -> Option<(&str, &str)> {
 }
 
 fn display_native_tool_name(tool_name: &str) -> String {
-    match canonical_native_tool_name(tool_name) {
-        "schema_context" => "ifc_schema_context".to_owned(),
-        "model_details" => "ifc_model_details".to_owned(),
-        "entity_reference" => "ifc_entity_reference".to_owned(),
-        "relation_reference" => "ifc_relation_reference".to_owned(),
-        "query_playbook" => "ifc_query_playbook".to_owned(),
-        "readonly_cypher" => "ifc_readonly_cypher".to_owned(),
-        "project_readonly_cypher" => "ifc_project_readonly_cypher".to_owned(),
-        "run_project_readonly_cypher" => "ifc_project_readonly_cypher".to_owned(),
-        "node_relations" => "ifc_node_relations".to_owned(),
-        "renderable_descendants" => "ifc_renderable_descendants".to_owned(),
-        "element_search" => "ifc_element_search".to_owned(),
-        "scope_summary" => "ifc_scope_summary".to_owned(),
-        "scope_inspect" => "ifc_scope_inspect".to_owned(),
-        "bridge_structure_summary" => "ifc_bridge_structure_summary".to_owned(),
-        "quantity_takeoff" => "ifc_quantity_takeoff".to_owned(),
-        "section_at_point_or_station" => "ifc_section_at_point_or_station".to_owned(),
-        other => other.to_owned(),
-    }
+    tool_name.trim().to_owned()
 }
 
 fn is_native_readonly_cypher_tool_name(tool_name: &str) -> bool {
     matches!(
-        canonical_native_tool_name(tool_name),
-        "readonly_cypher"
-            | "run_readonly_cypher"
-            | "project_readonly_cypher"
-            | "run_project_readonly_cypher"
+        native_ifc_tool_suffix(tool_name),
+        Some("readonly_cypher" | "project_readonly_cypher")
     )
 }
 
@@ -2533,7 +2539,7 @@ fn native_action_candidate_from_tool_call(
 ) -> Option<AgentActionCandidate> {
     let state = state?;
     let input = state.get("input")?.as_object()?;
-    match canonical_native_tool_name(tool_name) {
+    match native_ifc_tool_suffix(tool_name)? {
         "graph_set_seeds" => native_db_node_ids_from_input(input).map(|db_node_ids| {
             let mut candidate = AgentActionCandidate::graph_set_seeds(db_node_ids);
             if let Some(resource) = native_resource_from_input(input) {
@@ -2589,11 +2595,212 @@ fn native_action_candidate_from_tool_call(
             }
             candidate
         }),
-        "viewer_clear_inspection" | "clear_inspection" => {
-            Some(AgentActionCandidate::viewer_clear_inspection())
+        "viewer_clear_inspection" => Some(AgentActionCandidate::viewer_clear_inspection()),
+        "viewer_frame_visible" => Some(AgentActionCandidate::viewer_frame_visible()),
+        "viewer_section_set" => {
+            native_section_from_input(input).map(AgentActionCandidate::viewer_section_set)
         }
-        "viewer_frame_visible" | "frame" => Some(AgentActionCandidate::viewer_frame_visible()),
+        "viewer_section_clear" => Some(AgentActionCandidate::viewer_section_clear()),
+        "viewer_annotations_show_path" => native_path_annotation_from_input(input)
+            .map(AgentActionCandidate::viewer_annotations_show_path),
+        "viewer_annotations_clear" => {
+            let mut candidate = AgentActionCandidate::viewer_annotations_clear();
+            if let Some(resource) = native_resource_from_input(input) {
+                candidate = candidate.with_resource(resource);
+            }
+            Some(candidate)
+        }
         _ => None,
+    }
+}
+
+fn native_path_annotation_from_input(input: &serde_json::Map<String, Value>) -> Option<Value> {
+    if let Some(Value::Object(annotation)) = input.get("annotation").or_else(|| input.get("spec")) {
+        let mut annotation = annotation.clone();
+        normalize_native_path_annotation_fields(&mut annotation);
+        return Some(Value::Object(annotation));
+    }
+
+    let path = get_first_value(input, &["path"])?;
+    let mut annotation = serde_json::Map::new();
+    if let Some(resource) = native_resource_from_input(input) {
+        annotation.insert("resource".to_owned(), Value::String(resource));
+    }
+    annotation.insert("path".to_owned(), path);
+    if let Some(line) = native_path_annotation_line(input) {
+        annotation.insert("line".to_owned(), line);
+    }
+    if let Some(markers) = get_first_value(input, &["markers", "marker_groups", "markerGroups"]) {
+        annotation.insert("markers".to_owned(), markers);
+    }
+    for key in [
+        "mode",
+        "operation",
+        "update",
+        "behavior",
+        "max_samples",
+        "maxSamples",
+    ] {
+        if let Some(value) = get_first_value(input, &[key]) {
+            let target = match key {
+                "maxSamples" => "max_samples",
+                "operation" | "update" | "behavior" => "mode",
+                _ => key,
+            };
+            annotation.insert(target.to_owned(), value);
+        }
+    }
+    Some(Value::Object(annotation))
+}
+
+fn normalize_native_path_annotation_fields(annotation: &mut serde_json::Map<String, Value>) {
+    if let Some(value) = get_first_value(annotation, &["operation", "update", "behavior"]) {
+        annotation.insert("mode".to_owned(), value);
+        annotation.remove("operation");
+        annotation.remove("update");
+        annotation.remove("behavior");
+    }
+    if let Some(value) = get_first_value(annotation, &["maxSamples"]) {
+        annotation.insert("max_samples".to_owned(), value);
+        annotation.remove("maxSamples");
+    }
+    if let Some(line) = native_path_annotation_line(annotation) {
+        annotation.insert("line".to_owned(), line);
+        annotation.remove("line_range");
+        annotation.remove("lineRange");
+        annotation.remove("line_ranges");
+        annotation.remove("lineRanges");
+        annotation.remove("ranges");
+    }
+    if let Some(markers) =
+        get_first_value(annotation, &["markers", "marker_groups", "markerGroups"])
+    {
+        annotation.insert("markers".to_owned(), markers);
+        annotation.remove("marker_groups");
+        annotation.remove("markerGroups");
+    }
+}
+
+fn native_path_annotation_line(object: &serde_json::Map<String, Value>) -> Option<Value> {
+    get_first_value(object, &["line"])
+        .map(canonical_native_path_annotation_line)
+        .or_else(|| {
+            get_first_value(
+                object,
+                &[
+                    "line_range",
+                    "lineRange",
+                    "line_ranges",
+                    "lineRanges",
+                    "ranges",
+                ],
+            )
+            .map(canonical_native_path_annotation_line)
+        })
+}
+
+fn canonical_native_path_annotation_line(value: Value) -> Value {
+    match value {
+        Value::Array(ranges) => serde_json::json!({ "ranges": ranges }),
+        Value::Object(object) if object.get("ranges").is_none() => {
+            if let Some(range) = object.get("range").cloned() {
+                return serde_json::json!({ "ranges": [range] });
+            }
+            let mut line = serde_json::Map::new();
+            line.insert(
+                "ranges".to_owned(),
+                Value::Array(vec![Value::Object(object)]),
+            );
+            Value::Object(line)
+        }
+        other => other,
+    }
+}
+
+fn native_section_from_input(input: &serde_json::Map<String, Value>) -> Option<Value> {
+    if let Some(Value::Object(section)) = input.get("section").or_else(|| input.get("spec")) {
+        return Some(normalize_native_section_value(Value::Object(
+            section.clone(),
+        )));
+    }
+
+    let mut pose = serde_json::Map::new();
+    pose.insert("origin".to_owned(), input.get("origin")?.clone());
+    pose.insert("tangent".to_owned(), input.get("tangent")?.clone());
+    pose.insert("normal".to_owned(), input.get("normal")?.clone());
+    pose.insert("up".to_owned(), input.get("up")?.clone());
+
+    let mut section = serde_json::Map::new();
+    if let Some(resource) = native_resource_from_input(input) {
+        section.insert("resource".to_owned(), Value::String(resource));
+    }
+    if let Some(alignment_id) = get_first_value(input, &["alignment_id", "alignmentId"]) {
+        section.insert("alignmentId".to_owned(), alignment_id);
+    }
+    if let Some(station) = input.get("station").cloned() {
+        section.insert("station".to_owned(), station);
+    }
+    section.insert("pose".to_owned(), Value::Object(pose));
+    section.insert("width".to_owned(), input.get("width")?.clone());
+    section.insert("height".to_owned(), input.get("height")?.clone());
+    section.insert("thickness".to_owned(), input.get("thickness")?.clone());
+    if let Some(mode) = input.get("mode").cloned() {
+        section.insert("mode".to_owned(), mode);
+    }
+    if let Some(clip) = input.get("clip").cloned() {
+        section.insert("clip".to_owned(), normalize_section_clip_value(clip));
+    }
+    if let Some(provenance) = input.get("provenance").cloned() {
+        section.insert(
+            "provenance".to_owned(),
+            normalize_section_provenance(provenance),
+        );
+    }
+
+    Some(Value::Object(section))
+}
+
+fn normalize_native_section_value(value: Value) -> Value {
+    let Value::Object(mut section) = value else {
+        return value;
+    };
+    if let Some(provenance) = section.remove("provenance") {
+        section.insert(
+            "provenance".to_owned(),
+            normalize_section_provenance(provenance),
+        );
+    }
+    if let Some(clip) = section.remove("clip") {
+        section.insert("clip".to_owned(), normalize_section_clip_value(clip));
+    }
+    Value::Object(section)
+}
+
+fn normalize_section_clip_value(value: Value) -> Value {
+    let Value::String(text) = value else {
+        return value;
+    };
+    let normalized = text.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "plane" | "section-plane" | "sectionplane" | "overlay" | "3d-overlay" | "3doverlay" => {
+            Value::String("none".to_owned())
+        }
+        "slice" | "section" | "cross-section" | "crosssection" | "cross_section" | "cut"
+        | "cut-plane" | "cutplane" | "positive" | "clip-positive" | "clippositivenormal" => {
+            Value::String("clip-positive-normal".to_owned())
+        }
+        "negative" | "clip-negative" | "clipnegativenormal" => {
+            Value::String("clip-negative-normal".to_owned())
+        }
+        _ => Value::String(text),
+    }
+}
+
+fn normalize_section_provenance(value: Value) -> Value {
+    match value {
+        Value::Array(_) => value,
+        Value::String(text) => Value::Array(vec![Value::String(text)]),
+        other => Value::Array(vec![other]),
     }
 }
 
@@ -2821,6 +3028,44 @@ fn map_planned_ui_action(action: PlannedUiAction) -> AgentActionCandidate {
         }
         PlannedUiAction::ViewerFrameVisible => AgentActionCandidate::viewer_frame_visible(),
         PlannedUiAction::ViewerClearInspection => AgentActionCandidate::viewer_clear_inspection(),
+        PlannedUiAction::ViewerSectionSet { section } => {
+            AgentActionCandidate::viewer_section_set(normalize_native_section_value(section))
+        }
+        PlannedUiAction::ViewerSectionClear => AgentActionCandidate::viewer_section_clear(),
+        PlannedUiAction::ViewerAnnotationsShowPath {
+            resource,
+            path,
+            line,
+            markers,
+            mode,
+            max_samples,
+        } => {
+            let mut annotation = serde_json::Map::new();
+            if let Some(resource) = resource {
+                annotation.insert("resource".to_owned(), Value::String(resource));
+            }
+            annotation.insert("path".to_owned(), path);
+            if let Some(line) = line {
+                annotation.insert("line".to_owned(), line);
+            }
+            if let Some(markers) = markers {
+                annotation.insert("markers".to_owned(), markers);
+            }
+            if let Some(mode) = mode {
+                annotation.insert("mode".to_owned(), mode);
+            }
+            if let Some(max_samples) = max_samples {
+                annotation.insert("max_samples".to_owned(), max_samples);
+            }
+            AgentActionCandidate::viewer_annotations_show_path(Value::Object(annotation))
+        }
+        PlannedUiAction::ViewerAnnotationsClear { resource } => {
+            let mut candidate = AgentActionCandidate::viewer_annotations_clear();
+            if let Some(resource) = resource {
+                candidate = candidate.with_resource(resource);
+            }
+            candidate
+        }
     }
 }
 
@@ -3067,7 +3312,7 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
             "Return only JSON, with no markdown fences or commentary.".to_owned()
         },
         if native_agent {
-            "High-value native model tools: use `ifc_element_search` to find candidates; use `ifc_scope_summary` to understand grouped ids; use `ifc_scope_inspect` for show/inspect flows; use `ifc_bridge_structure_summary` for bridge decomposition; use `ifc_quantity_takeoff` for count/material/BOM style summaries with provenance; use `ifc_section_at_point_or_station` only when explicit station/point/ids are available, and never invent section geometry.".to_owned()
+            "High-value native model tools: use `ifc_element_search` to find candidates; use `ifc_scope_summary` to understand grouped ids; use `ifc_scope_inspect` for show/inspect flows; use `ifc_bridge_structure_summary` for bridge decomposition; use `ifc_quantity_takeoff` for count/material/BOM style summaries with provenance; for station/cross-section work use `ifc_alignment_catalog`, then `ifc_station_resolve`, then `ifc_section_intersections`, then `ifc_viewer_section_set` only from explicit IFC alignment/station/linear-placement facts; for path/marker infographics use `ifc_alignment_catalog`, then `ifc_viewer_annotations_show_path` with `path`, `markers`, optional `line` only when a line span is requested, and `mode` when the user asks to add to existing annotations. If those facts are unavailable or the tools report unsupported/not implemented, fail loudly with a diagnostic and never invent section or alignment geometry.".to_owned()
         } else {
             "Use only the JSON toolCalls kinds listed below; do not invent direct native tool wrappers.".to_owned()
         },
@@ -3113,7 +3358,9 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
                         { "kind": "properties.show_node", "db_node_id": 123, "resource": "ifc/building-architecture" },
                         { "kind": "elements.select", "semantic_ids": ["2iPwJwpPDCSgMheXwk9cBT"], "resource": "ifc/building-architecture" },
                         { "kind": "elements.inspect", "semantic_ids": ["2iPwJwpPDCSgMheXwk9cBT"], "resource": "ifc/building-architecture", "mode": "replace" },
-                        { "kind": "viewer.frame_visible" }
+                        { "kind": "viewer.frame_visible" },
+                        { "kind": "viewer.annotations.show_path", "resource": "ifc/infra-road", "path": { "kind": "ifc_alignment", "id": "curve:123", "measure": "station" }, "line": { "ranges": [{ "from": 0, "to": 140 }] }, "markers": [{ "range": { "from": 0, "to": 120 }, "every": 20, "label": "measure" }, { "range": { "from": 120, "to_end": true }, "every": 50, "label": "measure" }] },
+                        { "kind": "viewer.section.clear" }
                     ]
                 }
             ],
@@ -3122,8 +3369,11 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
         .expect("schema example should serialize"),
         "Allowed toolCalls kinds are only `get_schema_context`, `get_model_details`, `get_entity_reference`, `get_query_playbook`, `get_relation_reference`, `run_readonly_cypher`, `run_project_readonly_cypher`, `describe_nodes`, `get_node_properties`, `get_neighbors`, and `emit_ui_actions`.".to_owned(),
         "Do not invent `request_tools`; use the concrete tools above directly.".to_owned(),
-        "Allowed UI actions are only `graph.set_seeds`, `properties.show_node`, `elements.hide`, `elements.show`, `elements.select`, `elements.inspect`, `viewer.frame_visible`, and `viewer.clear_inspection`.".to_owned(),
-        "Use exact action payload field names: `db_node_ids` for graph seeds, `db_node_id` for properties.show_node, and `semantic_ids` for element actions.".to_owned(),
+        "Allowed UI actions are only `graph.set_seeds`, `properties.show_node`, `elements.hide`, `elements.show`, `elements.select`, `elements.inspect`, `viewer.frame_visible`, `viewer.clear_inspection`, `viewer.section.set`, `viewer.section.clear`, `viewer.annotations.show_path`, and `viewer.annotations.clear`.".to_owned(),
+        "Use exact action payload field names: `db_node_ids` for graph seeds, `db_node_id` for properties.show_node, `semantic_ids` for element actions, `section` for `viewer.section.set`, and `resource`, `path`, optional `line`, `markers`, and optional `mode` for `viewer.annotations.show_path`.".to_owned(),
+        "`viewer.section.set` requires a `section` object with `pose.origin`, `pose.tangent`, `pose.normal`, `pose.up`, `width`, `height`, and `thickness`; `normal` is the section plane normal and `tangent` is the in-plane width direction. For a requested cross section, use `clip: \"clip-positive-normal\"` by default; use `clip: \"none\"` only for a visible overlay plane without clipping.".to_owned(),
+        "`viewer.annotations.show_path` must reference an explicit path source. For IFC alignments, use `path: { kind: \"ifc_alignment\", id: <resolver_alignment_id>, measure: \"station\" }` where the id came from `ifc_alignment_catalog`; use `mode: \"add\"` for additive follow-ups and omit mode or use `replace` for a fresh annotation. For marker-only additive follow-ups, omit `line`; `line: {}` and `line: { ranges: [{}] }` mean the whole explicit path. Use `to_end: true` for a range that ends at the explicit IFC path end; never guess a numeric end station. Never include raw polyline, point, coordinate, or vertex arrays in annotation payloads.".to_owned(),
+        "Path annotation ranges have two coordinate modes: `from`/`to` are absolute station or chainage values, while `from_offset`/`to_offset` are relative distances from the explicit path start. For `station 100 to 200`, emit `{ \"from\": 100, \"to\": 200 }` only. Never combine `from` with `from_offset`, never combine `to` with `to_offset`, and never combine `to_end` with `to` or `to_offset`.".to_owned(),
         "`elements.inspect` also accepts `mode`: `replace`, `add`, or `remove`. Use `replace` for a new/only inspection focus, `add` for wording like `add`, `also`, `include`, or `plus`, and `remove` for wording like `remove`, `exclude`, or `subtract`.".to_owned(),
         "When a DB node id comes from a project-wide query result, include its `source_resource` as the UI action `resource`; DB node ids are only meaningful inside one IFC database.".to_owned(),
         "When semantic ids come from project-wide query results, preserve source by either passing `resource` on the element action or using the source-scoped `source_resource::GlobalId` id returned by the tool.".to_owned(),
@@ -3179,6 +3429,8 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
         "- If you already know the target DB node id and the user asks for properties or explanation, prefer `get_node_properties`, `describe_nodes`, and `properties.show_node` over another raw Cypher lookup.".to_owned(),
         "- Emit one coherent `emit_ui_actions` bundle near the end of the turn. Avoid repeating `elements.select`, `elements.inspect`, `properties.show_node`, `viewer.frame_visible`, or `viewer.clear_inspection` multiple times in the same turn unless the target changed.".to_owned(),
         "- If a requested 'type' answer only yields opaque numeric codes or low-level enum values, say that plainly and then inspect names and nearby relationships to explain the element's role in the model.".to_owned(),
+        "- For station or cross-section requests, require explicit IFC alignment/station/linear-placement facts. In native mode, prefer `ifc_alignment_catalog`, then `ifc_station_resolve`, then `ifc_section_intersections`; only emit `viewer.section.set` after station resolution returns an explicit pose. For normal cross sections use `clip: \"clip-positive-normal\"`; use `clip: \"none\"` only when the user asks for a visible plane/overlay without clipping. If those tools are unavailable or return unsupported/not implemented, say exactly what explicit fact/tool support is missing instead of drawing or describing a plausible section.".to_owned(),
+        "- For path infographic requests like `show alignment curves`, `show stations`, `show chainage every 20m`, or `show alignment line from start to 140`, use `ifc_alignment_catalog` first. If exactly one explicit alignment candidate fits, emit `viewer.annotations.show_path` with `path: { kind: \"ifc_alignment\", id: <resolver_alignment_id>, measure: \"station\" }`, optional `line.ranges`, and `markers`. Treat each requested line span as a `line.ranges` entry and each requested sampling rule as a `markers` entry. Use `mode: \"replace\"` or omit mode for fresh annotation requests; use `mode: \"add\"` for additive follow-ups such as `add`, `also`, `include`, or `for the rest`. For marker-only additive follow-ups, omit `line` entirely; include `line` only when the user explicitly asks to draw, add, extend, or change the path line. `line: {}` and `line: { ranges: [{}] }` mean the whole explicit path, so never send either for marker-only requests. Use `from`/`to` only for absolute station or chainage values, for example `station 100 to 200` -> `{\"from\":100,\"to\":200}`; use `from_offset`/`to_offset` only for relative distance from the explicit path start. Never combine `from` with `from_offset`, never combine `to` with `to_offset`, and never combine `to_end` with `to` or `to_offset`. For `add the rest of the bridge every 50m`, emit only `markers: [{\"range\":{\"from\":120,\"to_end\":true},\"every\":50,\"label\":\"measure\"}]` plus `mode: \"add\"`; `to_end: true` means the explicit IFC path end, not an inferred model bound. Never guess a numeric end station or use `to_offset:0` to mean end. For `every 10m for the first 100m, then every 50m`, use two marker groups: `[{\"range\":{\"from\":0,\"to\":100},\"every\":10,\"label\":\"measure\"},{\"range\":{\"from\":100,\"to_end\":true},\"every\":50,\"label\":\"measure\"}]`. If several alignment candidates fit, ask which alignment to annotate. Do not emit raw polyline arrays.".to_owned(),
         "- For product questions like slabs, walls, roofs, and doors, relationship context is often more useful than raw property values. Look for aggregation, containment, type, property-set, and material relationships.".to_owned(),
         "- Distinguish observation from inference. If you infer, say so briefly and ground it in the returned graph facts.".to_owned(),
         "- If the first result is thin, opaque, or only partially answers the question, keep exploring instead of stopping early.".to_owned(),
@@ -3809,6 +4061,35 @@ fn normalize_ui_action(action: Value) -> Value {
                 }
             }
         }
+        Some("viewer.section.set") => {
+            if let Some(value) = get_first_value(&normalized, &["section", "spec"]) {
+                normalized.insert(
+                    "section".to_owned(),
+                    normalize_native_section_value(value.clone()),
+                );
+                normalized.remove("spec");
+            }
+        }
+        Some("viewer.annotations.show_path") => {
+            normalize_native_path_annotation_fields(&mut normalized);
+            if let Some(Value::Object(mut annotation)) = normalized
+                .remove("annotation")
+                .or_else(|| normalized.remove("spec"))
+            {
+                normalize_native_path_annotation_fields(&mut annotation);
+                if let Some(value) = get_first_value(
+                    &annotation,
+                    &["resource", "sourceResource", "source_resource"],
+                ) {
+                    normalized.insert("resource".to_owned(), value);
+                }
+                for key in ["path", "line", "markers", "mode", "max_samples"] {
+                    if let Some(value) = get_first_value(&annotation, &[key]) {
+                        normalized.insert(key.to_owned(), value);
+                    }
+                }
+            }
+        }
         _ => {}
     }
 
@@ -3843,6 +4124,25 @@ fn normalize_ui_action_kind(kind: &str) -> Option<String> {
         | "viewerClearInspection"
         | "clear_inspection"
         | "clearInspection" => Some("viewer.clear_inspection".to_owned()),
+        "viewer.section.set" | "viewer.sectionSet" | "viewerSectionSet" | "section.set"
+        | "sectionSet" | "setSection" => Some("viewer.section.set".to_owned()),
+        "viewer.section.clear"
+        | "viewer.sectionClear"
+        | "viewerSectionClear"
+        | "section.clear"
+        | "sectionClear"
+        | "clearSection" => Some("viewer.section.clear".to_owned()),
+        "viewer.annotations.show_path"
+        | "viewer.annotations.showPath"
+        | "viewerAnnotationsShowPath"
+        | "annotations.show_path"
+        | "annotations.showPath"
+        | "showPathAnnotations" => Some("viewer.annotations.show_path".to_owned()),
+        "viewer.annotations.clear"
+        | "viewer.annotationsClear"
+        | "viewerAnnotationsClear"
+        | "annotations.clear"
+        | "clearAnnotations" => Some("viewer.annotations.clear".to_owned()),
         _ => None,
     }
 }
@@ -4345,6 +4645,7 @@ fn opencode_tool_progress_events(event: &Value) -> Vec<AgentTranscriptEvent> {
         status.as_str(),
         "running" | "started" | "streaming" | "in_progress" | "pending"
     ) {
+        let tool_name = display_native_tool_name(&tool_name);
         events.push(AgentTranscriptEvent::tool(format!(
             "Result from `{tool_name}`: {status}"
         )));
@@ -4525,18 +4826,20 @@ fn opencode_tool_progress_output_summary(tool_name: &str, output: Option<&Value>
     if is_cypher_tool_name(tool_name) {
         return summarize_cypher_tool_output(output);
     }
-    let tool_name = canonical_native_tool_name(tool_name);
+    let display_tool_name = display_native_tool_name(tool_name);
     match output {
         Some(value) => {
             let normalized = normalize_progress_payload(value);
-            let summary = summarize_tool_output(tool_name, &normalized);
+            let summary = native_ifc_tool_suffix(tool_name)
+                .map(|suffix| summarize_ifc_tool_output(suffix, &normalized))
+                .unwrap_or_else(|| summarize_generic_tool_output(&normalized));
             if summary.is_empty() {
-                format!("Result from `{tool_name}`: completed")
+                format!("Result from `{display_tool_name}`: completed")
             } else {
-                format!("Result from `{tool_name}`: {summary}")
+                format!("Result from `{display_tool_name}`: {summary}")
             }
         }
-        None => format!("Result from `{tool_name}`: completed"),
+        None => format!("Result from `{display_tool_name}`: completed"),
     }
 }
 
@@ -4544,13 +4847,14 @@ fn opencode_tool_progress_error_summary(tool_name: &str, error: &Value) -> Strin
     if is_cypher_tool_name(tool_name) {
         return format!(
             "Read-only Cypher failed: {}",
-            summarize_tool_output(tool_name, error)
+            summarize_cypher_tool_output(Some(error))
         );
     }
-    format!(
-        "Tool `{tool_name}` failed: {}",
-        summarize_tool_output(tool_name, error)
-    )
+    let display_tool_name = display_native_tool_name(tool_name);
+    let summary = native_ifc_tool_suffix(tool_name)
+        .map(|suffix| summarize_ifc_tool_output(suffix, error))
+        .unwrap_or_else(|| summarize_generic_tool_output(error));
+    format!("Tool `{display_tool_name}` failed: {}", summary)
 }
 
 fn summarize_cypher_tool_output(output: Option<&Value>) -> String {
@@ -4611,16 +4915,16 @@ fn summarize_cypher_tool_output(output: Option<&Value>) -> String {
     }
 }
 
-fn summarize_tool_output(tool_name: &str, value: &Value) -> String {
-    if is_cypher_tool_name(tool_name) {
-        return summarize_cypher_tool_output(Some(value));
-    }
-    match canonical_native_tool_name(tool_name) {
+fn summarize_ifc_tool_output(tool_suffix: &str, value: &Value) -> String {
+    match tool_suffix {
         "schema_context" => summarize_schema_context_output(value),
         "model_details" => summarize_model_details_output(value),
         "entity_reference" => summarize_collection_output("Entity reference lookup", value),
         "relation_reference" => summarize_collection_output("Relation reference lookup", value),
         "query_playbook" => summarize_collection_output("Query playbook lookup", value),
+        "alignment_catalog" => summarize_collection_output("Alignment catalog lookup", value),
+        "station_resolve" => summarize_generic_tool_output(value),
+        "section_intersections" => summarize_generic_tool_output(value),
         _ => summarize_generic_tool_output(value),
     }
 }
@@ -4768,18 +5072,15 @@ fn plural_suffix(count: usize) -> &'static str {
 
 fn is_cypher_tool_name(tool_name: &str) -> bool {
     matches!(
-        canonical_native_tool_name(tool_name),
-        "readonly_cypher"
-            | "run_readonly_cypher"
-            | "project_readonly_cypher"
-            | "run_project_readonly_cypher"
+        native_ifc_tool_suffix(tool_name),
+        Some("readonly_cypher" | "project_readonly_cypher")
     )
 }
 
 fn is_project_cypher_tool_name(tool_name: &str) -> bool {
     matches!(
-        canonical_native_tool_name(tool_name),
-        "project_readonly_cypher" | "run_project_readonly_cypher"
+        native_ifc_tool_suffix(tool_name),
+        Some("project_readonly_cypher")
     )
 }
 
@@ -5852,6 +6153,37 @@ mod tests {
                         { "kind": "graphSetSeeds", "dbNodeIds": [215, 216], "sourceResource": "ifc/infra-road" },
                         { "kind": "propertiesShowNode", "dbNodeId": 215, "source_resource": "ifc/infra-road" },
                         { "kind": "elementsSelect", "semanticIds": ["wall-a"] },
+                        {
+                            "kind": "setSection",
+                            "spec": {
+                                "pose": {
+                                    "origin": [0.0, 0.0, 0.0],
+                                    "tangent": [1.0, 0.0, 0.0],
+                                    "normal": [0.0, 1.0, 0.0],
+                                    "up": [0.0, 0.0, 1.0]
+                                },
+                                "width": 10.0,
+                                "height": 4.0,
+                                "thickness": 0.5,
+                                "clip": "slice",
+                                "provenance": "ifc_station_resolve; station=120"
+                            }
+                        },
+                        {
+                            "kind": "viewer.annotations.showPath",
+                            "annotation": {
+                                "resource": "ifc/infra-road",
+                                "operation": "append",
+                                "path": { "kind": "ifc_alignment", "id": "curve:42", "measure": "station" },
+                                "line": {
+                                    "ranges": [{ "from": 0, "to": 140 }]
+                                },
+                                "markers": [
+                                    { "range": { "from": 0, "to": 120 }, "every": 20, "label": "measure" },
+                                    { "range": { "from": 120 }, "every": 50, "label": "measure" }
+                                ]
+                            }
+                        },
                         { "kind": "frame" }
                     ]
                 }
@@ -5876,6 +6208,38 @@ mod tests {
                     PlannedUiAction::ElementsSelect {
                         semantic_ids: vec!["wall-a".to_owned()],
                         resource: None,
+                    },
+                    PlannedUiAction::ViewerSectionSet {
+                        section: serde_json::json!({
+                            "pose": {
+                                "origin": [0.0, 0.0, 0.0],
+                                "tangent": [1.0, 0.0, 0.0],
+                                "normal": [0.0, 1.0, 0.0],
+                                "up": [0.0, 0.0, 1.0]
+                            },
+                            "width": 10.0,
+                            "height": 4.0,
+                            "thickness": 0.5,
+                            "clip": "clip-positive-normal",
+                            "provenance": ["ifc_station_resolve; station=120"]
+                        }),
+                    },
+                    PlannedUiAction::ViewerAnnotationsShowPath {
+                        resource: Some("ifc/infra-road".to_owned()),
+                        path: serde_json::json!({
+                            "kind": "ifc_alignment",
+                            "id": "curve:42",
+                            "measure": "station"
+                        }),
+                        line: Some(serde_json::json!({
+                            "ranges": [{ "from": 0, "to": 140 }]
+                        })),
+                        markers: Some(serde_json::json!([
+                            { "range": { "from": 0, "to": 120 }, "every": 20, "label": "measure" },
+                            { "range": { "from": 120 }, "every": 50, "label": "measure" }
+                        ])),
+                        mode: Some(serde_json::json!("append")),
+                        max_samples: None,
                     },
                     PlannedUiAction::ViewerFrameVisible,
                 ]
@@ -6057,6 +6421,14 @@ mod tests {
         assert!(prompt.contains("get_model_details"));
         assert!(prompt.contains("request_tools"));
         assert!(prompt.contains("get_relation_reference"));
+        assert!(prompt.contains("ifc_alignment_catalog"));
+        assert!(prompt.contains("ifc_station_resolve"));
+        assert!(prompt.contains("ifc_section_intersections"));
+        assert!(prompt.contains("viewer.section.set"));
+        assert!(prompt.contains("`normal` is the section plane normal"));
+        assert!(prompt.contains("`tangent` is the in-plane width direction"));
+        assert!(prompt.contains("`from`/`to` are absolute station or chainage values"));
+        assert!(prompt.contains("Never combine `from` with `from_offset`"));
     }
 
     #[test]
@@ -6066,8 +6438,201 @@ mod tests {
         assert!(prompt.contains("ifc-explorer"));
         assert!(prompt.contains("native OpenCode access"));
         assert!(prompt.contains("Use the native `ifc_*` tools directly"));
+        assert!(prompt.contains("ifc_alignment_catalog"));
+        assert!(prompt.contains("ifc_station_resolve"));
+        assert!(prompt.contains("ifc_section_intersections"));
+        assert!(prompt.contains("ifc_viewer_section_set"));
+        assert!(prompt.contains("station 100 to 200"));
+        assert!(prompt.contains("never combine `to` with `to_offset`"));
         assert!(prompt.contains("Bound IFC resource for this turn: ifc/building-architecture."));
         assert!(!prompt.contains("You do not have direct tools."));
+    }
+
+    #[test]
+    fn native_tool_display_keeps_actual_ifc_tool_names() {
+        assert_eq!(
+            display_native_tool_name("ifc_alignment_catalog"),
+            "ifc_alignment_catalog"
+        );
+        assert_eq!(
+            display_native_tool_name("alignment_catalog"),
+            "alignment_catalog"
+        );
+        assert_eq!(
+            display_native_tool_name("ifc_station_resolve"),
+            "ifc_station_resolve"
+        );
+        assert_eq!(
+            display_native_tool_name("section_intersections"),
+            "section_intersections"
+        );
+        assert_eq!(
+            display_native_tool_name("ifc_section_intersections"),
+            "ifc_section_intersections"
+        );
+        assert_eq!(
+            display_native_tool_name("viewer_section_set"),
+            "viewer_section_set"
+        );
+        assert_eq!(
+            display_native_tool_name("ifc_viewer_section_set"),
+            "ifc_viewer_section_set"
+        );
+        assert_eq!(
+            display_native_tool_name("ifc_viewer_section_clear"),
+            "ifc_viewer_section_clear"
+        );
+    }
+
+    #[test]
+    fn native_tool_result_progress_uses_ifc_display_names() {
+        assert_eq!(
+            opencode_tool_progress_output_summary(
+                "ifc_station_resolve",
+                Some(&serde_json::json!({ "ok": true }))
+            ),
+            "Result from `ifc_station_resolve`: returned data"
+        );
+        assert_eq!(
+            opencode_tool_progress_error_summary(
+                "ifc_alignment_catalog",
+                &serde_json::json!("missing facts")
+            ),
+            "Tool `ifc_alignment_catalog` failed: missing facts"
+        );
+    }
+
+    #[test]
+    fn native_tool_dispatch_requires_public_ifc_tool_names() {
+        let state_value = serde_json::json!({
+            "input": {
+                "why": "clear an active section"
+            }
+        });
+        let state = state_value.as_object();
+
+        assert!(
+            native_action_candidate_from_tool_call("viewer_section_clear", state).is_none(),
+            "bare export suffixes should not be accepted as native OpenCode action tools"
+        );
+        assert!(
+            native_action_candidate_from_tool_call("section_clear", state).is_none(),
+            "short aliases should not be accepted as native OpenCode action tools"
+        );
+        assert!(
+            native_action_candidate_from_tool_call("ifc_viewer_section_clear", state).is_some(),
+            "public `ifc_*` OpenCode tool names should drive native viewer actions"
+        );
+        assert!(
+            native_action_candidate_from_tool_call("ifc_viewer_annotations_clear", state).is_some(),
+            "public annotation action tools should also require the `ifc_*` prefix"
+        );
+
+        assert!(!is_native_readonly_cypher_tool_name("readonly_cypher"));
+        assert!(is_native_readonly_cypher_tool_name("ifc_readonly_cypher"));
+    }
+
+    #[test]
+    fn native_viewer_annotations_show_path_builds_compact_payload() {
+        let input_value = serde_json::json!({
+            "resource": "ifc/infra-road",
+            "mode": "add",
+            "path": { "kind": "ifc_alignment", "id": "curve:42", "measure": "station" },
+            "line": { "ranges": [{ "from": 0, "to": 140 }] },
+            "markers": [
+                { "range": { "from": 0, "to": 120 }, "every": 20, "label": "measure" },
+                { "range": { "from": 120, "to_end": true }, "every": 50, "label": "measure" }
+            ]
+        });
+        let input = input_value.as_object().unwrap();
+
+        let annotation =
+            native_path_annotation_from_input(input).expect("annotation should be built");
+
+        assert_eq!(
+            annotation,
+            serde_json::json!({
+                "resource": "ifc/infra-road",
+                "mode": "add",
+                "path": { "kind": "ifc_alignment", "id": "curve:42", "measure": "station" },
+                "line": { "ranges": [{ "from": 0, "to": 140 }] },
+                "markers": [
+                    { "range": { "from": 0, "to": 120 }, "every": 20, "label": "measure" },
+                    { "range": { "from": 120, "to_end": true }, "every": 50, "label": "measure" }
+                ]
+            })
+        );
+        assert!(annotation.get("polyline").is_none());
+        assert!(annotation.get("points").is_none());
+        assert!(annotation.get("coordinates").is_none());
+    }
+
+    #[test]
+    fn native_viewer_annotations_show_path_accepts_line_range_shorthand() {
+        let input_value = serde_json::json!({
+            "resource": "ifc/infra-road",
+            "path": { "kind": "ifc_alignment", "id": "curve:42", "measure": "station" },
+            "line_ranges": [{ "from": 100, "to": 200 }]
+        });
+        let input = input_value.as_object().unwrap();
+
+        let annotation =
+            native_path_annotation_from_input(input).expect("annotation should be built");
+
+        assert_eq!(
+            annotation,
+            serde_json::json!({
+                "resource": "ifc/infra-road",
+                "path": { "kind": "ifc_alignment", "id": "curve:42", "measure": "station" },
+                "line": { "ranges": [{ "from": 100, "to": 200 }] }
+            })
+        );
+    }
+
+    #[test]
+    fn native_viewer_section_set_builds_pose_payload() {
+        let input_value = serde_json::json!({
+            "resource": "ifc/infra-road",
+            "alignmentId": "alignment-a",
+            "station": 42.5,
+            "origin": [100.0, 200.0, 3.0],
+            "tangent": [1.0, 0.0, 0.0],
+            "normal": [0.0, 1.0, 0.0],
+            "up": [0.0, 0.0, 1.0],
+            "width": 24.0,
+            "height": 9.0,
+            "thickness": 0.5,
+            "clip": "plane",
+            "provenance": "ifc_station_resolve; resource=ifc/infra-road; station=42.5"
+        });
+        let input = input_value.as_object().unwrap();
+
+        let section = native_section_from_input(input).expect("section should be built from pose");
+
+        assert_eq!(
+            section,
+            serde_json::json!({
+                "resource": "ifc/infra-road",
+                "alignmentId": "alignment-a",
+                "station": 42.5,
+                "pose": {
+                    "origin": [100.0, 200.0, 3.0],
+                    "tangent": [1.0, 0.0, 0.0],
+                    "normal": [0.0, 1.0, 0.0],
+                    "up": [0.0, 0.0, 1.0]
+                },
+                "width": 24.0,
+                "height": 9.0,
+                "thickness": 0.5,
+                "clip": "none",
+                "provenance": [
+                    "ifc_station_resolve; resource=ifc/infra-road; station=42.5"
+                ]
+            })
+        );
+        assert!(section.get("ids").is_none());
+        assert!(section.get("semantic_ids").is_none());
+        assert!(section.get("db_node_ids").is_none());
     }
 
     #[test]

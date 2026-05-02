@@ -1,0 +1,10 @@
+[package]
+name = "cc-w-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ab_glyph = "0.2.32"
+cc-w-types = { path = "../cc-w-types" }

@@ -486,8 +486,11 @@ name = "cc-w-render"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "cc-w-text",
  "cc-w-types",
+ "epaint_default_fonts",
  "glam",
+ "png",
  "pollster",
  "thiserror 2.0.18",
  "wgpu",
@@ -512,6 +515,14 @@ dependencies = [
  "glam",
  "slotmap",
  "smallvec",
+]
+
+[[package]]
+name = "cc-w-text"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph",
+ "cc-w-types",
 ]
 
 [[package]]

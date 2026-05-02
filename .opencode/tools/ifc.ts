@@ -9,9 +9,17 @@ import {
   ifcScopeSummary,
 } from "../tool-helpers/ifc_scope_helpers.ts";
 import {
+  ifcAlignmentCatalog,
   ifcQuantityTakeoff,
   ifcSectionAtPointOrStation,
+  ifcStationResolve,
 } from "../tool-helpers/ifc_quantity_section_helpers.ts";
+
+// Tool naming convention:
+// OpenCode publishes tools from this module with the module namespace prefix.
+// For example, `export const readonly_cypher` is exposed to agents as
+// `ifc_readonly_cypher`. Keep exports in this file as unprefixed suffixes;
+// the public tool name is always `ifc_${exportName}`.
 
 type ToolContext = {
   worktree?: string;
@@ -70,6 +78,64 @@ function isAbortError(error: unknown): boolean {
 
 function countMatches(value: string, pattern: RegExp): number {
   return Array.from(value.matchAll(pattern)).length;
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function annotationModeIsAdd(value: unknown): boolean {
+  return ["add", "append", "include", "plus"].includes(
+    String(value ?? "").trim().toLowerCase(),
+  );
+}
+
+function measureRangeHasBoundary(value: unknown): boolean {
+  const range = objectRecord(value);
+  if (!range) {
+    return false;
+  }
+  return [
+    "from",
+    "start",
+    "from_measure",
+    "fromMeasure",
+    "to",
+    "end",
+    "to_measure",
+    "toMeasure",
+    "from_offset",
+    "fromOffset",
+    "start_offset",
+    "startOffset",
+    "to_offset",
+    "toOffset",
+    "end_offset",
+    "endOffset",
+    "to_end",
+    "toEnd",
+    "path_end",
+    "pathEnd",
+  ].some((key) => range[key] !== undefined && range[key] !== null);
+}
+
+function lineRequestIsDefaultPath(value: unknown): boolean {
+  const line = objectRecord(value);
+  if (!line) {
+    return false;
+  }
+  const keys = Object.keys(line).filter((key) => line[key] !== undefined && line[key] !== null);
+  if (!keys.length) {
+    return true;
+  }
+  if (keys.length !== 1 || keys[0] !== "ranges") {
+    return false;
+  }
+  const ranges = line.ranges;
+  return Array.isArray(ranges) && (ranges.length === 0 || !ranges.some(measureRangeHasBoundary));
 }
 
 function riskyProjectCypherReason(cypher: string): string | null {
@@ -601,6 +667,126 @@ export const quantity_takeoff = tool({
   },
 });
 
+export const alignment_catalog = tool({
+  description:
+    "List explicit IFC alignment or station-capable facts in the selected IFC resource or project. Does not infer alignments from model bounds, names, terrain, visible curves, or product layout.",
+  args: {
+    resource: tool.schema.string().describe("Selected IFC or project resource"),
+    limit: tool.schema.number().optional().describe("Maximum rows"),
+    api_base: tool.schema.string().optional().describe("Viewer API base URL"),
+  },
+  async execute(args) {
+    return ifcAlignmentCatalog(
+      {
+        resource: args.resource,
+        limit: args.limit,
+        api_base: args.api_base,
+      },
+      postViewerJson,
+    );
+  },
+});
+
+export const station_resolve = tool({
+  description:
+    "Resolve an explicit IFC alignment and station to a section pose. Fails when required IFC alignment, curve, station, placement, unit, or transform facts are missing; does not approximate section geometry.",
+  args: {
+    resource: tool.schema.string().describe("Selected IFC or project resource"),
+    alignment_id: tool.schema
+      .string()
+      .describe("Resolver alignment id returned by ifc_alignment_catalog"),
+    station: tool.schema
+      .union([tool.schema.string(), tool.schema.number()])
+      .describe("Station value to resolve from explicit IFC facts"),
+    width: tool.schema.number().optional().describe("Requested section width in model units"),
+    height: tool.schema.number().optional().describe("Requested section height in model units"),
+    thickness: tool.schema.number().optional().describe("Requested section slab thickness in model units"),
+    clip: tool.schema
+      .string()
+      .optional()
+      .describe("Optional clipping policy. For a normal cross section use clip-positive-normal. Use none only for a visible plane overlay without clipping; use clip-negative-normal when the opposite half should be kept."),
+    limit: tool.schema.number().optional().describe("Maximum rows"),
+    api_base: tool.schema.string().optional().describe("Viewer API base URL"),
+  },
+  async execute(args) {
+    return ifcStationResolve(
+      {
+        resource: args.resource,
+        alignment_id: args.alignment_id,
+        station: args.station,
+        width: args.width,
+        height: args.height,
+        thickness: args.thickness,
+        clip: args.clip,
+        limit: args.limit,
+        api_base: args.api_base,
+      },
+      postViewerJson,
+    );
+  },
+});
+
+export const section_intersections = tool({
+  description:
+    "Report whether section/geometry intersection extraction is available for an explicit resolved section. This does not estimate intersections from bboxes or names.",
+  args: {
+    resource: tool.schema.string().describe("Selected IFC or project resource"),
+    origin: tool.schema
+      .array(tool.schema.number())
+      .optional()
+      .describe("Resolved world-space section origin as [x,y,z]"),
+    tangent: tool.schema
+      .array(tool.schema.number())
+      .optional()
+      .describe("Resolved world-space in-plane width direction as [x,y,z]"),
+    normal: tool.schema
+      .array(tool.schema.number())
+      .optional()
+      .describe("Resolved world-space section plane normal as [x,y,z]"),
+    up: tool.schema
+      .array(tool.schema.number())
+      .optional()
+      .describe("Resolved world-space in-plane up direction as [x,y,z]"),
+    width: tool.schema.number().optional().describe("Section plane width in model units"),
+    height: tool.schema.number().optional().describe("Section plane height in model units"),
+    thickness: tool.schema.number().optional().describe("Section slab thickness in model units"),
+    api_base: tool.schema.string().optional().describe("Viewer API base URL"),
+  },
+  async execute(args) {
+    return JSON.stringify(
+      {
+        ok: false,
+        tool: "ifc_section_intersections",
+        resource: args.resource,
+        section: {
+          origin: args.origin ?? null,
+          tangent: args.tangent ?? null,
+          normal: args.normal ?? null,
+          up: args.up ?? null,
+          width: args.width ?? null,
+          height: args.height ?? null,
+          thickness: args.thickness ?? null,
+        },
+        rows: [],
+        diagnostics: [
+          {
+            code: "section_intersection_geometry_endpoint_missing",
+            severity: "unsupported",
+            message:
+              "Section intersection extraction is not implemented yet. The tool did not estimate cut products from bboxes, names, or visible geometry.",
+            inputs_needed: [
+              "renderer or geometry-service endpoint for exact section/mesh intersections",
+              "provenance from each generated cut primitive back to the semantic product id",
+            ],
+          },
+        ],
+      },
+      null,
+      2,
+    );
+  },
+});
+
 export const section_at_point_or_station = tool({
   description:
     "Prepare a section query from an explicit station, point, or semantic ids. Does not invent section geometry when alignment/plane facts are missing.",
@@ -866,6 +1052,190 @@ export const viewer_clear_inspection = tool({
   async execute(args) {
     const reason = args.why?.trim();
     return ["Prepared viewer.clear_inspection.", reason ? `Why: ${reason}` : null]
+      .filter(Boolean)
+      .join("\n");
+  },
+});
+
+export const viewer_section_set = tool({
+  description:
+    "Ask the host viewer to display a section plane from an explicit resolved IFC alignment/station pose. Use only after stationing has been resolved from explicit IFC facts; do not invent section geometry. Pose vectors are geometry-neutral: normal is the section plane normal, tangent is the in-plane width direction, and up is the in-plane up direction.",
+  args: {
+    resource: tool.schema
+      .string()
+      .optional()
+      .describe("IFC or project resource the resolved section belongs to"),
+    alignment_id: tool.schema
+      .string()
+      .optional()
+      .describe("Explicit alignment or stationing fact id used to resolve this section"),
+    station: tool.schema
+      .union([tool.schema.string(), tool.schema.number()])
+      .optional()
+      .describe("Resolved station value, for example 120"),
+    origin: tool.schema
+      .array(tool.schema.number())
+      .describe("Resolved world-space section origin as [x,y,z]"),
+    tangent: tool.schema
+      .array(tool.schema.number())
+      .describe("Resolved world-space in-plane width direction as [x,y,z]"),
+    normal: tool.schema
+      .array(tool.schema.number())
+      .describe("Resolved world-space section plane normal as [x,y,z]"),
+    up: tool.schema
+      .array(tool.schema.number())
+      .describe("Resolved world-space in-plane up direction as [x,y,z]"),
+    width: tool.schema.number().describe("Section plane width in model units"),
+    height: tool.schema.number().describe("Section plane height in model units"),
+    thickness: tool.schema.number().describe("Section slab thickness in model units"),
+    mode: tool.schema
+      .string()
+      .optional()
+      .describe("Viewer display mode. Currently use 3d-overlay."),
+    clip: tool.schema
+      .string()
+      .optional()
+      .describe("Optional clipping policy. For a normal cross section use clip-positive-normal. Use none only for a visible plane overlay without clipping; use clip-negative-normal when the opposite half should be kept."),
+    provenance: tool.schema
+      .string()
+      .optional()
+      .describe("Short provenance note explaining which explicit IFC facts resolved the pose"),
+    why: tool.schema.string().optional().describe("Short reason for the viewer action"),
+  },
+  async execute(args) {
+    const reason = args.why?.trim();
+    return [
+      `Prepared viewer.section.set${args.station === undefined ? "" : ` for station ${args.station}`}.`,
+      reason ? `Why: ${reason}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  },
+});
+
+export const viewer_section_clear = tool({
+  description: "Ask the host viewer to clear the active section plane.",
+  args: {
+    why: tool.schema.string().optional().describe("Short reason for clearing the section"),
+  },
+  async execute(args) {
+    const reason = args.why?.trim();
+    return ["Prepared viewer.section.clear.", reason ? `Why: ${reason}` : null]
+      .filter(Boolean)
+      .join("\n");
+  },
+});
+
+export const viewer_annotations_show_path = tool({
+  description:
+    "Ask the host viewer to show composable path annotations from an explicit path source. For IFC alignments, use after ifc_alignment_catalog; do not include raw polyline, point, coordinate, or vertex arrays. For marker-only additive updates, omit line entirely.",
+  args: {
+    resource: tool.schema
+      .string()
+      .optional()
+      .describe("IFC or project resource the path source belongs to"),
+    path: tool.schema
+      .object({
+        kind: tool.schema
+          .string()
+          .describe("Path source kind. Currently use ifc_alignment for explicit IFC alignment paths."),
+        id: tool.schema
+          .string()
+          .describe("Resolver path id returned by ifc_alignment_catalog. Prefer curve:<db-node-id>; alignment:<db-node-id> is accepted only when it resolves through explicit Axis representation facts to exactly one IfcGradientCurve."),
+        measure: tool.schema
+          .string()
+          .optional()
+          .describe("Measure coordinate along the path. Use station for IFC alignment station/chainage annotations."),
+      })
+      .describe("Explicit measured path source to sample and annotate"),
+    line: tool.schema
+      .object({
+        ranges: tool.schema
+          .array(
+            tool.schema.object({
+              from: tool.schema.number().optional().describe("Optional absolute station/chainage start. For 'station 100 to 200', use from: 100 and do not set from_offset."),
+              to: tool.schema.number().optional().describe("Optional absolute station/chainage end. For 'station 100 to 200', use to: 200 and do not set to_offset."),
+              from_offset: tool.schema.number().optional().describe("Optional relative distance from the explicit path start. Use only for relative wording like 'first 120m'; never combine with from."),
+              to_offset: tool.schema.number().optional().describe("Optional relative distance from the explicit path start. Use only for relative wording like 'first 120m'; never combine with to."),
+              to_end: tool.schema.boolean().optional().describe("Use true for 'to the end' of the explicit path. Do not combine with to or to_offset; do not guess a numeric end station."),
+            })
+          )
+          .optional()
+          .describe("Path measure ranges to draw as line spans. Include only when the user asks for the path line. Omit ranges or use [{}] for the whole explicit path. Use one coordinate mode per boundary: absolute station fields from/to, or relative fields from_offset/to_offset, never both. For 'to the end of the path', use to_end: true; do not guess a numeric end station or use to_offset: 0."),
+      })
+      .optional()
+      .describe("Optional path line drawing request. Do not include for marker-only additive updates."),
+    markers: tool.schema
+      .array(
+        tool.schema.object({
+          range: tool.schema
+            .object({
+              from: tool.schema.number().optional().describe("Optional absolute station/chainage start. For 'station 100 to 200', use from: 100 and do not set from_offset."),
+              to: tool.schema.number().optional().describe("Optional absolute station/chainage end. For 'station 100 to 200', use to: 200 and do not set to_offset."),
+              from_offset: tool.schema.number().optional().describe("Optional relative distance from the explicit path start. Use only for relative wording like 'first 120m'; never combine with from."),
+              to_offset: tool.schema.number().optional().describe("Optional relative distance from the explicit path start. Use only for relative wording like 'first 120m'; never combine with to."),
+              to_end: tool.schema.boolean().optional().describe("Use true for 'to the end' of the explicit path. Do not combine with to or to_offset; do not guess a numeric end station."),
+            })
+            .optional()
+            .describe("Optional measure range for this marker sampling rule. Omit to sample the whole explicit path. Use one coordinate mode per boundary: absolute station fields from/to, or relative fields from_offset/to_offset, never both. For 'to the end of the path', use to_end: true; do not guess a numeric end station or use to_offset: 0."),
+          every: tool.schema.number().describe("Marker spacing in path measure units"),
+          label: tool.schema
+            .string()
+            .optional()
+            .describe("Use measure to label each marker by its path measure; use none for unlabeled markers."),
+        })
+      )
+      .optional()
+      .describe("Optional marker sampling rules along the path. Use one marker object per requested spacing/range."),
+    max_samples: tool.schema
+      .number()
+      .optional()
+      .describe("Optional maximum sample count per line range or marker group"),
+    mode: tool.schema
+      .string()
+      .optional()
+      .describe("Annotation update mode. Use add/append when the user asks to add markers to existing annotations; omit or use replace for a fresh annotation."),
+    why: tool.schema.string().optional().describe("Short reason for the viewer action"),
+  },
+  async execute(args) {
+    const reason = args.why?.trim();
+    const defaultLineIgnored =
+      annotationModeIsAdd(args.mode) &&
+      Array.isArray(args.markers) &&
+      args.markers.length > 0 &&
+      lineRequestIsDefaultPath(args.line);
+    const details = [
+      args.mode === undefined ? null : `mode ${args.mode}`,
+      args.line === undefined
+        ? null
+        : defaultLineIgnored
+          ? "default line ignored for marker add"
+          : "line ranges",
+      args.markers === undefined ? null : `${args.markers.length} marker groups`,
+    ]
+      .filter(Boolean)
+      .join(", ");
+    return [
+      `Prepared viewer.annotations.show_path for ${args.path.kind}:${args.path.id}${details ? ` (${details})` : ""}.`,
+      reason ? `Why: ${reason}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  },
+});
+
+export const viewer_annotations_clear = tool({
+  description: "Ask the host viewer to clear active scene annotations.",
+  args: {
+    resource: tool.schema
+      .string()
+      .optional()
+      .describe("Optional IFC or project resource whose annotations should be cleared"),
+    why: tool.schema.string().optional().describe("Short reason for clearing annotations"),
+  },
+  async execute(args) {
+    const reason = args.why?.trim();
+    return ["Prepared viewer.annotations.clear.", reason ? `Why: ${reason}` : null]
       .filter(Boolean)
       .join("\n");
   },

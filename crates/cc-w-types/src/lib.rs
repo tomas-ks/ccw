@@ -79,6 +79,25 @@ impl From<&str> for GeometryResourceId {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SceneTextLabelId(String);
+
+impl SceneTextLabelId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for SceneTextLabelId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GeometryAssetId(pub u64);
 
@@ -101,9 +120,13 @@ pub const WORLD_UP_F32: Vec3 = Vec3::Z;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SectionPose {
+    /// World-space point on the section plane.
     pub origin: DVec3,
+    /// In-plane width direction.
     pub tangent: DVec3,
+    /// Plane normal used for clipping.
     pub normal: DVec3,
+    /// In-plane height/up direction.
     pub up: DVec3,
 }
 
@@ -162,6 +185,252 @@ impl SectionState {
             clip: SectionClipMode::None,
             provenance: Vec::new(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SceneTextHorizontalAlign {
+    #[default]
+    Center,
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SceneTextVerticalAlign {
+    #[default]
+    Middle,
+    Top,
+    Bottom,
+    Baseline,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SceneTextDepthMode {
+    /// Draw as a screen-space overlay after the 3D scene.
+    #[default]
+    Overlay,
+    /// Depth-test the label against the scene while keeping depth writes disabled.
+    DepthTested,
+    /// Draw through geometry for diagnostic/context labels.
+    XRay,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SceneTextStyle {
+    pub color: DisplayColor,
+    pub color_alpha: f32,
+    pub background_color: Option<DisplayColor>,
+    pub background_alpha: f32,
+    pub outline_color: Option<DisplayColor>,
+    pub outline_alpha: f32,
+    pub embolden_px: f32,
+    pub size_px: f32,
+    pub padding_px: f32,
+}
+
+impl Default for SceneTextStyle {
+    fn default() -> Self {
+        Self {
+            color: DisplayColor::new(0.06, 0.08, 0.11),
+            color_alpha: 1.0,
+            background_color: None,
+            background_alpha: 1.0,
+            outline_color: None,
+            outline_alpha: 1.0,
+            embolden_px: 0.0,
+            size_px: 14.0,
+            padding_px: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SceneTextLabel {
+    pub id: SceneTextLabelId,
+    pub text: String,
+    pub anchor: DVec3,
+    pub screen_offset_px: DVec2,
+    pub horizontal_align: SceneTextHorizontalAlign,
+    pub vertical_align: SceneTextVerticalAlign,
+    pub depth_mode: SceneTextDepthMode,
+    pub style: SceneTextStyle,
+}
+
+impl SceneTextLabel {
+    pub fn new(id: impl Into<String>, text: impl Into<String>, anchor: DVec3) -> Self {
+        Self {
+            id: SceneTextLabelId::new(id),
+            text: text.into(),
+            anchor,
+            screen_offset_px: DVec2::ZERO,
+            horizontal_align: SceneTextHorizontalAlign::Center,
+            vertical_align: SceneTextVerticalAlign::Middle,
+            depth_mode: SceneTextDepthMode::Overlay,
+            style: SceneTextStyle::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SceneAnnotationLayerId(String);
+
+impl SceneAnnotationLayerId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for SceneAnnotationLayerId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SceneAnnotationPrimitiveId(String);
+
+impl SceneAnnotationPrimitiveId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for SceneAnnotationPrimitiveId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SceneAnnotationDepthMode {
+    /// Draw after the 3D scene as a screen-space overlay.
+    #[default]
+    Overlay,
+    /// Depth-test against the scene while keeping depth writes disabled.
+    DepthTested,
+    /// Draw through geometry for diagnostic/context annotations.
+    XRay,
+}
+
+impl From<SceneAnnotationDepthMode> for SceneTextDepthMode {
+    fn from(value: SceneAnnotationDepthMode) -> Self {
+        match value {
+            SceneAnnotationDepthMode::Overlay => Self::Overlay,
+            SceneAnnotationDepthMode::DepthTested => Self::DepthTested,
+            SceneAnnotationDepthMode::XRay => Self::XRay,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SceneMarkerKind {
+    #[default]
+    Dot,
+    Cross,
+    Tick,
+    Arrow,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SceneAnnotationLifecycle {
+    #[default]
+    Temporary,
+    Pinned,
+    Diagnostic,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScenePolyline {
+    pub id: SceneAnnotationPrimitiveId,
+    pub points: Vec<DVec3>,
+    pub color: DisplayColor,
+    pub alpha: f32,
+    pub width_px: f32,
+    pub depth_mode: SceneAnnotationDepthMode,
+}
+
+impl ScenePolyline {
+    pub fn new(id: impl Into<String>, points: Vec<DVec3>) -> Self {
+        Self {
+            id: SceneAnnotationPrimitiveId::new(id),
+            points,
+            color: DisplayColor::new(0.12, 0.55, 0.72),
+            alpha: 1.0,
+            width_px: 2.0,
+            depth_mode: SceneAnnotationDepthMode::DepthTested,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SceneMarker {
+    pub id: SceneAnnotationPrimitiveId,
+    pub position: DVec3,
+    pub direction: Option<DVec3>,
+    pub normal: Option<DVec3>,
+    pub color: DisplayColor,
+    pub alpha: f32,
+    pub size_px: f32,
+    pub kind: SceneMarkerKind,
+    pub depth_mode: SceneAnnotationDepthMode,
+}
+
+impl SceneMarker {
+    pub fn new(id: impl Into<String>, position: DVec3) -> Self {
+        Self {
+            id: SceneAnnotationPrimitiveId::new(id),
+            position,
+            direction: None,
+            normal: None,
+            color: DisplayColor::new(0.12, 0.55, 0.72),
+            alpha: 1.0,
+            size_px: 8.0,
+            kind: SceneMarkerKind::Dot,
+            depth_mode: SceneAnnotationDepthMode::DepthTested,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SceneAnnotationPrimitive {
+    Polyline(ScenePolyline),
+    Marker(SceneMarker),
+    Text(SceneTextLabel),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SceneAnnotationLayer {
+    pub id: SceneAnnotationLayerId,
+    pub source: Option<String>,
+    pub visible: bool,
+    pub lifecycle: SceneAnnotationLifecycle,
+    pub primitives: Vec<SceneAnnotationPrimitive>,
+    pub provenance: Vec<String>,
+}
+
+impl SceneAnnotationLayer {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: SceneAnnotationLayerId::new(id),
+            source: None,
+            visible: true,
+            lifecycle: SceneAnnotationLifecycle::Temporary,
+            primitives: Vec::new(),
+            provenance: Vec::new(),
+        }
+    }
+
+    pub fn primitive_count(&self) -> usize {
+        self.primitives.len()
     }
 }
 

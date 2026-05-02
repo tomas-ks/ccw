@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
 };
 
@@ -278,11 +277,9 @@ fn load_relation_reference_asset_file(
     artifacts_root: &Path,
     schema: &IfcSchemaId,
 ) -> Result<AgentRelationReferenceAssetFile, String> {
-    for path in schema_asset_candidate_paths(
-        artifacts_root,
-        schema,
-        "agent-relation-reference.json",
-    ) {
+    for path in
+        schema_asset_candidate_paths(artifacts_root, schema, "agent-relation-reference.json")
+    {
         if !path.is_file() {
             continue;
         }
@@ -346,12 +343,7 @@ fn schema_asset_candidate_paths(
         );
     }
 
-    paths.push(
-        artifacts_root
-            .join("_graphql")
-            .join(stem)
-            .join(file_name),
-    );
+    paths.push(artifacts_root.join("_graphql").join(stem).join(file_name));
 
     dedup_paths(paths)
 }

@@ -32,8 +32,14 @@ import {
   viewer_view_state_json,
   viewer_visible_element_ids,
 } from "../../pkg/cc_w_platform_web.js";
+import * as viewerWasm from "../../pkg/cc_w_platform_web.js";
 import { sleep } from "../net/http.js";
 import { currentViewerTheme } from "../ui/settings-menu.js";
+import {
+  diagnosticMessage,
+  firstPresent,
+  normalizePathAnnotationRequest,
+} from "./path-annotations.mjs";
 import { semanticIdsForViewerResource } from "./resource.js";
 
 export function createViewerApi(options = {}) {
@@ -44,6 +50,95 @@ export function createViewerApi(options = {}) {
   const parsePickResult = (json) => JSON.parse(json);
   const parseResourceCatalog = (json) => JSON.parse(json);
   const parseRenderProfiles = (json) => JSON.parse(json);
+  const parseSectionState = (json) => JSON.parse(json);
+  const parseAnnotationState = (json) => JSON.parse(json);
+  const readJsonResponse = async (response, fallbackMessage) => {
+    const payload = await response.json().catch(() => ({}));
+    if (response.ok) {
+      return payload;
+    }
+    const diagnostics = Array.isArray(payload?.diagnostics)
+      ? payload.diagnostics
+          .map(diagnosticMessage)
+          .filter(Boolean)
+      : [];
+    throw new Error(
+      diagnostics.length
+        ? diagnostics.join("; ")
+        : payload?.error || fallbackMessage || `viewer request failed (${response.status})`
+    );
+  };
+  const requireViewerFeatureExport = (feature, name) => {
+    const exported = viewerWasm?.[name];
+    if (typeof exported !== "function") {
+      throw new Error(
+        `Viewer ${feature} API is unavailable: wasm export \`${name}\` is not present.`
+      );
+    }
+    return exported;
+  };
+  const requireViewerSectionExport = (name) =>
+    requireViewerFeatureExport("section", name);
+  const requireViewerAnnotationsExport = (name) =>
+    requireViewerFeatureExport("annotations", name);
+  const section = {
+    set: (spec) => {
+      const setJson = requireViewerSectionExport("viewer_section_set_json");
+      return parseSectionState(setJson(JSON.stringify(spec)));
+    },
+    clear: () => {
+      const clearJson = requireViewerSectionExport("viewer_section_clear_json");
+      return parseSectionState(clearJson());
+    },
+    state: () => {
+      const stateJson = requireViewerSectionExport("viewer_section_state_json");
+      return parseSectionState(stateJson());
+    },
+  };
+  const annotations = {
+    set: (layerSpec) => {
+      const setJson = requireViewerAnnotationsExport("viewer_annotations_set_json");
+      return parseAnnotationState(setJson(JSON.stringify(layerSpec)));
+    },
+    merge: (layerSpec) => {
+      const mergeJson = requireViewerAnnotationsExport("viewer_annotations_merge_json");
+      return parseAnnotationState(mergeJson(JSON.stringify(layerSpec)));
+    },
+    clear: (layerId = null) => {
+      const clearJson = requireViewerAnnotationsExport("viewer_annotations_clear_json");
+      const id =
+        layerId && typeof layerId === "object"
+          ? firstPresent(layerId.layer_id, layerId.layerId, layerId.id)
+          : layerId;
+      return parseAnnotationState(clearJson(id == null ? null : String(id)));
+    },
+    state: () => {
+      const stateJson = requireViewerAnnotationsExport("viewer_annotations_state_json");
+      return parseAnnotationState(stateJson());
+    },
+    showPath: async (spec = {}) => {
+      const { mode, payload } = normalizePathAnnotationRequest(spec, viewer_current_resource());
+      const response = await fetch("/api/annotations/path", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+      const compiled = await readJsonResponse(
+        response,
+        "Alignment annotation compilation failed."
+      );
+      if (!compiled?.layer) {
+        throw new Error("Path annotation compilation returned no layer.");
+      }
+      if (mode === "add") {
+        return annotations.merge(compiled.layer);
+      }
+      return annotations.set(compiled.layer);
+    },
+    show_path: (spec = {}) => annotations.showPath(spec),
+  };
   const currentViewerElementIds = (ids, options = {}) =>
     semanticIdsForViewerResource(ids, viewer_current_resource(), options);
   const normalizeInspectionMode = (mode) => {
@@ -121,6 +216,8 @@ export function createViewerApi(options = {}) {
     resourceCatalog: () => parseResourceCatalog(viewer_resource_catalog_json()),
     viewState: () => parseViewState(viewer_view_state_json()),
     state: () => api.viewState(),
+    section,
+    annotations,
     setProfile: (profile) => parseViewState(viewer_set_profile(profile)),
     setViewMode: (mode) => setViewModeSoon(mode),
     defaultView: () => setViewModeSoon("default"),

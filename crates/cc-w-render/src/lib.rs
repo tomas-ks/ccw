@@ -2,8 +2,8 @@ use bytemuck::{Pod, Zeroable, bytes_of, cast_slice};
 use cc_w_types::{
     Bounds3, DefaultRenderClass, GeometryDefinitionId, GeometryInstanceId, PickHit, PickRegion,
     PickResult, PreparedMaterial, PreparedMesh, PreparedRenderDefinition, PreparedRenderInstance,
-    PreparedRenderRole, PreparedRenderScene, SemanticElementId, WORLD_FORWARD, WORLD_RIGHT,
-    WORLD_UP,
+    PreparedRenderRole, PreparedRenderScene, SceneAnnotationLayer, SceneTextDepthMode,
+    SceneTextLabel, SemanticElementId, WORLD_FORWARD, WORLD_RIGHT, WORLD_UP,
 };
 use glam::{DMat4, DVec3, DVec4, Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
@@ -12,12 +12,26 @@ use std::sync::mpsc;
 use wgpu::util::DeviceExt;
 use wgpu::vertex_attr_array;
 
+mod annotation_overlay;
 mod mesh_edges;
 mod profile;
+mod text_overlay;
+
+pub use annotation_overlay::AnnotationOverlayError;
+pub use text_overlay::{
+    DEFAULT_ALPHA_DISCARD_THRESHOLD, GpuTextGlyphInstance, TextAtlas, TextAtlasDescriptor,
+    TextAtlasRegion, TextGlyph, TextOverlayGlyphBuffer, TextOverlayPipeline, TextOverlayRenderer,
+    align_label_origin_px, create_text_camera_bind_group, create_text_camera_bind_group_layout,
+    label_base_offset_px, project_label_anchor_px, text_glyphs_from_layout,
+};
 
 pub use mesh_edges::{ExtractedMeshEdges, MeshEdgeExtractionConfig};
 pub use profile::{
     RenderProfileDescriptor, RenderProfileId, UnknownRenderProfile, available_render_profiles,
+};
+
+use annotation_overlay::{
+    AnnotationOverlayGpuState, AnnotationOverlayPipelines, annotation_overlay_geometry,
 };
 
 pub const DEFAULT_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -32,6 +46,10 @@ const SCREEN_SPACE_NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgb
 pub const BASIC_MESH_SHADER_WGSL: &str = r#"
 struct Camera {
     clip_from_world : mat4x4<f32>,
+    viewport_and_profile : vec4<f32>,
+    view_from_world : mat4x4<f32>,
+    clip_plane : vec4<f32>,
+    clip_params : vec4<f32>,
 };
 
 struct Lighting {
@@ -59,6 +77,7 @@ struct VertexOutput {
     @builtin(position) position : vec4<f32>,
     @location(0) normal : vec3<f32>,
     @location(1) material_color : vec4<f32>,
+    @location(2) world_position : vec3<f32>,
 };
 
 @vertex
@@ -74,11 +93,16 @@ fn vs_main(input : VertexInput) -> VertexOutput {
     out.position = camera.clip_from_world * world_position;
     out.normal = (model_from_object * vec4<f32>(input.normal, 0.0)).xyz;
     out.material_color = input.material_color;
+    out.world_position = world_position.xyz;
     return out;
 }
 
 @fragment
 fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+    let section_distance = dot(input.world_position, camera.clip_plane.xyz) + camera.clip_plane.w;
+    if (camera.clip_params.x != 0.0 && section_distance * camera.clip_params.x > 0.0) {
+        discard;
+    }
     let diffuse = max(dot(normalize(input.normal), normalize(lighting.light_direction.xyz)), 0.0);
     let lit = lighting.factors.x + (diffuse * lighting.factors.y);
     return vec4<f32>(input.material_color.xyz * lit, input.material_color.w);
@@ -88,6 +112,10 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
 pub const ARCHITECTURAL_MESH_SHADER_WGSL: &str = r#"
 struct Camera {
     clip_from_world : mat4x4<f32>,
+    viewport_and_profile : vec4<f32>,
+    view_from_world : mat4x4<f32>,
+    clip_plane : vec4<f32>,
+    clip_params : vec4<f32>,
 };
 
 struct Lighting {
@@ -115,6 +143,7 @@ struct VertexOutput {
     @builtin(position) position : vec4<f32>,
     @location(0) normal : vec3<f32>,
     @location(1) material_color : vec4<f32>,
+    @location(2) world_position : vec3<f32>,
 };
 
 @vertex
@@ -130,11 +159,16 @@ fn vs_main(input : VertexInput) -> VertexOutput {
     out.position = camera.clip_from_world * world_position;
     out.normal = (model_from_object * vec4<f32>(input.normal, 0.0)).xyz;
     out.material_color = input.material_color;
+    out.world_position = world_position.xyz;
     return out;
 }
 
 @fragment
 fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+    let section_distance = dot(input.world_position, camera.clip_plane.xyz) + camera.clip_plane.w;
+    if (camera.clip_params.x != 0.0 && section_distance * camera.clip_params.x > 0.0) {
+        discard;
+    }
     let diffuse = max(dot(normalize(input.normal), normalize(lighting.light_direction.xyz)), 0.0);
     let ambient_fill = max(lighting.factors.x, 0.46);
     let diffuse_fill = min(lighting.factors.y, 1.0 - ambient_fill);
@@ -146,6 +180,10 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
 pub const INSPECTION_CONTEXT_MESH_SHADER_WGSL: &str = r#"
 struct Camera {
     clip_from_world : mat4x4<f32>,
+    viewport_and_profile : vec4<f32>,
+    view_from_world : mat4x4<f32>,
+    clip_plane : vec4<f32>,
+    clip_params : vec4<f32>,
 };
 
 struct Lighting {
@@ -173,6 +211,7 @@ struct VertexOutput {
     @builtin(position) position : vec4<f32>,
     @location(0) normal : vec3<f32>,
     @location(1) material_color : vec4<f32>,
+    @location(2) world_position : vec3<f32>,
 };
 
 @vertex
@@ -188,11 +227,16 @@ fn vs_main(input : VertexInput) -> VertexOutput {
     out.position = camera.clip_from_world * world_position;
     out.normal = (model_from_object * vec4<f32>(input.normal, 0.0)).xyz;
     out.material_color = input.material_color;
+    out.world_position = world_position.xyz;
     return out;
 }
 
 @fragment
 fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+    let section_distance = dot(input.world_position, camera.clip_plane.xyz) + camera.clip_plane.w;
+    if (camera.clip_params.x != 0.0 && section_distance * camera.clip_params.x > 0.0) {
+        discard;
+    }
     let diffuse = max(dot(normalize(input.normal), normalize(lighting.light_direction.xyz)), 0.0);
     let lit = 0.62 + diffuse * 0.22;
     let neutral = vec3<f32>(0.48, 0.56, 0.66);
@@ -201,10 +245,81 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+pub const SECTION_CUTAWAY_CONTEXT_MESH_SHADER_WGSL: &str = r#"
+struct Camera {
+    clip_from_world : mat4x4<f32>,
+    viewport_and_profile : vec4<f32>,
+    view_from_world : mat4x4<f32>,
+    clip_plane : vec4<f32>,
+    clip_params : vec4<f32>,
+};
+
+struct Lighting {
+    light_direction : vec4<f32>,
+    factors : vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera : Camera;
+
+@group(0) @binding(1)
+var<uniform> lighting : Lighting;
+
+struct VertexInput {
+    @location(0) position : vec3<f32>,
+    @location(1) normal : vec3<f32>,
+    @location(2) model_col0 : vec4<f32>,
+    @location(3) model_col1 : vec4<f32>,
+    @location(4) model_col2 : vec4<f32>,
+    @location(5) model_col3 : vec4<f32>,
+    @location(6) material_color : vec4<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) position : vec4<f32>,
+    @location(0) normal : vec3<f32>,
+    @location(1) material_color : vec4<f32>,
+    @location(2) world_position : vec3<f32>,
+};
+
+@vertex
+fn vs_main(input : VertexInput) -> VertexOutput {
+    var out : VertexOutput;
+    let model_from_object = mat4x4<f32>(
+        input.model_col0,
+        input.model_col1,
+        input.model_col2,
+        input.model_col3,
+    );
+    let world_position = model_from_object * vec4<f32>(input.position, 1.0);
+    out.position = camera.clip_from_world * world_position;
+    out.normal = (model_from_object * vec4<f32>(input.normal, 0.0)).xyz;
+    out.material_color = input.material_color;
+    out.world_position = world_position.xyz;
+    return out;
+}
+
+@fragment
+fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+    let section_distance = dot(input.world_position, camera.clip_plane.xyz) + camera.clip_plane.w;
+    if (camera.clip_params.x == 0.0 || section_distance * camera.clip_params.x <= 0.0) {
+        discard;
+    }
+    let diffuse = max(dot(normalize(input.normal), normalize(lighting.light_direction.xyz)), 0.0);
+    let lit = 0.62 + diffuse * 0.22;
+    let neutral = vec3<f32>(0.48, 0.60, 0.68);
+    let tint = mix(neutral, input.material_color.xyz, 0.22) * lit;
+    return vec4<f32>(tint, 0.18 * max(lighting.factors.z, 0.0));
+}
+"#;
+
 pub const INSPECTION_CONTEXT_TINT_SHADER_WGSL: &str = r#"
 struct Camera {
     clip_from_world : mat4x4<f32>,
     viewport_and_profile : vec4<f32>,
+    view_from_world : mat4x4<f32>,
+    clip_plane : vec4<f32>,
+    clip_params : vec4<f32>,
 };
 
 struct Lighting {
@@ -235,6 +350,7 @@ struct VertexOutput {
     @builtin(position) position : vec4<f32>,
     @location(0) normal : vec3<f32>,
     @location(1) material_color : vec4<f32>,
+    @location(2) world_position : vec3<f32>,
 };
 
 @vertex
@@ -250,6 +366,7 @@ fn vs_main(input : VertexInput) -> VertexOutput {
     out.position = camera.clip_from_world * world_position;
     out.normal = (model_from_object * vec4<f32>(input.normal, 0.0)).xyz;
     out.material_color = input.material_color;
+    out.world_position = world_position.xyz;
     return out;
 }
 
@@ -267,6 +384,10 @@ fn decode_mask(pixel : vec4<u32>) -> u32 {
 
 @fragment
 fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+    let section_distance = dot(input.world_position, camera.clip_plane.xyz) + camera.clip_plane.w;
+    if (camera.clip_params.x != 0.0 && section_distance * camera.clip_params.x > 0.0) {
+        discard;
+    }
     let coord = vec2<i32>(floor(input.position.xy));
     if (decode_mask(textureLoad(focus_mask_texture, clamped_coord(coord), 0)) == 0u) {
         discard;
@@ -283,6 +404,10 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
 pub const PICK_MESH_SHADER_WGSL: &str = r#"
 struct Camera {
     clip_from_world : mat4x4<f32>,
+    viewport_and_profile : vec4<f32>,
+    view_from_world : mat4x4<f32>,
+    clip_plane : vec4<f32>,
+    clip_params : vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -300,6 +425,7 @@ struct VertexInput {
 struct VertexOutput {
     @builtin(position) position : vec4<f32>,
     @location(0) @interpolate(flat) pick_color : vec4<u32>,
+    @location(1) world_position : vec3<f32>,
 };
 
 fn encode_pick_index(index : u32) -> vec4<u32> {
@@ -323,11 +449,16 @@ fn vs_main(input : VertexInput) -> VertexOutput {
     let world_position = model_from_object * vec4<f32>(input.position, 1.0);
     out.position = camera.clip_from_world * world_position;
     out.pick_color = encode_pick_index(input.pick_index);
+    out.world_position = world_position.xyz;
     return out;
 }
 
 @fragment
 fn fs_main(input : VertexOutput) -> @location(0) vec4<u32> {
+    let section_distance = dot(input.world_position, camera.clip_plane.xyz) + camera.clip_plane.w;
+    if (camera.clip_params.x != 0.0 && section_distance * camera.clip_params.x > 0.0) {
+        discard;
+    }
     return input.pick_color;
 }
 "#;
@@ -335,6 +466,10 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<u32> {
 pub const PICK_MESH_WITH_DEPTH_SHADER_WGSL: &str = r#"
 struct Camera {
     clip_from_world : mat4x4<f32>,
+    viewport_and_profile : vec4<f32>,
+    view_from_world : mat4x4<f32>,
+    clip_plane : vec4<f32>,
+    clip_params : vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -352,6 +487,7 @@ struct VertexInput {
 struct VertexOutput {
     @builtin(position) position : vec4<f32>,
     @location(0) @interpolate(flat) pick_index : u32,
+    @location(1) world_position : vec3<f32>,
 };
 
 struct FragmentOutput {
@@ -371,11 +507,16 @@ fn vs_main(input : VertexInput) -> VertexOutput {
     let world_position = model_from_object * vec4<f32>(input.position, 1.0);
     out.position = camera.clip_from_world * world_position;
     out.pick_index = input.pick_index;
+    out.world_position = world_position.xyz;
     return out;
 }
 
 @fragment
 fn fs_main(input : VertexOutput) -> FragmentOutput {
+    let section_distance = dot(input.world_position, camera.clip_plane.xyz) + camera.clip_plane.w;
+    if (camera.clip_params.x != 0.0 && section_distance * camera.clip_params.x > 0.0) {
+        discard;
+    }
     var out : FragmentOutput;
     out.pick_index = input.pick_index;
     out.depth_bits = bitcast<u32>(clamp(input.position.z, 0.0, 1.0));
@@ -386,6 +527,10 @@ fn fs_main(input : VertexOutput) -> FragmentOutput {
 pub const OBJECT_ID_MESH_SHADER_WGSL: &str = r#"
 struct Camera {
     clip_from_world : mat4x4<f32>,
+    viewport_and_profile : vec4<f32>,
+    view_from_world : mat4x4<f32>,
+    clip_plane : vec4<f32>,
+    clip_params : vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -403,6 +548,7 @@ struct VertexInput {
 struct VertexOutput {
     @builtin(position) position : vec4<f32>,
     @location(0) @interpolate(flat) object_color : vec4<u32>,
+    @location(1) world_position : vec3<f32>,
 };
 
 fn encode_object_index(index : u32) -> vec4<u32> {
@@ -426,11 +572,16 @@ fn vs_main(input : VertexInput) -> VertexOutput {
     let world_position = model_from_object * vec4<f32>(input.position, 1.0);
     out.position = camera.clip_from_world * world_position;
     out.object_color = encode_object_index(input.outline_index);
+    out.world_position = world_position.xyz;
     return out;
 }
 
 @fragment
 fn fs_main(input : VertexOutput) -> @location(0) vec4<u32> {
+    let section_distance = dot(input.world_position, camera.clip_plane.xyz) + camera.clip_plane.w;
+    if (camera.clip_params.x != 0.0 && section_distance * camera.clip_params.x > 0.0) {
+        discard;
+    }
     return input.object_color;
 }
 "#;
@@ -440,6 +591,8 @@ struct Camera {
     clip_from_world : mat4x4<f32>,
     viewport_and_profile : vec4<f32>,
     view_from_world : mat4x4<f32>,
+    clip_plane : vec4<f32>,
+    clip_params : vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -457,6 +610,7 @@ struct VertexInput {
 struct VertexOutput {
     @builtin(position) position : vec4<f32>,
     @location(0) normal : vec3<f32>,
+    @location(1) world_position : vec3<f32>,
 };
 
 @vertex
@@ -472,11 +626,16 @@ fn vs_main(input : VertexInput) -> VertexOutput {
     let world_normal = model_from_object * vec4<f32>(input.normal, 0.0);
     out.position = camera.clip_from_world * world_position;
     out.normal = normalize((camera.view_from_world * world_normal).xyz);
+    out.world_position = world_position.xyz;
     return out;
 }
 
 @fragment
 fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+    let section_distance = dot(input.world_position, camera.clip_plane.xyz) + camera.clip_plane.w;
+    if (camera.clip_params.x != 0.0 && section_distance * camera.clip_params.x > 0.0) {
+        discard;
+    }
     let normal = normalize(input.normal);
     return vec4<f32>((normal * 0.5) + vec3<f32>(0.5), 1.0);
 }
@@ -486,6 +645,9 @@ pub const EDGE_RIBBON_SHADER_WGSL: &str = r#"
 struct Camera {
     clip_from_world : mat4x4<f32>,
     viewport_and_profile : vec4<f32>,
+    view_from_world : mat4x4<f32>,
+    clip_plane : vec4<f32>,
+    clip_params : vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -508,6 +670,7 @@ struct VertexOutput {
     @builtin(position) position : vec4<f32>,
     @location(0) edge_side : f32,
     @location(1) edge_visibility : f32,
+    @location(2) world_position : vec3<f32>,
 };
 
 @vertex
@@ -519,8 +682,10 @@ fn vs_main(input : VertexInput) -> VertexOutput {
         input.model_col2,
         input.model_col3,
     );
-    let start_clip = camera.clip_from_world * (model_from_object * vec4<f32>(input.edge_start, 1.0));
-    let end_clip = camera.clip_from_world * (model_from_object * vec4<f32>(input.edge_end, 1.0));
+    let start_world = model_from_object * vec4<f32>(input.edge_start, 1.0);
+    let end_world = model_from_object * vec4<f32>(input.edge_end, 1.0);
+    let start_clip = camera.clip_from_world * start_world;
+    let end_clip = camera.clip_from_world * end_world;
     let start_ndc = start_clip.xy / start_clip.w;
     let end_ndc = end_clip.xy / end_clip.w;
     let viewport = max(camera.viewport_and_profile.xy, vec2<f32>(1.0, 1.0));
@@ -547,11 +712,16 @@ fn vs_main(input : VertexInput) -> VertexOutput {
         input.crease_edge_visibility,
         input.edge_kind > 0.5,
     );
+    out.world_position = select(start_world, end_world, input.corner.x > 0.5).xyz;
     return out;
 }
 
 @fragment
 fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+    let section_distance = dot(input.world_position, camera.clip_plane.xyz) + camera.clip_plane.w;
+    if (camera.clip_params.x != 0.0 && section_distance * camera.clip_params.x > 0.0) {
+        discard;
+    }
     let half_width_px = max(camera.viewport_and_profile.z, 0.5);
     let antialias_width = min(0.95, 1.0 / half_width_px);
     let edge_alpha = 1.0 - smoothstep(1.0 - antialias_width, 1.0, abs(input.edge_side));
@@ -563,6 +733,9 @@ pub const CREASE_RIBBON_SHADER_WGSL: &str = r#"
 struct Camera {
     clip_from_world : mat4x4<f32>,
     viewport_and_profile : vec4<f32>,
+    view_from_world : mat4x4<f32>,
+    clip_plane : vec4<f32>,
+    clip_params : vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -585,6 +758,7 @@ struct VertexOutput {
     @location(0) edge_side : f32,
     @location(1) edge_visibility : f32,
     @location(2) edge_kind : f32,
+    @location(3) world_position : vec3<f32>,
 };
 
 @vertex
@@ -596,8 +770,10 @@ fn vs_main(input : VertexInput) -> VertexOutput {
         input.model_col2,
         input.model_col3,
     );
-    let start_clip = camera.clip_from_world * (model_from_object * vec4<f32>(input.edge_start, 1.0));
-    let end_clip = camera.clip_from_world * (model_from_object * vec4<f32>(input.edge_end, 1.0));
+    let start_world = model_from_object * vec4<f32>(input.edge_start, 1.0);
+    let end_world = model_from_object * vec4<f32>(input.edge_end, 1.0);
+    let start_clip = camera.clip_from_world * start_world;
+    let end_clip = camera.clip_from_world * end_world;
     let start_ndc = start_clip.xy / start_clip.w;
     let end_ndc = end_clip.xy / end_clip.w;
     let viewport = max(camera.viewport_and_profile.xy, vec2<f32>(1.0, 1.0));
@@ -621,11 +797,16 @@ fn vs_main(input : VertexInput) -> VertexOutput {
     out.edge_side = input.corner.y;
     out.edge_visibility = input.crease_edge_visibility;
     out.edge_kind = input.edge_kind;
+    out.world_position = select(start_world, end_world, input.corner.x > 0.5).xyz;
     return out;
 }
 
 @fragment
 fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+    let section_distance = dot(input.world_position, camera.clip_plane.xyz) + camera.clip_plane.w;
+    if (camera.clip_params.x != 0.0 && section_distance * camera.clip_params.x > 0.0) {
+        discard;
+    }
     if (input.edge_kind < 0.5 || input.edge_visibility <= 0.01) {
         discard;
     }
@@ -867,6 +1048,38 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+pub const SECTION_OVERLAY_SHADER_WGSL: &str = r#"
+struct Camera {
+    clip_from_world : mat4x4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera : Camera;
+
+struct VertexInput {
+    @location(0) position : vec3<f32>,
+    @location(1) color : vec4<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) position : vec4<f32>,
+    @location(0) color : vec4<f32>,
+};
+
+@vertex
+fn vs_main(input : VertexInput) -> VertexOutput {
+    var out : VertexOutput;
+    out.position = camera.clip_from_world * vec4<f32>(input.position, 1.0);
+    out.color = input.color;
+    return out;
+}
+
+@fragment
+fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+    return input.color;
+}
+"#;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DirectionalLight {
     pub direction: Vec3,
@@ -916,6 +1129,106 @@ impl Default for RenderDefaults {
     }
 }
 
+pub const DEFAULT_SECTION_OVERLAY_COLOR: [f32; 4] = [0.12, 0.74, 0.92, 0.14];
+pub const DEFAULT_SECTION_OVERLAY_BORDER_COLOR: [f32; 4] = [0.03, 0.48, 0.66, 0.72];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClipPlaneSide {
+    #[default]
+    None,
+    PositiveNormal,
+    NegativeNormal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ClipPlaneUniform {
+    plane: [f32; 4],
+    side: f32,
+}
+
+impl ClipPlaneUniform {
+    fn disabled() -> Self {
+        Self {
+            plane: [0.0, 0.0, 1.0, 0.0],
+            side: 0.0,
+        }
+    }
+
+    fn from_origin_normal(
+        origin: DVec3,
+        normal: DVec3,
+        side: ClipPlaneSide,
+    ) -> Result<Self, String> {
+        if side == ClipPlaneSide::None {
+            return Ok(Self::disabled());
+        }
+        if !origin.is_finite() || !normal.is_finite() {
+            return Err("clip plane origin and normal must be finite".to_string());
+        }
+        let length = normal.length();
+        if length <= f64::EPSILON {
+            return Err("clip plane normal must be non-zero".to_string());
+        }
+        let normal = normal / length;
+        let plane_offset = -normal.dot(origin);
+        let side = match side {
+            ClipPlaneSide::None => 0.0,
+            ClipPlaneSide::PositiveNormal => 1.0,
+            ClipPlaneSide::NegativeNormal => -1.0,
+        };
+        Ok(Self {
+            plane: [
+                normal.x as f32,
+                normal.y as f32,
+                normal.z as f32,
+                plane_offset as f32,
+            ],
+            side,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SectionOverlay {
+    pub corners: [DVec3; 4],
+    pub color: [f32; 4],
+    pub border_color: [f32; 4],
+}
+
+impl SectionOverlay {
+    pub fn new(corners: [DVec3; 4]) -> Self {
+        Self {
+            corners,
+            color: DEFAULT_SECTION_OVERLAY_COLOR,
+            border_color: DEFAULT_SECTION_OVERLAY_BORDER_COLOR,
+        }
+    }
+
+    pub fn with_color(mut self, color: [f32; 4]) -> Self {
+        self.color = color;
+        self
+    }
+
+    pub fn with_border_color(mut self, color: [f32; 4]) -> Self {
+        self.border_color = color;
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SectionOverlayError {
+    #[error("section overlay {overlay_index} corner {corner_index} is not finite")]
+    NonFiniteCorner {
+        overlay_index: usize,
+        corner_index: usize,
+    },
+    #[error("section overlay {overlay_index} color component {component_index} is not finite")]
+    NonFiniteColor {
+        overlay_index: usize,
+        component_index: usize,
+    },
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 struct GpuReferenceGridVertex {
@@ -930,6 +1243,26 @@ impl GpuReferenceGridVertex {
 
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<GpuReferenceGridVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &ATTRIBUTES,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+struct GpuSectionOverlayVertex {
+    position: [f32; 3],
+    color: [f32; 4],
+}
+
+impl GpuSectionOverlayVertex {
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        const ATTRIBUTES: [wgpu::VertexAttribute; 2] =
+            vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<GpuSectionOverlayVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &ATTRIBUTES,
         }
@@ -1506,11 +1839,18 @@ struct CameraUniform {
     clip_from_world: [[f32; 4]; 4],
     viewport_and_profile: [f32; 4],
     view_from_world: [[f32; 4]; 4],
+    clip_plane: [f32; 4],
+    clip_params: [f32; 4],
 }
 
 impl CameraUniform {
-    fn from_camera(camera: Camera, viewport: ViewportSize) -> Self {
+    fn from_camera(
+        camera: Camera,
+        viewport: ViewportSize,
+        clip_plane: Option<ClipPlaneUniform>,
+    ) -> Self {
         let viewport = viewport.clamped();
+        let clip_plane = clip_plane.unwrap_or_else(ClipPlaneUniform::disabled);
         Self {
             clip_from_world: camera.clip_from_world_f32(viewport).to_cols_array_2d(),
             viewport_and_profile: [
@@ -1520,6 +1860,8 @@ impl CameraUniform {
                 SCREEN_SPACE_OUTLINE_DEPTH_THRESHOLD,
             ],
             view_from_world: mat4_from_dmat4(camera.view_from_world()).to_cols_array_2d(),
+            clip_plane: clip_plane.plane,
+            clip_params: [clip_plane.side, 0.0, 0.0, 0.0],
         }
     }
 }
@@ -1628,6 +1970,16 @@ impl RenderLayer {
         matches!(
             self,
             Self::InspectionContextOpaque | Self::InspectionContextSurfaceDecal
+        )
+    }
+
+    fn draws_as_section_cutaway_context(self) -> bool {
+        matches!(
+            self,
+            Self::Opaque
+                | Self::SurfaceDecal
+                | Self::InspectionContextOpaque
+                | Self::InspectionContextSurfaceDecal
         )
     }
 
@@ -1821,15 +2173,17 @@ impl ScreenSpaceAmbientOcclusionTargets {
     }
 }
 
-#[derive(Debug)]
 pub struct MeshRenderer {
     pipeline: wgpu::RenderPipeline,
     architectural_pipeline: wgpu::RenderPipeline,
     inspection_context_pipeline: wgpu::RenderPipeline,
+    section_cutaway_context_pipeline: wgpu::RenderPipeline,
     inspection_context_tint_pipeline: wgpu::RenderPipeline,
     surface_decal_pipeline: wgpu::RenderPipeline,
     architectural_surface_decal_pipeline: wgpu::RenderPipeline,
     reference_grid_pipeline: wgpu::RenderPipeline,
+    section_overlay_pipeline: wgpu::RenderPipeline,
+    annotation_overlay_pipelines: AnnotationOverlayPipelines,
     normal_pipeline: wgpu::RenderPipeline,
     ssao_pipeline: wgpu::RenderPipeline,
     edge_pipeline: wgpu::RenderPipeline,
@@ -1849,12 +2203,23 @@ pub struct MeshRenderer {
     ssao_targets: ScreenSpaceAmbientOcclusionTargets,
     viewport: ViewportSize,
     camera: Camera,
+    clip_plane: Option<ClipPlaneUniform>,
     defaults: RenderDefaults,
     profile: RenderProfileId,
     inspection_context_alpha_multiplier: f32,
     reference_grid_visible: bool,
     reference_grid_vertex_buffer: Option<wgpu::Buffer>,
     reference_grid_vertex_count: u32,
+    section_overlay_vertex_buffer: Option<wgpu::Buffer>,
+    section_overlay_vertex_count: u32,
+    section_overlay_count: u32,
+    annotation_overlays: AnnotationOverlayGpuState,
+    annotation_text_renderer: TextOverlayRenderer,
+    annotation_text_font: cc_w_text::TextFont,
+    annotation_text_atlas: Option<TextAtlas>,
+    annotation_text_overlay_glyphs: TextOverlayGlyphBuffer,
+    annotation_text_depth_tested_glyphs: TextOverlayGlyphBuffer,
+    annotation_text_xray_glyphs: TextOverlayGlyphBuffer,
     meshes: Vec<GpuMesh>,
     instance_batches: Vec<GpuInstanceBatch>,
     pick_targets: Vec<PickHit>,
@@ -1884,7 +2249,8 @@ impl MeshRenderer {
         camera: Camera,
         defaults: RenderDefaults,
     ) -> Self {
-        let camera_uniform = CameraUniform::from_camera(camera, viewport);
+        let clip_plane = None;
+        let camera_uniform = CameraUniform::from_camera(camera, viewport, clip_plane);
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("w camera buffer"),
             contents: bytes_of(&camera_uniform),
@@ -1998,6 +2364,11 @@ impl MeshRenderer {
             label: Some("w inspection context mesh shader"),
             source: wgpu::ShaderSource::Wgsl(INSPECTION_CONTEXT_MESH_SHADER_WGSL.into()),
         });
+        let section_cutaway_context_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("w section cutaway context mesh shader"),
+                source: wgpu::ShaderSource::Wgsl(SECTION_CUTAWAY_CONTEXT_MESH_SHADER_WGSL.into()),
+            });
         let inspection_context_tint_shader =
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("w inspection context tint shader"),
@@ -2104,13 +2475,53 @@ impl MeshRenderer {
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: defaults.depth_format,
                     depth_write_enabled: Some(false),
-                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    depth_compare: Some(defaults.depth_compare),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &inspection_context_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        let section_cutaway_context_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("w section cutaway context mesh pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &section_cutaway_context_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[GpuVertex::layout(), GpuInstance::layout()],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: defaults.front_face,
+                    cull_mode: defaults.cull_mode,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: defaults.depth_format,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(defaults.depth_compare),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &section_cutaway_context_shader,
                     entry_point: Some("fs_main"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     targets: &[Some(wgpu::ColorTargetState {
@@ -2144,7 +2555,7 @@ impl MeshRenderer {
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: defaults.depth_format,
                     depth_write_enabled: Some(false),
-                    depth_compare: Some(defaults.depth_compare),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
@@ -2268,7 +2679,7 @@ impl MeshRenderer {
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: defaults.depth_format,
                     depth_write_enabled: Some(false),
-                    depth_compare: Some(defaults.depth_compare),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
@@ -2286,6 +2697,61 @@ impl MeshRenderer {
                 multiview_mask: None,
                 cache: None,
             });
+        let section_overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("w section overlay shader"),
+            source: wgpu::ShaderSource::Wgsl(SECTION_OVERLAY_SHADER_WGSL.into()),
+        });
+        let section_overlay_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("w section overlay pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &section_overlay_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[GpuSectionOverlayVertex::layout()],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: defaults.front_face,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: defaults.depth_format,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(section_overlay_depth_compare(defaults.depth_compare)),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &section_overlay_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        let annotation_overlay_pipelines =
+            AnnotationOverlayPipelines::new(device, &pipeline_layout, color_format, defaults);
+        let annotation_text_renderer = TextOverlayRenderer::new(
+            device,
+            color_format,
+            defaults.depth_format,
+            &scene_bind_group_layout,
+        );
+        let annotation_text_font =
+            cc_w_text::TextFont::from_bytes(epaint_default_fonts::UBUNTU_LIGHT.to_vec())
+                .expect("bundled renderer text font must be valid");
         let normal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("w screen-space ao normal shader"),
             source: wgpu::ShaderSource::Wgsl(NORMAL_MESH_SHADER_WGSL.into()),
@@ -2760,10 +3226,13 @@ impl MeshRenderer {
             pipeline,
             architectural_pipeline,
             inspection_context_pipeline,
+            section_cutaway_context_pipeline,
             inspection_context_tint_pipeline,
             surface_decal_pipeline,
             architectural_surface_decal_pipeline,
             reference_grid_pipeline,
+            section_overlay_pipeline,
+            annotation_overlay_pipelines,
             normal_pipeline,
             ssao_pipeline,
             edge_pipeline,
@@ -2783,12 +3252,23 @@ impl MeshRenderer {
             ssao_targets: ScreenSpaceAmbientOcclusionTargets::new(device, viewport),
             viewport: viewport.clamped(),
             camera,
+            clip_plane,
             defaults,
             profile: RenderProfileId::Bim,
             inspection_context_alpha_multiplier,
             reference_grid_visible: false,
             reference_grid_vertex_buffer: None,
             reference_grid_vertex_count: 0,
+            section_overlay_vertex_buffer: None,
+            section_overlay_vertex_count: 0,
+            section_overlay_count: 0,
+            annotation_overlays: AnnotationOverlayGpuState::default(),
+            annotation_text_renderer,
+            annotation_text_font,
+            annotation_text_atlas: None,
+            annotation_text_overlay_glyphs: TextOverlayGlyphBuffer::empty(),
+            annotation_text_depth_tested_glyphs: TextOverlayGlyphBuffer::empty(),
+            annotation_text_xray_glyphs: TextOverlayGlyphBuffer::empty(),
             meshes: Vec::new(),
             instance_batches: Vec::new(),
             pick_targets: Vec::new(),
@@ -3041,6 +3521,35 @@ impl MeshRenderer {
         self.camera
     }
 
+    pub fn set_clip_plane(
+        &mut self,
+        queue: &wgpu::Queue,
+        origin: DVec3,
+        normal: DVec3,
+        side: ClipPlaneSide,
+    ) -> Result<(), String> {
+        if side == ClipPlaneSide::None {
+            self.clear_clip_plane(queue);
+            return Ok(());
+        }
+        self.clip_plane = Some(ClipPlaneUniform::from_origin_normal(origin, normal, side)?);
+        self.update_camera(queue);
+        Ok(())
+    }
+
+    pub fn clear_clip_plane(&mut self, queue: &wgpu::Queue) {
+        self.clip_plane = None;
+        self.update_camera(queue);
+    }
+
+    pub fn clip_plane_side(&self) -> ClipPlaneSide {
+        match self.clip_plane.map(|clip| clip.side).unwrap_or(0.0) {
+            side if side > 0.0 => ClipPlaneSide::PositiveNormal,
+            side if side < 0.0 => ClipPlaneSide::NegativeNormal,
+            _ => ClipPlaneSide::None,
+        }
+    }
+
     pub fn defaults(&self) -> RenderDefaults {
         self.defaults
     }
@@ -3072,6 +3581,138 @@ impl MeshRenderer {
 
     pub fn set_reference_grid_visible(&mut self, visible: bool) {
         self.reference_grid_visible = visible;
+    }
+
+    pub fn section_overlay_count(&self) -> u32 {
+        self.section_overlay_count
+    }
+
+    pub fn annotation_layer_count(&self) -> u32 {
+        self.annotation_overlays.layer_count
+    }
+
+    pub fn annotation_primitive_count(&self) -> u32 {
+        self.annotation_overlays.primitive_count
+    }
+
+    pub fn annotation_text_label_count(&self) -> usize {
+        self.annotation_overlays.text_labels.len()
+    }
+
+    pub fn annotation_text_glyph_count(&self) -> u32 {
+        self.annotation_text_overlay_glyphs.glyph_count()
+            + self.annotation_text_depth_tested_glyphs.glyph_count()
+            + self.annotation_text_xray_glyphs.glyph_count()
+    }
+
+    pub fn clear_section_overlays(&mut self) {
+        self.section_overlay_vertex_buffer = None;
+        self.section_overlay_vertex_count = 0;
+        self.section_overlay_count = 0;
+    }
+
+    pub fn set_section_overlays(
+        &mut self,
+        device: &wgpu::Device,
+        overlays: &[SectionOverlay],
+    ) -> Result<(), SectionOverlayError> {
+        let vertices = section_overlay_vertices(overlays)?;
+        self.section_overlay_vertex_count = vertices.len() as u32;
+        self.section_overlay_count = overlays.len() as u32;
+        self.section_overlay_vertex_buffer = (!vertices.is_empty()).then(|| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("w section overlay vertex buffer"),
+                contents: cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
+        Ok(())
+    }
+
+    pub fn clear_annotation_layers(&mut self) {
+        self.annotation_overlays.clear();
+        self.annotation_text_atlas = None;
+        self.annotation_text_overlay_glyphs = TextOverlayGlyphBuffer::empty();
+        self.annotation_text_depth_tested_glyphs = TextOverlayGlyphBuffer::empty();
+        self.annotation_text_xray_glyphs = TextOverlayGlyphBuffer::empty();
+    }
+
+    pub fn set_annotation_layers(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layers: &[SceneAnnotationLayer],
+    ) -> Result<(), AnnotationOverlayError> {
+        let geometry = annotation_overlay_geometry(layers)?;
+        self.upload_annotation_text(device, queue, &geometry.text_labels)?;
+        self.annotation_overlays = AnnotationOverlayGpuState::from_geometry(device, geometry);
+        Ok(())
+    }
+
+    fn upload_annotation_text(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        labels: &[SceneTextLabel],
+    ) -> Result<(), AnnotationOverlayError> {
+        if labels.is_empty() {
+            self.annotation_text_atlas = None;
+            self.annotation_text_overlay_glyphs = TextOverlayGlyphBuffer::empty();
+            self.annotation_text_depth_tested_glyphs = TextOverlayGlyphBuffer::empty();
+            self.annotation_text_xray_glyphs = TextOverlayGlyphBuffer::empty();
+            return Ok(());
+        }
+
+        let mut cpu_atlas = cc_w_text::TextAtlas::new_alpha_mask(2048, 1024, 6);
+        let sdf_radius_px = cpu_atlas.sdf_radius_px() as f32;
+        let mut overlay_instances = Vec::new();
+        let mut depth_tested_instances = Vec::new();
+        let mut xray_instances = Vec::new();
+
+        for (label_index, label) in labels.iter().enumerate() {
+            if !label.anchor.is_finite() {
+                return Err(AnnotationOverlayError::NonFiniteTextAnchor { label_index });
+            }
+            if !label.screen_offset_px.is_finite() {
+                return Err(AnnotationOverlayError::NonFiniteTextOffset { label_index });
+            }
+            if !label.style.size_px.is_finite() || label.style.size_px <= 0.0 {
+                return Err(AnnotationOverlayError::InvalidTextSize { label_index });
+            }
+            let layout = cc_w_text::layout_label(&self.annotation_text_font, &mut cpu_atlas, label)
+                .map_err(|_| AnnotationOverlayError::TextLayout { label_index })?;
+            let outline_width_px = label
+                .style
+                .outline_color
+                .map(|_| (label.style.size_px * 0.08).clamp(1.5, 2.75))
+                .unwrap_or(0.0);
+            let instances =
+                text_glyphs_from_layout(label, &layout, sdf_radius_px, outline_width_px)
+                    .into_iter()
+                    .filter_map(TextGlyph::to_gpu);
+
+            match label.depth_mode {
+                SceneTextDepthMode::Overlay => overlay_instances.extend(instances),
+                SceneTextDepthMode::DepthTested => depth_tested_instances.extend(instances),
+                SceneTextDepthMode::XRay => xray_instances.extend(instances),
+            }
+        }
+
+        self.annotation_text_atlas = Some(TextAtlas::new(
+            device,
+            queue,
+            self.annotation_text_renderer.atlas_bind_group_layout(),
+            TextAtlasDescriptor::sdf_r8(cpu_atlas.width(), cpu_atlas.height()),
+            Some(cpu_atlas.pixels()),
+        ));
+        self.annotation_text_overlay_glyphs =
+            TextOverlayGlyphBuffer::from_gpu_instances(device, &overlay_instances);
+        self.annotation_text_depth_tested_glyphs =
+            TextOverlayGlyphBuffer::from_gpu_instances(device, &depth_tested_instances);
+        self.annotation_text_xray_glyphs =
+            TextOverlayGlyphBuffer::from_gpu_instances(device, &xray_instances);
+
+        Ok(())
     }
 
     pub fn render(
@@ -3128,12 +3769,16 @@ impl MeshRenderer {
         depth_target: &wgpu::TextureView,
         clear_color: wgpu::Color,
     ) {
-        if self.instance_batches.is_empty() {
+        if self.instance_batches.is_empty()
+            && !self.has_section_overlays()
+            && !self.has_annotation_overlays()
+            && !self.has_annotation_text_overlays()
+        {
             return;
         }
 
         let inspection_context_rendering = uses_inspection_context_rendering(self.profile);
-        let needs_depth_sampling = (inspection_context_rendering
+        let needs_profile_depth_sampling = (inspection_context_rendering
             || matches!(
                 self.profile,
                 RenderProfileId::Bim
@@ -3142,6 +3787,10 @@ impl MeshRenderer {
                     | RenderProfileId::ArchitecturalV4
             ))
             && device.is_some();
+        let needs_depth_sampling = needs_profile_depth_sampling
+            || self.has_section_overlays()
+            || self.has_annotation_overlays()
+            || self.has_annotation_text_overlays();
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("w mesh pass"),
@@ -3181,6 +3830,12 @@ impl MeshRenderer {
                 &self.surface_decal_pipeline
             };
             pass.set_bind_group(0, &self.scene_bind_group, &[]);
+
+            if self.reference_grid_visible {
+                self.draw_reference_grid(&mut pass);
+            }
+
+            self.draw_section_cutaway_context(&mut pass);
 
             if inspection_context_rendering {
                 pass.set_pipeline(&self.inspection_context_pipeline);
@@ -3223,10 +3878,6 @@ impl MeshRenderer {
                 pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
             }
 
-            if self.reference_grid_visible {
-                self.draw_reference_grid(&mut pass);
-            }
-
             if self.profile == RenderProfileId::ArchitecturalV1 {
                 self.draw_mesh_edges(&mut pass);
             }
@@ -3259,6 +3910,22 @@ impl MeshRenderer {
                 self.render_screen_space_outline(device, encoder, target, depth_target);
             }
         }
+
+        self.render_section_overlays(encoder, target, depth_target);
+        self.render_annotation_overlays(encoder, target, depth_target);
+        self.render_annotation_text_overlays(encoder, target, depth_target);
+    }
+
+    fn has_section_overlays(&self) -> bool {
+        self.section_overlay_vertex_count > 0 && self.section_overlay_vertex_buffer.is_some()
+    }
+
+    fn has_annotation_overlays(&self) -> bool {
+        self.annotation_overlays.has_vertices()
+    }
+
+    fn has_annotation_text_overlays(&self) -> bool {
+        self.annotation_text_glyph_count() > 0 && self.annotation_text_atlas.is_some()
     }
 
     fn draw_reference_grid<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
@@ -3273,6 +3940,126 @@ impl MeshRenderer {
         pass.set_bind_group(0, &self.scene_bind_group, &[]);
         pass.set_vertex_buffer(0, vertex_buffer.slice(..));
         pass.draw(0..self.reference_grid_vertex_count, 0..1);
+    }
+
+    fn draw_section_cutaway_context<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
+        if self.clip_plane_side() == ClipPlaneSide::None {
+            return;
+        }
+
+        pass.set_pipeline(&self.section_cutaway_context_pipeline);
+        pass.set_bind_group(0, &self.scene_bind_group, &[]);
+        for batch in self
+            .instance_batches
+            .iter()
+            .filter(|batch| batch.render_layer.draws_as_section_cutaway_context())
+        {
+            let mesh = &self.meshes[batch.mesh_index];
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
+            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
+        }
+    }
+
+    fn draw_section_overlays<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
+        let Some(vertex_buffer) = &self.section_overlay_vertex_buffer else {
+            return;
+        };
+        if self.section_overlay_vertex_count == 0 {
+            return;
+        }
+
+        pass.set_pipeline(&self.section_overlay_pipeline);
+        pass.set_bind_group(0, &self.scene_bind_group, &[]);
+        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        pass.draw(0..self.section_overlay_vertex_count, 0..1);
+    }
+
+    fn render_section_overlays(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        depth_target: &wgpu::TextureView,
+    ) {
+        if !self.has_section_overlays() {
+            return;
+        }
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("w section overlay final pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_target,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        self.draw_section_overlays(&mut pass);
+    }
+
+    fn render_annotation_overlays(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        depth_target: &wgpu::TextureView,
+    ) {
+        self.annotation_overlay_pipelines.render(
+            encoder,
+            target,
+            depth_target,
+            &self.scene_bind_group,
+            &self.annotation_overlays,
+        );
+    }
+
+    fn render_annotation_text_overlays(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        depth_target: &wgpu::TextureView,
+    ) {
+        let Some(atlas) = &self.annotation_text_atlas else {
+            return;
+        };
+        self.annotation_text_renderer.render_depth_tested(
+            encoder,
+            target,
+            depth_target,
+            &self.scene_bind_group,
+            atlas,
+            &self.annotation_text_depth_tested_glyphs,
+        );
+        self.annotation_text_renderer.render_xray(
+            encoder,
+            target,
+            depth_target,
+            &self.scene_bind_group,
+            atlas,
+            &self.annotation_text_xray_glyphs,
+        );
+        self.annotation_text_renderer.render_overlay(
+            encoder,
+            target,
+            depth_target,
+            &self.scene_bind_group,
+            atlas,
+            &self.annotation_text_overlay_glyphs,
+        );
     }
 
     fn draw_mesh_edges<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
@@ -3979,7 +4766,7 @@ impl MeshRenderer {
     }
 
     fn update_camera(&self, queue: &wgpu::Queue) {
-        let uniform = CameraUniform::from_camera(self.camera, self.viewport);
+        let uniform = CameraUniform::from_camera(self.camera, self.viewport, self.clip_plane);
         queue.write_buffer(&self.camera_buffer, 0, bytes_of(&uniform));
     }
 
@@ -4024,6 +4811,10 @@ fn depth_compare_equal_variant(compare: wgpu::CompareFunction) -> wgpu::CompareF
         }
         _ => wgpu::CompareFunction::LessEqual,
     }
+}
+
+fn section_overlay_depth_compare(compare: wgpu::CompareFunction) -> wgpu::CompareFunction {
+    depth_compare_equal_variant(compare)
 }
 
 fn surface_decal_depth_bias(compare: wgpu::CompareFunction) -> wgpu::DepthBiasState {
@@ -4082,6 +4873,110 @@ fn reference_grid_vertices(bounds: Bounds3) -> Vec<GpuReferenceGridVertex> {
     }
 
     vertices
+}
+
+fn section_overlay_vertices(
+    overlays: &[SectionOverlay],
+) -> Result<Vec<GpuSectionOverlayVertex>, SectionOverlayError> {
+    let mut vertices = Vec::with_capacity(overlays.len() * 30);
+
+    for (overlay_index, overlay) in overlays.iter().enumerate() {
+        for (component_index, component) in overlay.color.into_iter().enumerate() {
+            if !component.is_finite() {
+                return Err(SectionOverlayError::NonFiniteColor {
+                    overlay_index,
+                    component_index,
+                });
+            }
+        }
+        for (component_index, component) in overlay.border_color.into_iter().enumerate() {
+            if !component.is_finite() {
+                return Err(SectionOverlayError::NonFiniteColor {
+                    overlay_index,
+                    component_index,
+                });
+            }
+        }
+
+        let mut corners = [DVec3::ZERO; 4];
+        for (corner_index, corner) in overlay.corners.into_iter().enumerate() {
+            if ![corner.x, corner.y, corner.z]
+                .into_iter()
+                .all(f64::is_finite)
+            {
+                return Err(SectionOverlayError::NonFiniteCorner {
+                    overlay_index,
+                    corner_index,
+                });
+            }
+            corners[corner_index] = corner;
+        }
+
+        push_section_overlay_quad(&mut vertices, corners, overlay.color);
+
+        let center = (corners[0] + corners[1] + corners[2] + corners[3]) * 0.25;
+        if let Some(width) = section_overlay_border_width(&corners) {
+            for [start, end] in [[0, 1], [1, 2], [2, 3], [3, 0]] {
+                push_section_overlay_border_strip(
+                    &mut vertices,
+                    corners[start],
+                    corners[end],
+                    center,
+                    width,
+                    overlay.border_color,
+                );
+            }
+        }
+    }
+
+    Ok(vertices)
+}
+
+fn push_section_overlay_quad(
+    vertices: &mut Vec<GpuSectionOverlayVertex>,
+    corners: [DVec3; 4],
+    color: [f32; 4],
+) {
+    for corner_index in [0, 1, 2, 0, 2, 3] {
+        let corner = corners[corner_index];
+        vertices.push(GpuSectionOverlayVertex {
+            position: [corner.x as f32, corner.y as f32, corner.z as f32],
+            color,
+        });
+    }
+}
+
+fn section_overlay_border_width(corners: &[DVec3; 4]) -> Option<f64> {
+    let shortest_edge = [0, 1, 2, 3]
+        .into_iter()
+        .map(|corner_index| {
+            let next_index = (corner_index + 1) % 4;
+            corners[corner_index].distance(corners[next_index])
+        })
+        .filter(|distance| distance.is_finite() && *distance > 0.0)
+        .fold(f64::INFINITY, f64::min);
+
+    shortest_edge
+        .is_finite()
+        .then(|| (shortest_edge * 0.018).clamp(0.04, 0.6))
+}
+
+fn push_section_overlay_border_strip(
+    vertices: &mut Vec<GpuSectionOverlayVertex>,
+    start: DVec3,
+    end: DVec3,
+    center: DVec3,
+    width: f64,
+    color: [f32; 4],
+) {
+    let edge = end - start;
+    let inward = center - (start + end) * 0.5;
+    if edge.length_squared() <= f64::EPSILON || inward.length_squared() <= f64::EPSILON {
+        return;
+    }
+
+    let inward = inward.normalize() * width;
+    push_section_overlay_quad(vertices, [start, end, end + inward, start + inward], color);
 }
 
 fn reference_grid_line_alpha(coordinate: f64, major_spacing: f64) -> f32 {
@@ -4501,7 +5396,8 @@ mod tests {
     use cc_w_types::{
         Bounds3, DisplayColor, GeometryDefinitionId, GeometryInstanceId, PreparedMaterial,
         PreparedRenderDefinition, PreparedRenderInstance, PreparedRenderRole, PreparedRenderScene,
-        PreparedVertex, WORLD_UP,
+        PreparedVertex, SceneAnnotationLayer, SceneAnnotationPrimitive, SceneMarker, ScenePolyline,
+        SceneTextLabel, WORLD_UP,
     };
     use glam::DVec3;
 
@@ -4517,6 +5413,52 @@ mod tests {
         assert_eq!(
             defaults.directional_light.direction,
             Vec3::new(0.35, -0.45, 0.82)
+        );
+    }
+
+    #[test]
+    fn section_overlay_depth_compare_respects_existing_reverse_z_depth() {
+        assert_eq!(
+            section_overlay_depth_compare(wgpu::CompareFunction::Greater),
+            wgpu::CompareFunction::GreaterEqual
+        );
+        assert_eq!(
+            section_overlay_depth_compare(wgpu::CompareFunction::Less),
+            wgpu::CompareFunction::LessEqual
+        );
+    }
+
+    #[test]
+    fn clip_plane_uniform_encodes_explicit_plane_side() {
+        let clip = ClipPlaneUniform::from_origin_normal(
+            DVec3::new(0.0, 5.0, 0.0),
+            DVec3::new(0.0, 2.0, 0.0),
+            ClipPlaneSide::PositiveNormal,
+        )
+        .expect("valid clip plane");
+
+        assert_eq!(clip.plane, [0.0, 1.0, 0.0, -5.0]);
+        assert_eq!(clip.side, 1.0);
+
+        let reverse = ClipPlaneUniform::from_origin_normal(
+            DVec3::new(0.0, 5.0, 0.0),
+            DVec3::new(0.0, 2.0, 0.0),
+            ClipPlaneSide::NegativeNormal,
+        )
+        .expect("valid clip plane");
+        assert_eq!(reverse.side, -1.0);
+    }
+
+    #[test]
+    fn clip_plane_uniform_rejects_missing_explicit_normal() {
+        assert_eq!(
+            ClipPlaneUniform::from_origin_normal(
+                DVec3::ZERO,
+                DVec3::ZERO,
+                ClipPlaneSide::PositiveNormal,
+            )
+            .unwrap_err(),
+            "clip plane normal must be non-zero"
         );
     }
 
@@ -4647,6 +5589,71 @@ mod tests {
     }
 
     #[test]
+    fn section_overlay_vertices_build_two_triangles_from_world_corners() {
+        let overlay = SectionOverlay::new([
+            DVec3::new(0.0, 0.0, 1.0),
+            DVec3::new(2.0, 0.0, 1.0),
+            DVec3::new(2.0, 3.0, 1.0),
+            DVec3::new(0.0, 3.0, 1.0),
+        ])
+        .with_color([0.1, 0.2, 0.3, 0.4]);
+
+        let vertices = section_overlay_vertices(&[overlay]).expect("valid overlay");
+
+        assert_eq!(vertices.len(), 30);
+        assert_eq!(vertices[0].position, [0.0, 0.0, 1.0]);
+        assert_eq!(vertices[1].position, [2.0, 0.0, 1.0]);
+        assert_eq!(vertices[2].position, [2.0, 3.0, 1.0]);
+        assert_eq!(vertices[3].position, [0.0, 0.0, 1.0]);
+        assert_eq!(vertices[4].position, [2.0, 3.0, 1.0]);
+        assert_eq!(vertices[5].position, [0.0, 3.0, 1.0]);
+        assert!(
+            vertices[..6]
+                .iter()
+                .all(|vertex| vertex.color == overlay.color)
+        );
+        assert!(
+            vertices[6..]
+                .iter()
+                .all(|vertex| vertex.color == overlay.border_color)
+        );
+    }
+
+    #[test]
+    fn section_overlay_vertices_reject_non_finite_inputs() {
+        let overlay = SectionOverlay::new([
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(f64::INFINITY, 0.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+        ]);
+
+        assert_eq!(
+            section_overlay_vertices(&[overlay]).unwrap_err(),
+            SectionOverlayError::NonFiniteCorner {
+                overlay_index: 0,
+                corner_index: 1,
+            }
+        );
+
+        let overlay = SectionOverlay::new([
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+        ])
+        .with_color([0.1, f32::NAN, 0.3, 0.4]);
+
+        assert_eq!(
+            section_overlay_vertices(&[overlay]).unwrap_err(),
+            SectionOverlayError::NonFiniteColor {
+                overlay_index: 0,
+                component_index: 1,
+            }
+        );
+    }
+
+    #[test]
     fn reference_grid_spacing_uses_metric_decades() {
         assert_eq!(metric_reference_grid_spacing(0.006), 0.01);
         assert_eq!(metric_reference_grid_spacing(0.08), 0.1);
@@ -4720,6 +5727,27 @@ mod tests {
         assert!(surface_decal_layer.draws_as_surface_decal(false));
         assert!(!surface_decal_layer.draws_as_surface_decal(true));
         assert!(!surface_decal_layer.picks_as_surface_decal());
+    }
+
+    #[test]
+    fn all_render_layers_can_draw_section_cutaway_context() {
+        for layer in [
+            RenderLayer::Opaque,
+            RenderLayer::SurfaceDecal,
+            RenderLayer::InspectionContextOpaque,
+            RenderLayer::InspectionContextSurfaceDecal,
+        ] {
+            assert!(layer.draws_as_section_cutaway_context());
+        }
+    }
+
+    #[test]
+    fn section_cutaway_shader_draws_only_the_clipped_away_side() {
+        assert!(
+            SECTION_CUTAWAY_CONTEXT_MESH_SHADER_WGSL
+                .contains("section_distance * camera.clip_params.x <= 0.0")
+        );
+        assert!(SECTION_CUTAWAY_CONTEXT_MESH_SHADER_WGSL.contains("camera.clip_params.x == 0.0"));
     }
 
     #[test]
@@ -5070,6 +6098,61 @@ mod tests {
             assert_eq!(renderer.instance_batches[1].instance_count, 1);
             assert!(renderer.reference_grid_vertex_buffer.is_some());
             assert!(renderer.reference_grid_vertex_count > 0);
+
+            let section = SectionOverlay::new([
+                DVec3::new(0.0, 1.0, 3.5),
+                DVec3::new(7.0, 1.0, 3.5),
+                DVec3::new(7.0, 3.0, 3.5),
+                DVec3::new(0.0, 3.0, 3.5),
+            ]);
+            renderer
+                .set_section_overlays(&device, &[section])
+                .expect("section overlay upload");
+            assert_eq!(renderer.section_overlay_count(), 1);
+            assert_eq!(renderer.section_overlay_vertex_count, 30);
+            assert!(renderer.section_overlay_vertex_buffer.is_some());
+            renderer.clear_section_overlays();
+            assert_eq!(renderer.section_overlay_count(), 0);
+            assert!(renderer.section_overlay_vertex_buffer.is_none());
+
+            let mut annotation_layer = SceneAnnotationLayer::new("dimensions");
+            annotation_layer.primitives = vec![
+                SceneAnnotationPrimitive::Polyline(ScenePolyline::new(
+                    "span",
+                    vec![DVec3::new(0.0, 0.0, 3.0), DVec3::new(2.0, 0.0, 3.0)],
+                )),
+                SceneAnnotationPrimitive::Marker(SceneMarker::new(
+                    "endpoint",
+                    DVec3::new(2.0, 0.0, 3.0),
+                )),
+                SceneAnnotationPrimitive::Text(SceneTextLabel::new(
+                    "span-label",
+                    "2.0",
+                    DVec3::new(1.0, 0.0, 3.0),
+                )),
+            ];
+            renderer
+                .set_annotation_layers(&device, &queue, &[annotation_layer])
+                .expect("annotation overlay upload");
+            assert_eq!(renderer.annotation_layer_count(), 1);
+            assert_eq!(renderer.annotation_primitive_count(), 3);
+            assert_eq!(renderer.annotation_text_label_count(), 1);
+            assert!(renderer.annotation_text_glyph_count() > 0);
+            assert_eq!(
+                renderer
+                    .annotation_overlays
+                    .polyline_depth_tested_vertex_count,
+                6
+            );
+            assert_eq!(
+                renderer
+                    .annotation_overlays
+                    .marker_depth_tested_vertex_count,
+                6
+            );
+            renderer.clear_annotation_layers();
+            assert_eq!(renderer.annotation_layer_count(), 0);
+            assert!(!renderer.annotation_overlays.has_vertices());
         });
     }
 

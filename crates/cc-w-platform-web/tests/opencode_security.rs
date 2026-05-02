@@ -75,6 +75,91 @@ fn backticked_tokens(text: &str) -> BTreeSet<String> {
     tokens
 }
 
+fn ifc_tool_export_suffixes() -> BTreeSet<String> {
+    read_repo_file(".opencode/tools/ifc.ts")
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix("export const ")?;
+            let name = rest.split_whitespace().next()?.trim_end_matches('=');
+            (!name.is_empty()).then_some(name.to_owned())
+        })
+        .collect()
+}
+
+fn public_ifc_tool_names() -> BTreeSet<String> {
+    ifc_tool_export_suffixes()
+        .into_iter()
+        .map(|suffix| format!("ifc_{suffix}"))
+        .collect()
+}
+
+fn assert_no_bare_ifc_export_names(body: &str, context: &str) {
+    let backticked_tokens = backticked_tokens(body);
+    for suffix in ifc_tool_export_suffixes() {
+        assert!(
+            !backticked_tokens.contains(&suffix),
+            "{context} should not mention bare OpenCode export suffix `{suffix}`; use `ifc_{suffix}`"
+        );
+    }
+}
+
+#[test]
+fn opencode_ifc_tools_have_one_public_prefix_convention() {
+    let tool_files: BTreeSet<String> = fs::read_dir(repo_root().join(".opencode/tools"))
+        .expect("runtime OpenCode tools directory should exist")
+        .map(|entry| {
+            entry
+                .expect("tool directory entry should be readable")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name.ends_with(".ts"))
+        .collect();
+
+    assert_eq!(
+        tool_files,
+        BTreeSet::from(["ifc.ts".to_owned()]),
+        "runtime OpenCode tools should live under the single `ifc` namespace"
+    );
+
+    let suffixes = ifc_tool_export_suffixes();
+    assert!(
+        suffixes.contains("alignment_catalog"),
+        "the IFC tool module should define the alignment catalog suffix"
+    );
+    assert!(
+        suffixes.contains("station_resolve"),
+        "the IFC tool module should define the station resolve suffix"
+    );
+    assert!(
+        suffixes.contains("viewer_section_set"),
+        "the IFC tool module should define the viewer section suffix"
+    );
+    assert!(
+        suffixes.contains("viewer_annotations_show_path"),
+        "the IFC tool module should define the path annotation viewer suffix"
+    );
+    assert!(
+        suffixes.iter().all(|suffix| !suffix.starts_with("ifc_")),
+        "exports in `.opencode/tools/ifc.ts` are namespace suffixes; do not double-prefix them"
+    );
+
+    let public_tools = public_ifc_tool_names();
+    for tool in [
+        "ifc_alignment_catalog",
+        "ifc_station_resolve",
+        "ifc_section_intersections",
+        "ifc_viewer_section_set",
+        "ifc_viewer_annotations_show_path",
+    ] {
+        assert!(
+            public_tools.contains(tool),
+            "`{tool}` should be a public OpenCode tool name derived from the `ifc` module"
+        );
+    }
+}
+
 #[test]
 fn opencode_config_is_deny_by_default_and_seeded_with_gpt_5_4() {
     let config: Value = serde_json::from_str(&read_repo_file("tools/opencode/opencode.json"))
@@ -127,7 +212,7 @@ fn opencode_config_is_deny_by_default_and_seeded_with_gpt_5_4() {
 }
 
 #[test]
-fn ifc_agent_config_is_deny_by_default_and_allows_compatibility_aliases() {
+fn ifc_agent_config_is_deny_by_default_and_allows_only_canonical_ifc_tools() {
     let agent = read_repo_file("agent/agents/ifc-explorer.md");
     let (frontmatter, body) = split_frontmatter(&agent);
     let permissions = parse_permission_map(frontmatter);
@@ -142,31 +227,21 @@ fn ifc_agent_config_is_deny_by_default_and_allows_compatibility_aliases() {
         Some("allow"),
         "the IFC agent should allow the IFC tool family"
     );
-    assert_eq!(
-        permissions.get("entity_search").map(String::as_str),
-        Some("allow"),
-        "the IFC agent should allow the entity_search compatibility alias"
-    );
-    assert_eq!(
-        permissions.get("properties").map(String::as_str),
-        Some("allow"),
-        "the IFC agent should allow the properties compatibility alias"
+    assert!(
+        !permissions.contains_key("entity_search") && !permissions.contains_key("properties"),
+        "the IFC agent should not expose unprefixed tool names"
     );
 
     assert!(
-        permissions.iter().all(|(key, value)| key == "*"
-            || key == "ifc_*"
-            || key == "entity_search"
-            || key == "properties"
-            || value == "deny"),
-        "the IFC agent should not grant any extra permissions beyond the canonical IFC tools and the two compatibility aliases"
+        permissions
+            .iter()
+            .all(|(key, value)| key == "*" || key == "ifc_*" || value == "deny"),
+        "the IFC agent should not grant any extra permissions beyond the canonical IFC tools"
     );
 
     let backticked_tokens = backticked_tokens(body);
     for token in [
         "ifc_*",
-        "entity_search",
-        "properties",
         "ifc_entity_reference",
         "ifc_query_playbook",
         "ifc_readonly_cypher",
@@ -178,6 +253,11 @@ fn ifc_agent_config_is_deny_by_default_and_allows_compatibility_aliases() {
             "the agent body should mention `{token}`"
         );
     }
+    assert!(
+        !backticked_tokens.contains("entity_search") && !backticked_tokens.contains("properties"),
+        "the IFC agent body should not mention unprefixed tool names"
+    );
+    assert_no_bare_ifc_export_names(body, "the IFC agent body");
 }
 
 #[test]
@@ -198,11 +278,11 @@ fn strict_ifc_agent_config_is_deny_by_default_and_mentions_only_canonical_ifc_to
     );
     assert!(
         !permissions.contains_key("entity_search"),
-        "the strict IFC agent should not expose the compatibility alias"
+        "the strict IFC agent should not expose unprefixed tool names"
     );
     assert!(
         !permissions.contains_key("properties"),
-        "the strict IFC agent should not expose the compatibility alias"
+        "the strict IFC agent should not expose unprefixed tool names"
     );
     assert!(
         permissions
@@ -235,8 +315,9 @@ fn strict_ifc_agent_config_is_deny_by_default_and_mentions_only_canonical_ifc_to
     }
     assert!(
         !backticked_tokens.contains("entity_search") && !backticked_tokens.contains("properties"),
-        "the strict agent body should not mention compatibility aliases"
+        "the strict agent body should not mention unprefixed tool names"
     );
+    assert_no_bare_ifc_export_names(body, "the strict IFC agent body");
     assert!(
         body.contains("What schema are we using?"),
         "the strict agent body should include the schema example"

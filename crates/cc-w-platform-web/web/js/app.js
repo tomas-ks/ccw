@@ -101,6 +101,15 @@ init()
     window.ids = repl.ids;
     window.viewState = repl.viewState;
     window.state = repl.state;
+    window.sceneBounds = repl.sceneBounds;
+    window.section = repl.section;
+    window.setSection = repl.setSection;
+    window.clearSection = repl.clearSection;
+    window.sectionState = repl.sectionState;
+    window.annotations = repl.annotations;
+    window.setAnnotationLayer = repl.setAnnotationLayer;
+    window.clearAnnotations = repl.clearAnnotations;
+    window.annotationsState = repl.annotationsState;
     window.setViewMode = repl.setViewMode;
     window.defaultView = repl.defaultView;
     window.allView = repl.allView;

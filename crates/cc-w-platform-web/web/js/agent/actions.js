@@ -45,6 +45,29 @@ export function agentDbNodeIds(action) {
   );
 }
 
+function agentPathAnnotation(action, resource) {
+  const path = tryGetFirst(action, ["path"]);
+  if (!path || typeof path !== "object" || Array.isArray(path)) {
+    return null;
+  }
+  const annotation = {
+    resource,
+    path,
+  };
+  for (const [target, keys] of [
+    ["line", ["line", "line_range", "lineRange", "line_ranges", "lineRanges", "ranges"]],
+    ["markers", ["markers", "marker_groups", "markerGroups"]],
+    ["mode", ["mode", "operation", "update", "behavior"]],
+    ["max_samples", ["max_samples", "maxSamples"]],
+  ]) {
+    const value = tryGetFirst(action, keys);
+    if (value !== undefined && value !== null && value !== "") {
+      annotation[target] = value;
+    }
+  }
+  return annotation;
+}
+
 export function createAgentActionApplier({
   viewer,
   graph,
@@ -245,6 +268,65 @@ export function createAgentActionApplier({
     if (kind === "viewer.clear_inspection" || kind === "viewer.clearinspection") {
       viewer.clearInspection();
       return "viewer.clear_inspection";
+    }
+
+    if (
+      kind === "viewer.section.set" ||
+      kind === "viewer.sectionset" ||
+      kind === "section.set" ||
+      kind === "sectionset"
+    ) {
+      const section = tryGetFirst(action, ["section", "spec"]);
+      if (!section || typeof section !== "object" || Array.isArray(section)) {
+        return null;
+      }
+      viewer.section.set(section);
+      return "viewer.section.set";
+    }
+
+    if (
+      kind === "viewer.section.clear" ||
+      kind === "viewer.sectionclear" ||
+      kind === "section.clear" ||
+      kind === "sectionclear"
+    ) {
+      viewer.section.clear();
+      return "viewer.section.clear";
+    }
+
+    if (kind === "viewer.annotations.show_path" || kind === "viewer.annotations.showpath") {
+      const resource = agentActionResource(action);
+      if (!isIfcResource(resource)) {
+        return null;
+      }
+      const annotation = agentPathAnnotation(action, resource);
+      if (!annotation) {
+        return null;
+      }
+      const annotations = viewer.annotations;
+      if (typeof annotations?.showPath === "function") {
+        await annotations.showPath(annotation);
+        return "viewer.annotations.show_path";
+      }
+      if (typeof annotations?.show_path === "function") {
+        await annotations.show_path(annotation);
+        return "viewer.annotations.show_path";
+      }
+      return null;
+    }
+
+    if (
+      kind === "viewer.annotations.clear" ||
+      kind === "viewer.annotationsclear" ||
+      kind === "annotations.clear"
+    ) {
+      const resource = agentActionResource(action);
+      const annotations = viewer.annotations;
+      if (typeof annotations?.clear === "function") {
+        annotations.clear({ resource });
+        return "viewer.annotations.clear";
+      }
+      return null;
     }
 
     return null;

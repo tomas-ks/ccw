@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Text Overlay Visual Fixture</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0f131a;
+        --panel: #151b24;
+        --panel-2: #1c2430;
+        --text: #edf4ff;
+        --muted: #9caabe;
+        --line: #2a3544;
+        --accent: #8fd3ff;
+        --warn: #ffc66f;
+        --preview-width: 1200px;
+        --preview-height: 760px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--bg);
+        color: var(--text);
+        font-family:
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+      }
+
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 18px 22px;
+        border-bottom: 1px solid var(--line);
+        background: var(--panel);
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 18px;
+        font-weight: 700;
+      }
+
+      main {
+        display: grid;
+        grid-template-columns: minmax(280px, 380px) minmax(0, 1fr);
+        min-height: calc(100vh - 62px);
+      }
+
+      aside {
+        padding: 22px;
+        border-right: 1px solid var(--line);
+        background: var(--panel);
+      }
+
+      section {
+        padding: 22px;
+        overflow: auto;
+      }
+
+      p {
+        margin: 0 0 14px;
+        color: var(--muted);
+        line-height: 1.45;
+      }
+
+      code,
+      pre {
+        font-family:
+          "SFMono-Regular",
+          Consolas,
+          "Liberation Mono",
+          Menlo,
+          monospace;
+      }
+
+      pre {
+        margin: 12px 0 20px;
+        padding: 14px;
+        overflow: auto;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #0b0f15;
+        color: #dce7f7;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      .preview {
+        width: var(--preview-width);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel-2);
+        overflow: hidden;
+      }
+
+      .preview img {
+        display: block;
+        width: var(--preview-width);
+        height: var(--preview-height);
+        max-width: none;
+        image-rendering: auto;
+      }
+
+      .missing {
+        display: none;
+        padding: 26px;
+        color: var(--warn);
+      }
+
+      .note {
+        color: var(--accent);
+      }
+
+      .pixel-status {
+        margin: 0 0 14px;
+        color: var(--accent);
+        font-size: 13px;
+      }
+
+      @media (max-width: 860px) {
+        main {
+          grid-template-columns: 1fr;
+        }
+
+        aside {
+          border-right: 0;
+          border-bottom: 1px solid var(--line);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Text Overlay Visual Fixture</h1>
+      <span class="note">SDF glyphs from cc-w-render text layout</span>
+    </header>
+    <main>
+      <aside>
+        <p>
+          This page previews the Rust text overlay fixture. It is meant for
+          quick visual QA of glyph size, edge crispness, outline behavior, and
+          atlas packing. The PNG is generated from the same font layout and SDF
+          atlas used by the renderer.
+        </p>
+        <p>Regenerate the PNG from the repo root:</p>
+        <pre>CC_W_TEXT_OVERLAY_VISUAL_OUT=crates/cc-w-render/visual/text-overlay/text-overlay.png \
+cargo test -p cc-w-render dump_text_glyph_visual_fixture -- --ignored</pre>
+        <p>
+          Then open this <code>index.html</code> file directly in a browser.
+          The page sizes the PNG by <code>devicePixelRatio</code>, so one image
+          pixel maps to one physical screen pixel. Keep browser zoom at 100% for
+          pixel-level QA.
+        </p>
+      </aside>
+      <section>
+        <div id="pixel-status" class="pixel-status">Measuring display pixel ratio...</div>
+        <div class="preview">
+          <img
+            id="fixture-image"
+            src="text-overlay.png"
+            width="1200"
+            height="760"
+            alt="Rendered text overlay glyph fixture"
+            onerror="this.style.display='none'; document.querySelector('.missing').style.display='block';"
+          />
+          <div class="missing">
+            No <code>text-overlay.png</code> found yet. Run the command on the
+            left to generate it.
+          </div>
+        </div>
+      </section>
+    </main>
+    <script>
+      const img = document.getElementById("fixture-image");
+      const status = document.getElementById("pixel-status");
+
+      function syncPixelPerfectSize() {
+        if (!img || !img.naturalWidth || !img.naturalHeight) return;
+        const dpr = window.devicePixelRatio || 1;
+        const cssWidth = img.naturalWidth / dpr;
+        const cssHeight = img.naturalHeight / dpr;
+        document.documentElement.style.setProperty("--preview-width", `${cssWidth}px`);
+        document.documentElement.style.setProperty("--preview-height", `${cssHeight}px`);
+        status.textContent = `1 image pixel = 1 physical screen pixel. PNG ${img.naturalWidth} x ${img.naturalHeight}, DPR ${dpr.toFixed(2)}, CSS ${Math.round(cssWidth)} x ${Math.round(cssHeight)}.`;
+      }
+
+      img?.addEventListener("load", syncPixelPerfectSize);
+      window.addEventListener("resize", syncPixelPerfectSize);
+      syncPixelPerfectSize();
+    </script>
+  </body>
+</html>

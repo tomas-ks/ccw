@@ -4,6 +4,8 @@ mod agent_error_log;
 mod agent_executor;
 #[path = "server/agent_query_log.rs"]
 mod agent_query_log;
+#[path = "server/alignment_annotations.rs"]
+mod alignment_annotations;
 #[path = "server/opencode_acp.rs"]
 mod opencode_acp;
 #[path = "server/opencode_executor.rs"]
@@ -86,6 +88,7 @@ const PACKAGE_API_PATH: &str = "/api/package";
 const GEOMETRY_CATALOG_API_PATH: &str = "/api/geometry/catalog";
 const GEOMETRY_INSTANCES_API_PATH: &str = "/api/geometry/instances";
 const GEOMETRY_DEFINITIONS_API_PATH: &str = "/api/geometry/definitions";
+const PATH_ANNOTATIONS_API_PATH: &str = "/api/annotations/path";
 const MAX_GEOMETRY_BATCH_IDS: usize = 5_000;
 const GEOMETRY_INSTANCE_IDS_FIELD: &str = "instance_ids";
 const GEOMETRY_DEFINITION_IDS_FIELD: &str = "definition_ids";
@@ -1340,6 +1343,29 @@ enum AgentUiAction {
     ViewerFrameVisible,
     #[serde(rename = "viewer.clear_inspection")]
     ViewerClearInspection,
+    #[serde(rename = "viewer.section.set")]
+    ViewerSectionSet { section: serde_json::Value },
+    #[serde(rename = "viewer.section.clear")]
+    ViewerSectionClear,
+    #[serde(rename = "viewer.annotations.show_path")]
+    ViewerAnnotationsShowPath {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+        path: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        markers: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_samples: Option<serde_json::Value>,
+    },
+    #[serde(rename = "viewer.annotations.clear")]
+    ViewerAnnotationsClear {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -1854,6 +1880,7 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<ServerState>) -> Result<
                 || request_path == GEOMETRY_CATALOG_API_PATH
                 || request_path == GEOMETRY_INSTANCES_API_PATH
                 || request_path == GEOMETRY_DEFINITIONS_API_PATH
+                || request_path == PATH_ANNOTATIONS_API_PATH
                 || request_path == GRAPH_SUBGRAPH_API_PATH
                 || request_path == GRAPH_NODE_PROPERTIES_API_PATH
                 || request_path == AGENT_CAPABILITIES_API_PATH
@@ -1865,7 +1892,7 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<ServerState>) -> Result<
                 write_json_error(
                     &mut stream,
                     "405 Method Not Allowed",
-                    "use POST for package, geometry, cypher, graph, and agent API routes",
+                    "use POST for package, geometry, annotations, cypher, graph, and agent API routes",
                 )
             } else {
                 serve_path(
@@ -1887,6 +1914,9 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<ServerState>) -> Result<
         }
         "POST" if request_path == GEOMETRY_DEFINITIONS_API_PATH => {
             serve_geometry_definitions_api(&mut stream, &request, state)
+        }
+        "POST" if request_path == PATH_ANNOTATIONS_API_PATH => {
+            alignment_annotations::serve_alignment_annotations_api(&mut stream, &request, state)
         }
         "POST" if request_path == CYPHER_API_PATH => serve_cypher_api(&mut stream, &request, state),
         "POST" if request_path == GRAPH_SUBGRAPH_API_PATH => {
@@ -5400,6 +5430,28 @@ fn agent_ui_action_from_backend(action: BackendAgentUiAction) -> AgentUiAction {
         },
         BackendAgentUiAction::ViewerFrameVisible => AgentUiAction::ViewerFrameVisible,
         BackendAgentUiAction::ViewerClearInspection => AgentUiAction::ViewerClearInspection,
+        BackendAgentUiAction::ViewerSectionSet { section } => {
+            AgentUiAction::ViewerSectionSet { section }
+        }
+        BackendAgentUiAction::ViewerSectionClear => AgentUiAction::ViewerSectionClear,
+        BackendAgentUiAction::ViewerAnnotationsShowPath {
+            resource,
+            path,
+            line,
+            markers,
+            mode,
+            max_samples,
+        } => AgentUiAction::ViewerAnnotationsShowPath {
+            resource,
+            path,
+            line,
+            markers,
+            mode,
+            max_samples,
+        },
+        BackendAgentUiAction::ViewerAnnotationsClear { resource } => {
+            AgentUiAction::ViewerAnnotationsClear { resource }
+        }
     }
 }
 
@@ -5801,6 +5853,20 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
     let mut inspect_modes_present = HashSet::new();
     let mut frame_visible_present = false;
     let mut clear_inspection_present = false;
+    let mut section_set_present = false;
+    let mut section_clear_present = false;
+    let mut latest_section = None::<serde_json::Value>;
+    let mut annotations_show_present = false;
+    let mut annotations_clear_present = false;
+    let mut latest_path_annotation = None::<(
+        Option<String>,
+        serde_json::Value,
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+    )>;
+    let mut latest_annotations_clear_resource = None::<Option<String>>;
     let mut order = Vec::new();
 
     for action in actions {
@@ -5917,6 +5983,40 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                     clear_inspection_present = true;
                 }
             }
+            AgentUiAction::ViewerSectionSet { section } => {
+                if !section_set_present {
+                    order.push(10u8);
+                    section_set_present = true;
+                }
+                latest_section = Some(section);
+            }
+            AgentUiAction::ViewerSectionClear => {
+                if !section_clear_present {
+                    order.push(11u8);
+                    section_clear_present = true;
+                }
+            }
+            AgentUiAction::ViewerAnnotationsShowPath {
+                resource,
+                path,
+                line,
+                markers,
+                mode,
+                max_samples,
+            } => {
+                if !annotations_show_present {
+                    order.push(12u8);
+                    annotations_show_present = true;
+                }
+                latest_path_annotation = Some((resource, path, line, markers, mode, max_samples));
+            }
+            AgentUiAction::ViewerAnnotationsClear { resource } => {
+                if !annotations_clear_present {
+                    order.push(13u8);
+                    annotations_clear_present = true;
+                }
+                latest_annotations_clear_resource = Some(resource);
+            }
         }
     }
 
@@ -6003,6 +6103,29 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
             }
             8 => normalized.push(AgentUiAction::ViewerFrameVisible),
             9 => normalized.push(AgentUiAction::ViewerClearInspection),
+            10 => {
+                if let Some(section) = latest_section.clone() {
+                    normalized.push(AgentUiAction::ViewerSectionSet { section });
+                }
+            }
+            11 => normalized.push(AgentUiAction::ViewerSectionClear),
+            12 => {
+                if let Some((resource, path, line, markers, mode, max_samples)) =
+                    latest_path_annotation.clone()
+                {
+                    normalized.push(AgentUiAction::ViewerAnnotationsShowPath {
+                        resource,
+                        path,
+                        line,
+                        markers,
+                        mode,
+                        max_samples,
+                    });
+                }
+            }
+            13 => normalized.push(AgentUiAction::ViewerAnnotationsClear {
+                resource: latest_annotations_clear_resource.clone().flatten(),
+            }),
             _ => {}
         }
     }
@@ -7142,12 +7265,12 @@ mod tests {
         AgentSessionApiRequest, AgentTranscriptEvent, AgentTranscriptEventKind,
         AgentTurnApiRequest, AgentUiAction, CypherResourceScope, CypherResourceTarget,
         CypherWorkerConfig, DEFAULT_CYPHER_WORKER_TIMEOUT_MS, GraphSubgraphMode,
-        InspectionUpdateMode,
-        PROJECT_BRIDGE_FOR_MINND_MEMBERS, PROJECT_BUILDING_MEMBERS, PROJECT_GEOMETRY_LOCAL_ID_MASK,
-        PROJECT_INFRA_MEMBERS, ProjectResourceConfigFile, ProjectResourceRegistry, ServerState,
-        add_cypher_source_provenance, agent_capabilities_response, agent_model_provider,
-        agent_turn_selection_summary, available_server_resources, candidate_ports,
-        content_type_for_path, create_agent_session_api, dedup_sorted_ids, default_level_for_model,
+        InspectionUpdateMode, PROJECT_BRIDGE_FOR_MINND_MEMBERS, PROJECT_BUILDING_MEMBERS,
+        PROJECT_GEOMETRY_LOCAL_ID_MASK, PROJECT_INFRA_MEMBERS, ProjectResourceConfigFile,
+        ProjectResourceRegistry, ServerState, add_cypher_source_provenance,
+        agent_capabilities_response, agent_model_provider, agent_turn_selection_summary,
+        available_server_resources, candidate_ports, content_type_for_path,
+        create_agent_session_api, dedup_sorted_ids, default_level_for_model,
         discovered_levels_by_model, execute_agent_turn_api, extract_db_node_ids,
         extract_project_semantic_element_ids, extract_semantic_element_ids,
         format_user_facing_agent_error, geometry_definition_batch_api_response,
