@@ -77,6 +77,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     "--debug" => options.release = false,
                     "--release" => options.release = true,
+                    "--debug-artifacts" => options.debug_artifacts = true,
+                    "--no-debug-artifacts" => options.debug_artifacts = false,
                     "--replace-existing" => options.replace_existing = true,
                     _ => return Err(format!("unknown option for import: {arg}").into()),
                 }
@@ -125,6 +127,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     "--debug" => options.release = false,
                     "--release" => options.release = true,
+                    "--debug-artifacts" => options.debug_artifacts = true,
+                    "--no-debug-artifacts" => options.debug_artifacts = false,
                     "--replace-existing" => options.replace_existing = true,
                     _ => return Err(format!("unknown option for import-fixtures: {arg}").into()),
                 }
@@ -595,10 +599,10 @@ fn print_usage() {
     println!("  list-fixtures");
     println!("  sync-fixtures [--velr-ifc-root <path>] [--fixtures-root <path>]");
     println!(
-        "  import (--fixture <slug> | --ifc <path>) [--model <slug>] [--artifacts-root <path>] [--velr-ifc-root <path>] [--debug] [--replace-existing]"
+        "  import (--fixture <slug> | --ifc <path>) [--model <slug>] [--artifacts-root <path>] [--velr-ifc-root <path>] [--debug] [--debug-artifacts|--no-debug-artifacts] [--replace-existing]"
     );
     println!(
-        "  import-fixtures [--artifacts-root <path>] [--velr-ifc-root <path>] [--debug] [--replace-existing]"
+        "  import-fixtures [--artifacts-root <path>] [--velr-ifc-root <path>] [--debug] [--debug-artifacts|--no-debug-artifacts] [--replace-existing]"
     );
     println!("  clear-artifacts (--model <slug> | --all) [--artifacts-root <path>]");
     println!("  clear-geometry-cache (--model <slug> | --all) [--artifacts-root <path>]");

@@ -20,7 +20,9 @@ use std::{fmt, str::FromStr};
 const DEFAULT_WEB_RESOURCE: &str = "ifc/building-architecture";
 const DEFAULT_DEMO_RESOURCE: &str = "demo/revolved-solid";
 #[cfg(target_arch = "wasm32")]
-const WEB_GEOMETRY_BATCH_CHUNK_SIZE: usize = 5_000;
+const WEB_GEOMETRY_INSTANCE_BATCH_CHUNK_SIZE: usize = 5_000;
+#[cfg(target_arch = "wasm32")]
+const WEB_GEOMETRY_DEFINITION_BATCH_CHUNK_SIZE: usize = 16;
 const SOURCE_SCOPED_ID_SEPARATOR: &str = "::";
 #[cfg(target_arch = "wasm32")]
 const PROJECT_GEOMETRY_LOCAL_ID_BITS: u32 = 48;
@@ -2025,7 +2027,7 @@ async fn fetch_geometry_instance_batch_from_server(
     instance_ids: &[GeometryInstanceId],
 ) -> Result<GeometryInstanceBatch, String> {
     let mut instances = Vec::new();
-    for chunk in instance_ids.chunks(WEB_GEOMETRY_BATCH_CHUNK_SIZE) {
+    for chunk in instance_ids.chunks(WEB_GEOMETRY_INSTANCE_BATCH_CHUNK_SIZE) {
         instances.extend(
             fetch_geometry_instance_batch_chunk_from_server(window, resource, chunk)
                 .await?
@@ -2083,7 +2085,7 @@ async fn fetch_geometry_definition_batch_from_server(
     definition_ids: &[GeometryDefinitionId],
 ) -> Result<GeometryDefinitionBatch, String> {
     let mut definitions = Vec::new();
-    for chunk in definition_ids.chunks(WEB_GEOMETRY_BATCH_CHUNK_SIZE) {
+    for chunk in definition_ids.chunks(WEB_GEOMETRY_DEFINITION_BATCH_CHUNK_SIZE) {
         definitions.extend(
             fetch_geometry_definition_batch_chunk_from_server(window, resource, chunk)
                 .await?

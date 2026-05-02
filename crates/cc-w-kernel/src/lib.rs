@@ -142,7 +142,8 @@ fn triangulate_face(
 
     let normal = reference_cross.normalize();
 
-    if !face_is_planar(&geometry.positions, face, normal) {
+    let is_planar = face_is_planar(&geometry.positions, face, normal);
+    if !is_planar && !face.holes.is_empty() {
         return Err(KernelError::InvalidTessellatedFace {
             kind: "non-planar tessellated polygon",
         });
@@ -985,6 +986,18 @@ fn face_reference_cross(positions: &[DVec3], ring: &[u32]) -> Option<DVec3> {
         return None;
     }
 
+    let mut newell = DVec3::ZERO;
+    for index in 0..ring.len() {
+        let current = positions[ring[index] as usize];
+        let next = positions[ring[(index + 1) % ring.len()] as usize];
+        newell.x += (current.y - next.y) * (current.z + next.z);
+        newell.y += (current.z - next.z) * (current.x + next.x);
+        newell.z += (current.x - next.x) * (current.y + next.y);
+    }
+    if newell.length_squared() > KERNEL_EPSILON {
+        return Some(newell);
+    }
+
     let origin = positions[ring[0] as usize];
     let mut reference_cross = None;
     let mut reference_cross_length_squared = 0.0;
@@ -1262,6 +1275,70 @@ mod tests {
         assert_eq!(
             canonicalize_triangles(&mesh.indices),
             canonicalize_triangles(&[[0, 1, 2], [0, 2, 3]])
+        );
+    }
+
+    #[test]
+    fn tessellated_non_planar_polygon_uses_projected_triangulation() {
+        let geometry = TessellatedGeometry::new(
+            vec![
+                DVec3::new(-1.0, -1.0, 0.0),
+                DVec3::new(1.0, -1.0, 0.0),
+                DVec3::new(1.0, 1.0, 0.25),
+                DVec3::new(-1.0, 1.0, 0.0),
+            ],
+            vec![IndexedPolygon::new(vec![0, 1, 2, 3], vec![], 4).expect("quad")],
+        )
+        .expect("tessellation");
+
+        let mesh = TrivialKernel
+            .tessellate_primitive(&GeometryPrimitive::Tessellated(geometry))
+            .expect("non-planar exterior should project-triangulate");
+
+        assert_eq!(mesh.triangle_count(), 2);
+        assert_eq!(
+            canonicalize_triangles(&mesh.indices),
+            canonicalize_triangles(&[[0, 1, 2], [0, 2, 3]])
+        );
+    }
+
+    #[test]
+    fn tessellated_non_planar_concave_polygon_does_not_fan_across_void() {
+        let geometry = TessellatedGeometry::new(
+            vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(4.0, 0.0, 0.1),
+                DVec3::new(4.0, 4.0, 0.0),
+                DVec3::new(3.0, 4.0, 0.2),
+                DVec3::new(3.0, 1.0, 0.0),
+                DVec3::new(1.0, 1.0, 0.15),
+                DVec3::new(1.0, 4.0, 0.0),
+                DVec3::new(0.0, 4.0, 0.1),
+            ],
+            vec![IndexedPolygon::new(vec![0, 1, 2, 3, 4, 5, 6, 7], vec![], 8).expect("face")],
+        )
+        .expect("tessellation");
+
+        let mesh = TrivialKernel
+            .tessellate_primitive(&GeometryPrimitive::Tessellated(geometry))
+            .expect("non-planar concave exterior should project-triangulate");
+
+        assert_eq!(mesh.triangle_count(), 6);
+        let void_point = DVec2::new(2.0, 3.0);
+        assert!(
+            !mesh.indices.iter().any(|triangle| {
+                let [a, b, c] = *triangle;
+                let a = mesh.positions[a as usize];
+                let b = mesh.positions[b as usize];
+                let c = mesh.positions[c as usize];
+                point_in_triangle_2d(
+                    void_point,
+                    DVec2::new(a.x, a.y),
+                    DVec2::new(b.x, b.y),
+                    DVec2::new(c.x, c.y),
+                )
+            }),
+            "projected triangulation must not create triangles across the concave void"
         );
     }
 

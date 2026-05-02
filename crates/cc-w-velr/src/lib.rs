@@ -851,6 +851,7 @@ pub struct IfcImportOptions {
     pub artifacts_root: PathBuf,
     pub release: bool,
     pub replace_existing: bool,
+    pub debug_artifacts: bool,
 }
 
 impl Default for IfcImportOptions {
@@ -860,6 +861,7 @@ impl Default for IfcImportOptions {
             artifacts_root: default_ifc_artifacts_root(),
             release: true,
             replace_existing: false,
+            debug_artifacts: true,
         }
     }
 }
@@ -1306,14 +1308,19 @@ ORDER BY item_id
                 )?;
                 let declared_entity =
                     parse_required_string_cell(row.get(11), "declared_entity")?.to_string();
-                let primitive = Arc::new(GeometryPrimitive::Tessellated(
-                    tessellated_geometry_from_row(
-                        parse_required_string_cell(row.get(12), "coord_list")?,
-                        parse_required_string_cell(row.get(13), "coord_index")?,
-                    )?,
-                ));
+                let Some(geometry) = tessellated_geometry_from_row(
+                    parse_required_string_cell(row.get(12), "coord_list")?,
+                    parse_required_string_cell(row.get(13), "coord_index")?,
+                )?
+                else {
+                    eprintln!(
+                        "w velr skipped empty IfcTriangulatedFaceSet item {item_id}: no faces with at least three vertices"
+                    );
+                    return Ok(None);
+                };
+                let primitive = Arc::new(GeometryPrimitive::Tessellated(geometry));
 
-                Ok(IfcBodyRecord {
+                Ok(Some(IfcBodyRecord {
                     product_id,
                     placement_id,
                     item_id,
@@ -1329,9 +1336,12 @@ ORDER BY item_id
                     declared_entity,
                     item_transform: DMat4::IDENTITY,
                     primitive,
-                })
+                }))
             })
-            .collect::<Result<_, VelrIfcError>>()?;
+            .collect::<Result<Vec<_>, VelrIfcError>>()?
+            .into_iter()
+            .flatten()
+            .collect();
 
         Ok(records)
     }
@@ -1454,9 +1464,15 @@ ORDER BY item_id, face_edge.ordinal
                 continue;
             };
             coord_index_rows.sort_by_key(|(face_ordinal, _)| *face_ordinal);
-            let primitive = Arc::new(GeometryPrimitive::Tessellated(
-                tessellated_geometry_from_coord_index_rows(&coord_list, &coord_index_rows)?,
-            ));
+            let Some(geometry) =
+                tessellated_geometry_from_coord_index_rows(&coord_list, &coord_index_rows)?
+            else {
+                eprintln!(
+                    "w velr skipped empty IfcPolygonalFaceSet item {item_id}: no faces with at least three vertices"
+                );
+                continue;
+            };
+            let primitive = Arc::new(GeometryPrimitive::Tessellated(geometry));
             geometry_by_item.insert(item_id, primitive);
         }
 
@@ -1534,8 +1550,6 @@ ORDER BY item_id
                 )?;
                 let declared_entity =
                     parse_required_string_cell(row.get(11), "declared_entity")?.to_string();
-                let primitive =
-                    body_primitive_for_declared_entity(&declared_entity, Arc::clone(&primitive))?;
 
                 Ok(Some(IfcBodyRecord {
                     product_id,
@@ -2282,8 +2296,6 @@ ORDER BY mapped_item_id, item_id
                 )?;
                 let declared_entity =
                     parse_required_string_cell(row.get(12), "declared_entity")?.to_string();
-                let primitive =
-                    body_primitive_for_declared_entity(&declared_entity, Arc::clone(&primitive))?;
 
                 Ok(Some(IfcBodyRecord {
                     product_id,
@@ -2414,8 +2426,6 @@ ORDER BY item_id
                 )?;
                 let declared_entity =
                     parse_required_string_cell(row.get(13), "declared_entity")?.to_string();
-                let primitive =
-                    body_primitive_for_declared_entity(&declared_entity, Arc::clone(&primitive))?;
 
                 Ok(IfcBodyRecord {
                     product_id,
@@ -2775,7 +2785,7 @@ RETURN id(lp) AS placement_id, id(curve) AS curve_id, distance.payload_value AS 
             r#"
 	MATCH (curve:IfcGradientCurve)-[:BASE_CURVE]->(:IfcCompositeCurve)-[segment_edge:SEGMENTS]->(seg:IfcCurveSegment)-[:PLACEMENT]->(place:IfcAxis2Placement2D)-[:LOCATION]->(point:IfcCartesianPoint)
 	MATCH (place)-[:REF_DIRECTION]->(dir:IfcDirection)
-	MATCH (seg)-[:SEGMENT_LENGTH]->(length)
+	OPTIONAL MATCH (seg)-[:SEGMENT_LENGTH]->(length)
 	OPTIONAL MATCH (seg)-[:PARENT_CURVE]->(parent_curve)
 	RETURN id(curve) AS curve_id, id(seg) AS segment_id, segment_edge.ordinal AS segment_ordinal, point.Coordinates AS start_point, dir.DirectionRatios AS direction, length.payload_value AS segment_length, parent_curve.declared_entity AS parent_curve_entity, parent_curve.Radius AS radius, parent_curve.ClothoidConstant AS clothoid_constant
 	ORDER BY curve_id, segment_ordinal, segment_id
@@ -2785,7 +2795,7 @@ RETURN id(lp) AS placement_id, id(curve) AS curve_id, distance.payload_value AS 
 	            r#"
 	MATCH (curve:IfcGradientCurve)-[segment_edge:SEGMENTS]->(seg:IfcCurveSegment)-[:PLACEMENT]->(place:IfcAxis2Placement2D)-[:LOCATION]->(point:IfcCartesianPoint)
 	MATCH (place)-[:REF_DIRECTION]->(dir:IfcDirection)
-	MATCH (seg)-[:SEGMENT_LENGTH]->(length)
+	OPTIONAL MATCH (seg)-[:SEGMENT_LENGTH]->(length)
 	OPTIONAL MATCH (seg)-[:PARENT_CURVE]->(parent_curve)
 	RETURN id(curve) AS curve_id, id(seg) AS segment_id, segment_edge.ordinal AS segment_ordinal, point.Coordinates AS start_point, dir.DirectionRatios AS direction, length.payload_value AS segment_length, parent_curve.declared_entity AS parent_curve_entity, parent_curve.Radius AS radius, parent_curve.ClothoidConstant AS clothoid_constant
 	ORDER BY curve_id, segment_ordinal, segment_id
@@ -2798,7 +2808,7 @@ RETURN id(lp) AS placement_id, id(curve) AS curve_id, distance.payload_value AS 
             ordinal: u64,
             start_point: DVec2,
             direction: DVec2,
-            signed_length: f64,
+            signed_length: Option<f64>,
             parent_curve_entity: Option<String>,
             radius: Option<f64>,
         }
@@ -2816,7 +2826,7 @@ RETURN id(lp) AS placement_id, id(curve) AS curve_id, distance.payload_value AS 
                             parse_dvec2_cell(row.get(4), "direction")?,
                             DVec2::X,
                         ),
-                        signed_length: parse_f64_cell(row.get(5), "segment_length")?,
+                        signed_length: parse_optional_f64_cell(row.get(5), "segment_length")?,
                         parent_curve_entity: parse_optional_string_cell(row.get(6)),
                         radius: parse_optional_f64_cell(row.get(7), "radius")?,
                     });
@@ -2826,6 +2836,34 @@ RETURN id(lp) AS placement_id, id(curve) AS curve_id, distance.payload_value AS 
 
         let mut horizontal_rows_by_curve = parse_rows_by_curve(horizontal_rows)?;
         let mut vertical_rows_by_curve = parse_rows_by_curve(vertical_rows)?;
+
+        let explicit_or_derived_gradient_segment_length = |row: &SegmentRow,
+                                                           next: Option<&SegmentRow>,
+                                                           use_explicit_station: bool|
+         -> Result<f64, VelrIfcError> {
+            if let Some(length) = row.signed_length {
+                return Ok(length);
+            }
+            if let Some(next) = next {
+                if use_explicit_station {
+                    return Ok(next.start_point.x - row.start_point.x);
+                }
+                let delta = next.start_point - row.start_point;
+                let signed = delta.dot(normalized_2d_or(row.direction, DVec2::X));
+                return Ok(if signed.abs() > 1.0e-9 {
+                    signed
+                } else {
+                    delta.length()
+                });
+            }
+            if row.parent_curve_entity.as_deref() == Some("IfcLine") {
+                return Ok(f64::INFINITY);
+            }
+            Err(VelrIfcError::IfcGeometryData(format!(
+                "IfcCurveSegment `{}` is missing explicit SegmentLength and no following segment provides an explicit span",
+                row.segment_id
+            )))
+        };
 
         let build_segments = |mut rows: Vec<SegmentRow>,
                               use_explicit_station: bool|
@@ -2845,7 +2883,9 @@ RETURN id(lp) AS placement_id, id(curve) AS curve_id, distance.payload_value AS 
             for index in 0..rows.len() {
                 let row = &rows[index];
                 let next = rows.get(index + 1);
-                let length = row.signed_length.abs();
+                let signed_length =
+                    explicit_or_derived_gradient_segment_length(row, next, use_explicit_station)?;
+                let length = signed_length.abs();
                 let end_point = next.map(|row| row.start_point);
                 let end_direction = next.map(|row| row.direction);
                 let kind = match row.parent_curve_entity.as_deref() {
@@ -2860,7 +2900,7 @@ RETURN id(lp) AS placement_id, id(curve) AS curve_id, distance.payload_value AS 
                                 radius.abs(),
                                 length,
                                 end_point,
-                                row.signed_length,
+                                signed_length,
                             ),
                         })
                         .unwrap_or(IfcGradientCurveSegmentKind::Line),
@@ -3388,9 +3428,19 @@ pub fn import_ifc_file(
     if options.release {
         command.arg("--release");
     }
-    command.args(["-p", "ifc-schema-tool", "--", "import-step-into-velr"]);
+    command.args([
+        "-p",
+        "ifc-schema-tool",
+        "--bin",
+        "ifc-schema-tool",
+        "--",
+        "import-step-into-velr",
+    ]);
     command.arg(step_input);
     command.arg(&layout.database);
+    if !options.debug_artifacts {
+        command.arg("--no-debug-artifacts");
+    }
 
     let rendered_command = render_command(&command);
     let output = command.output().map_err(|source| VelrIfcError::CommandIo {
@@ -3411,15 +3461,17 @@ pub fn import_ifc_file(
         .velr_ifc_root
         .join("generated/step-import")
         .join(stem_or_default(step_input, "input"));
-    copy_optional_file(
-        import_output_dir.join("import-bundle.json"),
-        &layout.import_bundle,
-    )?;
-    copy_optional_file(
-        import_output_dir.join("import.cypher"),
-        &layout.import_cypher,
-    )?;
-    copy_optional_file(import_output_dir.join("issues.json"), &layout.import_issues)?;
+    if options.debug_artifacts {
+        copy_optional_file(
+            import_output_dir.join("import-bundle.json"),
+            &layout.import_bundle,
+        )?;
+        copy_optional_file(
+            import_output_dir.join("import.cypher"),
+            &layout.import_cypher,
+        )?;
+        copy_optional_file(import_output_dir.join("issues.json"), &layout.import_issues)?;
+    }
     copy_required_file(
         import_output_dir.join("import-timing.json"),
         &layout.import_timing,
@@ -4108,7 +4160,7 @@ fn parse_optional_dvec2_cell(
 fn tessellated_geometry_from_row(
     coord_list: &str,
     coord_index: &str,
-) -> Result<TessellatedGeometry, VelrIfcError> {
+) -> Result<Option<TessellatedGeometry>, VelrIfcError> {
     let positions = parse_dvec3_rows_json(coord_list, "coord_list")?;
     let faces_value = parse_json_value(coord_index, "coord_index")?;
     let face_rows = json_array(&faces_value, "coord_index")?;
@@ -4123,13 +4175,19 @@ fn tessellated_geometry_from_row(
         faces.push(IndexedPolygon::new(exterior, vec![], positions.len())?);
     }
 
-    TessellatedGeometry::new(positions, faces).map_err(VelrIfcError::from)
+    if faces.is_empty() {
+        return Ok(None);
+    }
+
+    TessellatedGeometry::new(positions, faces)
+        .map(Some)
+        .map_err(VelrIfcError::from)
 }
 
 fn tessellated_geometry_from_coord_index_rows(
     coord_list: &str,
     coord_index_rows: &[(u64, String)],
-) -> Result<TessellatedGeometry, VelrIfcError> {
+) -> Result<Option<TessellatedGeometry>, VelrIfcError> {
     let positions = parse_dvec3_rows_json(coord_list, "coord_list")?;
     let mut faces = Vec::with_capacity(coord_index_rows.len());
 
@@ -4143,24 +4201,13 @@ fn tessellated_geometry_from_coord_index_rows(
         faces.push(IndexedPolygon::new(exterior, vec![], positions.len())?);
     }
 
-    TessellatedGeometry::new(positions, faces).map_err(VelrIfcError::from)
-}
-
-fn body_primitive_for_declared_entity(
-    declared_entity: &str,
-    primitive: Arc<GeometryPrimitive>,
-) -> Result<Arc<GeometryPrimitive>, VelrIfcError> {
-    if declared_entity != "IfcGeographicElement" {
-        return Ok(primitive);
+    if faces.is_empty() {
+        return Ok(None);
     }
 
-    let GeometryPrimitive::Tessellated(geometry) = primitive.as_ref() else {
-        return Ok(primitive);
-    };
-
-    Ok(Arc::new(GeometryPrimitive::Tessellated(
-        reverse_tessellated_winding(geometry)?,
-    )))
+    TessellatedGeometry::new(positions, faces)
+        .map(Some)
+        .map_err(VelrIfcError::from)
 }
 
 fn sectioned_solid_horizontal_geometry(
@@ -4609,32 +4656,6 @@ fn assert_unique_section_ordinals(
         }
     }
     Ok(())
-}
-
-fn reverse_tessellated_winding(
-    geometry: &TessellatedGeometry,
-) -> Result<TessellatedGeometry, VelrIfcError> {
-    let faces = geometry
-        .faces
-        .iter()
-        .map(|face| {
-            let mut exterior = face.exterior.clone();
-            exterior.reverse();
-            let holes = face
-                .holes
-                .iter()
-                .map(|hole| {
-                    let mut hole = hole.clone();
-                    hole.reverse();
-                    hole
-                })
-                .collect();
-            IndexedPolygon::new(exterior, holes, geometry.positions.len())
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(VelrIfcError::from)?;
-
-    TessellatedGeometry::new(geometry.positions.clone(), faces).map_err(VelrIfcError::from)
 }
 
 fn faceted_brep_geometry_from_faces(
@@ -5131,19 +5152,30 @@ fn evaluate_curve_segments(
     let last = segments.last().unwrap_or(first);
     let segment = segments
         .iter()
-        .find(|segment| {
-            distance_along <= segment.start_station + segment.length || segment.length <= 1.0e-12
-        })
+        .find(|segment| segment.contains_distance(distance_along))
         .unwrap_or(last);
-    let along = if segment.length <= 1.0e-12 {
-        0.0
-    } else {
-        (distance_along - segment.start_station).clamp(0.0, segment.length)
-    };
+    let along = segment.along_distance(distance_along);
     Some(segment.evaluate_2d(along))
 }
 
 impl IfcGradientCurveSegment {
+    fn contains_distance(&self, distance_along: f64) -> bool {
+        if self.length.is_infinite() {
+            return distance_along >= self.start_station;
+        }
+        distance_along <= self.start_station + self.length || self.length <= 1.0e-12
+    }
+
+    fn along_distance(&self, distance_along: f64) -> f64 {
+        if self.length <= 1.0e-12 {
+            0.0
+        } else if self.length.is_infinite() {
+            (distance_along - self.start_station).max(0.0)
+        } else {
+            (distance_along - self.start_station).clamp(0.0, self.length)
+        }
+    }
+
     fn evaluate_2d(&self, along: f64) -> (DVec2, DVec2) {
         let start_tangent = normalized_2d_or(self.direction, DVec2::X);
         match self.kind {
@@ -6618,7 +6650,8 @@ mod tests {
             "[[0.0,0.0,0.0],[1000.0,0.0,0.0],[1000.0,1000.0,0.0],[0.0,1000.0,0.0]]",
             "[[1,2,3,4]]",
         )
-        .expect("tessellated geometry");
+        .expect("tessellated geometry")
+        .expect("non-empty tessellated geometry");
 
         assert_eq!(geometry.positions.len(), 4);
         assert_eq!(geometry.face_count(), 1);
@@ -6631,7 +6664,8 @@ mod tests {
             "[[0.0,0.0,0.0],[1000.0,0.0,0.0],[2000.0,0.0,0.0],[0.0,1000.0,0.0]]",
             "[[1,2,3],[1,2,4]]",
         )
-        .expect("tessellated geometry");
+        .expect("tessellated geometry")
+        .expect("non-empty tessellated geometry");
 
         assert_eq!(geometry.face_count(), 2);
         assert_eq!(geometry.faces[0].exterior, vec![0, 1, 2]);
@@ -6644,7 +6678,8 @@ mod tests {
             "[[0.0,0.0,0.0],[1000.0,0.0,0.0],[0.0,1000.0,0.0]]",
             "[[1,2,2,3,1]]",
         )
-        .expect("tessellated geometry");
+        .expect("tessellated geometry")
+        .expect("non-empty tessellated geometry");
 
         assert_eq!(geometry.face_count(), 1);
         assert_eq!(geometry.faces[0].exterior, vec![0, 1, 2]);
@@ -6656,7 +6691,8 @@ mod tests {
             "[[-603.1602021555037,294.5945945946744,49.999999998914426],[-610.2356451318109,281.3344594595385,49.99999999894908],[-606.8471046702699,286.5920608108901,49.999999998937525]]",
             "[[1,2,3]]",
         )
-        .expect("tessellated geometry");
+        .expect("tessellated geometry")
+        .expect("non-empty tessellated geometry");
 
         assert_eq!(geometry.face_count(), 1);
         assert_eq!(geometry.faces[0].exterior, vec![0, 1, 2]);
@@ -6808,6 +6844,67 @@ mod tests {
             transform.transform_point3(DVec3::ZERO),
             DVec3::new(40.0, 22.0, 3.0)
         );
+    }
+
+    #[test]
+    fn gradient_curve_unbounded_line_segment_can_place_known_station() {
+        let curve = IfcGradientCurveRecord {
+            horizontal_segments: vec![IfcGradientCurveSegment {
+                start_station: 0.0,
+                length: f64::INFINITY,
+                start_point: DVec2::new(100.0, 200.0),
+                direction: DVec2::X,
+                end_point: None,
+                end_direction: None,
+                kind: IfcGradientCurveSegmentKind::Line,
+            }],
+            vertical_segments: vec![IfcGradientCurveSegment {
+                start_station: 0.0,
+                length: f64::INFINITY,
+                start_point: DVec2::new(0.0, 12.0),
+                direction: DVec2::X,
+                end_point: None,
+                end_direction: None,
+                kind: IfcGradientCurveSegmentKind::Line,
+            }],
+        };
+
+        let (point, tangent) = curve.evaluate(35.0).expect("station evaluation");
+
+        assert_eq!(point, DVec3::new(135.0, 200.0, 12.0));
+        assert_eq!(tangent, DVec3::X);
+    }
+
+    #[test]
+    fn empty_triangulated_face_set_is_unsupported_geometry() {
+        let geometry =
+            tessellated_geometry_from_row("[[0.0,0.0,0.0],[1.0,0.0,0.0],[0.0,1.0,0.0]]", "[]")
+                .expect("empty tessellation should parse");
+
+        assert!(geometry.is_none());
+    }
+
+    #[test]
+    fn empty_polygonal_face_set_is_unsupported_geometry() {
+        let geometry = tessellated_geometry_from_coord_index_rows(
+            "[[0.0,0.0,0.0],[1.0,0.0,0.0],[0.0,1.0,0.0]]",
+            &[(0, "[1,1,2]".to_owned())],
+        )
+        .expect("empty polygonal tessellation should parse");
+
+        assert!(geometry.is_none());
+    }
+
+    #[test]
+    fn polygonal_face_set_preserves_authored_winding() {
+        let geometry = tessellated_geometry_from_coord_index_rows(
+            "[[0.0,0.0,0.0],[0.0,1.0,0.0],[1.0,1.0,0.0],[1.0,0.0,0.0]]",
+            &[(0, "[1,2,3,4]".to_owned())],
+        )
+        .expect("polygonal tessellation should parse")
+        .expect("polygonal tessellation should produce geometry");
+
+        assert_eq!(geometry.faces[0].exterior, vec![0, 1, 2, 3]);
     }
 
     #[test]

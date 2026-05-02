@@ -405,6 +405,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         root,
         ifc_artifacts_root: args.ifc_artifacts_root,
         project_registry,
+        geometry_package_cache: Arc::new(Mutex::new(HashMap::new())),
         cypher_worker,
         agent_sessions: Arc::new(Mutex::new(AgentSessionStore::default())),
         agent_turns: Arc::new(Mutex::new(AgentTurnStore::default())),
@@ -506,10 +507,17 @@ struct ServerState {
     root: PathBuf,
     ifc_artifacts_root: PathBuf,
     project_registry: Arc<ProjectResourceRegistry>,
+    geometry_package_cache: Arc<Mutex<HashMap<String, CachedPreparedPackage>>>,
     cypher_worker: CypherWorkerConfig,
     agent_sessions: Arc<Mutex<AgentSessionStore>>,
     agent_turns: Arc<Mutex<AgentTurnStore>>,
     agent_runtime: AgentRuntimeConfig,
+}
+
+#[derive(Clone)]
+struct CachedPreparedPackage {
+    package: Arc<PreparedGeometryPackage>,
+    metrics: PackageApiMetrics,
 }
 
 #[derive(Debug, Clone)]
@@ -2153,11 +2161,7 @@ fn serve_package_api(
     let parse_ms = parse_started.elapsed().as_millis();
 
     let load_started = Instant::now();
-    match load_package_response(
-        &api_request.resource,
-        &state.project_registry,
-        &state.ifc_artifacts_root,
-    ) {
+    match load_package_response(&api_request.resource, state) {
         Ok((response, metrics)) => {
             let load_ms = load_started.elapsed().as_millis();
             let write_started = Instant::now();
@@ -2212,11 +2216,7 @@ fn serve_geometry_catalog_api(
     let parse_ms = parse_started.elapsed().as_millis();
 
     let load_started = Instant::now();
-    match load_prepared_package_with_metrics(
-        &state.project_registry,
-        &api_request.resource,
-        &state.ifc_artifacts_root,
-    ) {
+    match load_prepared_package_with_metrics(state, &api_request.resource) {
         Ok((package, metrics)) => {
             let catalog = package.catalog();
             let response =
@@ -2314,11 +2314,7 @@ fn serve_geometry_instances_api(
     }
 
     let load_started = Instant::now();
-    match load_prepared_package_with_metrics(
-        &state.project_registry,
-        &api_request.resource,
-        &state.ifc_artifacts_root,
-    ) {
+    match load_prepared_package_with_metrics(state, &api_request.resource) {
         Ok((package, metrics)) => {
             let request = api_request.to_geometry_instance_batch_request();
             let batch = package.catalog().instance_batch(&request);
@@ -2425,11 +2421,7 @@ fn serve_geometry_definitions_api(
     }
 
     let load_started = Instant::now();
-    match load_prepared_package_with_metrics(
-        &state.project_registry,
-        &api_request.resource,
-        &state.ifc_artifacts_root,
-    ) {
+    match load_prepared_package_with_metrics(state, &api_request.resource) {
         Ok((package, metrics)) => {
             let request = api_request.to_geometry_definition_batch_request();
             let batch = package.definition_batch(&request);
@@ -2886,22 +2878,52 @@ fn serve_agent_turn_poll_api(
 
 fn load_package_response(
     resource: &str,
-    registry: &ProjectResourceRegistry,
-    ifc_artifacts_root: &Path,
+    state: &ServerState,
 ) -> Result<(WebPreparedPackageResponse, PackageApiMetrics), String> {
-    let (package, metrics) =
-        load_prepared_package_with_metrics(registry, resource, ifc_artifacts_root)?;
+    let (package, metrics) = load_prepared_package_with_metrics(state, resource)?;
 
     Ok((
         WebPreparedPackageResponse {
             resource: resource.to_string(),
-            package: WebPreparedGeometryPackage::from_prepared_package(&package),
+            package: WebPreparedGeometryPackage::from_prepared_package(package.as_ref()),
         },
         metrics,
     ))
 }
 
 fn load_prepared_package_with_metrics(
+    state: &ServerState,
+    resource: &str,
+) -> Result<(Arc<PreparedGeometryPackage>, PackageApiMetrics), String> {
+    if let Some(cached) = state
+        .geometry_package_cache
+        .lock()
+        .map_err(|_| "geometry package cache lock poisoned".to_owned())?
+        .get(resource)
+        .cloned()
+    {
+        return Ok((cached.package, cached.metrics));
+    }
+
+    let (package, metrics) = load_prepared_package_uncached_with_metrics(
+        &state.project_registry,
+        resource,
+        &state.ifc_artifacts_root,
+    )?;
+    let cached = CachedPreparedPackage {
+        package: Arc::new(package),
+        metrics,
+    };
+    state
+        .geometry_package_cache
+        .lock()
+        .map_err(|_| "geometry package cache lock poisoned".to_owned())?
+        .insert(resource.to_owned(), cached.clone());
+
+    Ok((cached.package, cached.metrics))
+}
+
+fn load_prepared_package_uncached_with_metrics(
     registry: &ProjectResourceRegistry,
     resource: &str,
     ifc_artifacts_root: &Path,
@@ -7237,8 +7259,8 @@ fn write_json_response<T>(stream: &mut TcpStream, status: &str, payload: &T) -> 
 where
     T: Serialize,
 {
-    let body = serde_json::to_vec_pretty(payload)
-        .map_err(|error| format!("json encode failed: {error}"))?;
+    let body =
+        serde_json::to_vec(payload).map_err(|error| format!("json encode failed: {error}"))?;
     write_response(
         stream,
         status,
@@ -7284,7 +7306,7 @@ mod tests {
         validate_geometry_batch_id_count, validate_graph_limit, validate_project_member_resource,
     };
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, HashMap},
         fs,
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
@@ -7329,6 +7351,7 @@ mod tests {
             root: PathBuf::from("."),
             ifc_artifacts_root: ifc_artifacts_root.clone(),
             project_registry: Arc::new(ProjectResourceRegistry::default()),
+            geometry_package_cache: Arc::new(Mutex::new(HashMap::new())),
             cypher_worker: CypherWorkerConfig {
                 binary: PathBuf::from("cc-w-platform-web-cypher-worker"),
                 timeout: Duration::from_millis(DEFAULT_CYPHER_WORKER_TIMEOUT_MS),

@@ -1009,23 +1009,137 @@ fn normalize_path_annotation_line(object: &serde_json::Map<String, Value>) -> Op
 
 fn normalize_path_annotation_markers(object: &serde_json::Map<String, Value>) -> Option<Value> {
     normalize_annotation_value(object, &["markers", "marker_groups", "markerGroups"])
+        .map(canonical_path_annotation_markers)
 }
 
 fn canonical_path_annotation_line(value: Value) -> Value {
     match value {
-        Value::Array(ranges) => serde_json::json!({ "ranges": ranges }),
+        Value::Array(ranges) => serde_json::json!({
+            "ranges": canonical_path_annotation_range_list(ranges)
+        }),
         Value::Object(object) if object.get("ranges").is_none() => {
             if let Some(range) = object.get("range").cloned() {
-                return serde_json::json!({ "ranges": [range] });
+                return serde_json::json!({
+                    "ranges": [canonical_path_annotation_measure_range(range)]
+                });
             }
             let mut line = serde_json::Map::new();
             line.insert(
                 "ranges".to_owned(),
-                Value::Array(vec![Value::Object(object)]),
+                Value::Array(vec![canonical_path_annotation_measure_range(
+                    Value::Object(object),
+                )]),
             );
             Value::Object(line)
         }
+        Value::Object(mut object) => {
+            if let Some(ranges) = object.remove("ranges") {
+                let ranges = match ranges {
+                    Value::Array(ranges) => {
+                        Value::Array(canonical_path_annotation_range_list(ranges))
+                    }
+                    other => other,
+                };
+                object.insert("ranges".to_owned(), ranges);
+            }
+            Value::Object(object)
+        }
         other => other,
+    }
+}
+
+fn canonical_path_annotation_range_list(ranges: Vec<Value>) -> Vec<Value> {
+    ranges
+        .into_iter()
+        .map(canonical_path_annotation_measure_range)
+        .collect()
+}
+
+fn canonical_path_annotation_markers(value: Value) -> Value {
+    match value {
+        Value::Array(markers) => Value::Array(
+            markers
+                .into_iter()
+                .map(canonical_path_annotation_marker)
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn canonical_path_annotation_marker(value: Value) -> Value {
+    let Value::Object(mut marker) = value else {
+        return value;
+    };
+    if let Some(range) = marker
+        .remove("range")
+        .or_else(|| marker.remove("measure_range"))
+        .or_else(|| marker.remove("measureRange"))
+    {
+        marker.insert(
+            "range".to_owned(),
+            canonical_path_annotation_measure_range(range),
+        );
+    }
+    Value::Object(marker)
+}
+
+fn canonical_path_annotation_measure_range(value: Value) -> Value {
+    const FROM_KEYS: &[&str] = &["from", "start", "from_measure", "fromMeasure"];
+    const TO_KEYS: &[&str] = &["to", "end", "to_measure", "toMeasure"];
+    const FROM_OFFSET_KEYS: &[&str] = &["from_offset", "fromOffset", "start_offset", "startOffset"];
+    const TO_OFFSET_KEYS: &[&str] = &["to_offset", "toOffset", "end_offset", "endOffset"];
+    const TO_END_KEYS: &[&str] = &["to_end", "toEnd", "path_end", "pathEnd"];
+
+    let Value::Object(mut range) = value else {
+        return value;
+    };
+
+    let from = first_non_null_annotation_value(&range, FROM_KEYS);
+    let to = first_non_null_annotation_value(&range, TO_KEYS);
+    let from_offset = first_non_null_annotation_value(&range, FROM_OFFSET_KEYS);
+    let to_offset = first_non_null_annotation_value(&range, TO_OFFSET_KEYS);
+    let to_end = annotation_bool_flag_is_true(&range, TO_END_KEYS);
+
+    remove_annotation_keys(&mut range, FROM_KEYS);
+    remove_annotation_keys(&mut range, TO_KEYS);
+    remove_annotation_keys(&mut range, FROM_OFFSET_KEYS);
+    remove_annotation_keys(&mut range, TO_OFFSET_KEYS);
+    remove_annotation_keys(&mut range, TO_END_KEYS);
+
+    if let Some(value) = from {
+        range.insert("from".to_owned(), value);
+    } else if let Some(value) = from_offset {
+        range.insert("from_offset".to_owned(), value);
+    }
+
+    if to_end {
+        range.insert("to_end".to_owned(), Value::Bool(true));
+    } else if let Some(value) = to {
+        range.insert("to".to_owned(), value);
+    } else if let Some(value) = to_offset {
+        range.insert("to_offset".to_owned(), value);
+    }
+
+    Value::Object(range)
+}
+
+fn first_non_null_annotation_value(
+    object: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<Value> {
+    keys.iter()
+        .find_map(|key| object.get(*key).filter(|value| !value.is_null()).cloned())
+}
+
+fn annotation_bool_flag_is_true(object: &serde_json::Map<String, Value>, keys: &[&str]) -> bool {
+    keys.iter()
+        .any(|key| matches!(object.get(*key), Some(Value::Bool(true))))
+}
+
+fn remove_annotation_keys(object: &mut serde_json::Map<String, Value>, keys: &[&str]) {
+    for key in keys {
+        object.remove(*key);
     }
 }
 
@@ -1893,6 +2007,96 @@ mod tests {
                 mode: None,
                 max_samples: None,
             }]
+        );
+    }
+
+    #[test]
+    fn viewer_annotations_show_path_canonicalizes_ai_payload_ranges_before_rendering() {
+        let normalize = |annotation: serde_json::Value| -> AgentUiAction {
+            let mut actions = validate_agent_action_candidates(vec![
+                AgentActionCandidate::viewer_annotations_show_path(annotation),
+            ])
+            .unwrap();
+            assert_eq!(actions.len(), 1);
+            actions.remove(0)
+        };
+        let path = serde_json::json!({
+            "kind": "ifc_alignment",
+            "id": "curve:215711",
+            "measure": "station"
+        });
+
+        assert_eq!(
+            normalize(serde_json::json!({
+                "resource": "ifc/bridge-for-minnd",
+                "path": path.clone(),
+                "line": {
+                    "ranges": [
+                        { "from": 100, "from_offset": 100, "to": 200, "to_offset": 200 }
+                    ]
+                }
+            })),
+            AgentUiAction::ViewerAnnotationsShowPath {
+                resource: Some("ifc/bridge-for-minnd".to_owned()),
+                path: path.clone(),
+                line: Some(serde_json::json!({
+                    "ranges": [{ "from": 100, "to": 200 }]
+                })),
+                markers: None,
+                mode: None,
+                max_samples: None,
+            }
+        );
+
+        assert_eq!(
+            normalize(serde_json::json!({
+                "resource": "ifc/bridge-for-minnd",
+                "path": path.clone(),
+                "line_range": { "fromOffset": 0, "toOffset": 120 },
+                "markers": [
+                    { "range": { "fromOffset": 0, "toOffset": 120 }, "every": 20, "label": "measure" }
+                ]
+            })),
+            AgentUiAction::ViewerAnnotationsShowPath {
+                resource: Some("ifc/bridge-for-minnd".to_owned()),
+                path: path.clone(),
+                line: Some(serde_json::json!({
+                    "ranges": [{ "from_offset": 0, "to_offset": 120 }]
+                })),
+                markers: Some(serde_json::json!([
+                    { "range": { "from_offset": 0, "to_offset": 120 }, "every": 20, "label": "measure" }
+                ])),
+                mode: None,
+                max_samples: None,
+            }
+        );
+
+        assert_eq!(
+            normalize(serde_json::json!({
+                "resource": "ifc/bridge-for-minnd",
+                "mode": "add",
+                "path": path.clone(),
+                "line": {
+                    "ranges": [
+                        { "from": 400, "to": 500, "toEnd": true }
+                    ]
+                },
+                "markers": [
+                    { "measureRange": { "from": 400, "to": 500, "to_offset": 500, "pathEnd": true }, "every": 50, "label": "measure" }
+                ]
+            })),
+            AgentUiAction::ViewerAnnotationsShowPath {
+                resource: Some("ifc/bridge-for-minnd".to_owned()),
+                path,
+                line: Some(serde_json::json!({
+                    "ranges": [{ "from": 400, "to_end": true }]
+                })),
+                markers: Some(serde_json::json!([
+                    { "range": { "from": 400, "to_end": true }, "every": 50, "label": "measure" }
+                ])),
+                mode: Some(serde_json::json!("add")),
+                max_samples: None,
+            }
         );
     }
 
