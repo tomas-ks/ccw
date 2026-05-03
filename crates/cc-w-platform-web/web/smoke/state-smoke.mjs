@@ -391,7 +391,7 @@ async function run() {
       return { ok: true };
     }, options.toResource);
 
-    await expectPageValue(page, "project outliner renders member rows after commit", () => {
+    await expectPageValue(page, "workspace outliner renders loaded data rows after commit", () => {
       const rows = Array.from(document.querySelectorAll("#outliner-body .outliner-row"));
       if (!rows.length) {
         return { ok: false, message: "no outliner rows rendered" };

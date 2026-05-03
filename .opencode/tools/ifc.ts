@@ -971,6 +971,35 @@ export const elements_show = tool({
   },
 });
 
+export const elements_set_visible = tool({
+  description:
+    "Ask the host viewer to set one or more renderable semantic ids visible or hidden without framing, selecting, or changing inspection. Prefer elements_show for user-facing reveal/show requests; use this for precise visibility-only toggles.",
+  args: {
+    semantic_ids: tool.schema
+      .array(tool.schema.string())
+      .min(1)
+      .describe("Renderable semantic ids to update. In project mode these may be source-scoped as ifc/resource::GlobalId"),
+    visible: tool.schema
+      .boolean()
+      .describe("Whether the elements should be visible."),
+    resource: tool.schema
+      .string()
+      .optional()
+      .describe("IFC resource the semantic ids came from, for example ifc/infra-road"),
+    why: tool.schema.string().optional().describe("Short reason for the viewer action"),
+  },
+  async execute(args) {
+    const count = args.semantic_ids.length;
+    const reason = args.why?.trim();
+    return [
+      `Prepared elements.set_visible ${args.visible ? "visible" : "hidden"} for ${count} element${count === 1 ? "" : "s"}.`,
+      reason ? `Why: ${reason}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  },
+});
+
 export const elements_select = tool({
   description: "Ask the host viewer to select one or more renderable semantic ids.",
   args: {
@@ -1052,6 +1081,23 @@ export const viewer_clear_inspection = tool({
   async execute(args) {
     const reason = args.why?.trim();
     return ["Prepared viewer.clear_inspection.", reason ? `Why: ${reason}` : null]
+      .filter(Boolean)
+      .join("\n");
+  },
+});
+
+export const viewer_reset_default_view = tool({
+  description:
+    "Ask the host viewer to clear inspection, reset element visibility to the default set, and return to the default view mode.",
+  args: {
+    why: tool.schema.string().optional().describe("Short reason for resetting the viewer"),
+  },
+  async execute(args) {
+    const reason = args.why?.trim();
+    return [
+      "Prepared viewer.reset_default_view.",
+      reason ? `Why: ${reason}` : null,
+    ]
       .filter(Boolean)
       .join("\n");
   },

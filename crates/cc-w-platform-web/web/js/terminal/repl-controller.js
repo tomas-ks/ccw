@@ -14,13 +14,13 @@ const GRAPH_REPL_CALLS = [
   "snapshot",
 ];
 const REPL_INTRO_LINES = [
-  'resource(), profile(), profiles(), setProfile(name), referenceGridVisible(), setReferenceGridVisible(true), theme(), setTheme("light"), allView(), defaultView(), sceneBounds(), viewState(), state(), section.state(), setSection({...}), clearSection(), annotations.state(), setAnnotationLayer({...}), showPath({...}), clearAnnotations(), pickAt(x,y), pickRect(x0,y0,x1,y1), query(...), ids(...), hide([...]), show([...]), select([...]), inspect([...]), addInspection([...]), removeInspection([...]), clearInspection(), graph.reset(...), frame()',
+  'resource(), profile(), profiles(), setProfile(name), referenceGridVisible(), setReferenceGridVisible(true), theme(), setTheme("light"), allView(), defaultView(), resetDefaultView(), sceneBounds(), viewState(), state(), section.state(), setSection({...}), clearSection(), annotations.state(), setAnnotationLayer({...}), showPath({...}), clearAnnotations(), pickAt(x,y), pickRect(x0,y0,x1,y1), query(...), ids(...), hide([...]), show([...]), setVisible([...], true), select([...]), inspect([...]), addInspection([...]), removeInspection([...]), clearInspection(), graph.reset(...), frame()',
   'Example: graph.reset("MATCH (p:IfcProject) RETURN id(p) AS node_id LIMIT 1");',
   'Example: var walls = ids("MATCH (w:IfcWall) RETURN w.GlobalId AS global_id LIMIT 8"); hide(walls);',
   "Enter runs. Up/Down walks history. Ctrl+C clears the line.",
 ];
 const REPL_SCOPE_PREAMBLE =
-  "const { viewer, graph, resource, profile, profiles, setProfile, referenceGridVisible, setReferenceGridVisible, toggleReferenceGrid, theme, setTheme, viewState, state, sceneBounds, section, setSection, clearSection, sectionState, annotations, setAnnotationLayer, showPath, clearAnnotations, annotationsState, setViewMode, defaultView, allView, setViewModeAsync, defaultViewAsync, allViewAsync, pickAt, pickRect, pickAtAsync, pickRectAsync, listIds, visibleIds, selectedIds, inspectedIds, selectedInstanceIds, query, queryIds, ids, hide, show, select, inspect, addInspection, removeInspection, resetVisibility, clearSelection, clearInspection, frame, frameVisible, hideQuery, showQuery, selectQuery, inspectQuery } = api;";
+  "const { viewer, graph, resource, profile, profiles, setProfile, referenceGridVisible, setReferenceGridVisible, toggleReferenceGrid, theme, setTheme, viewState, state, sceneBounds, section, setSection, clearSection, sectionState, annotations, setAnnotationLayer, showPath, clearAnnotations, annotationsState, setViewMode, defaultView, allView, resetDefaultView, setViewModeAsync, defaultViewAsync, allViewAsync, pickAt, pickRect, pickAtAsync, pickRectAsync, listIds, visibleIds, selectedIds, inspectedIds, selectedInstanceIds, query, queryIds, ids, hide, show, setVisible, select, inspect, addInspection, removeInspection, resetVisibility, clearSelection, clearInspection, frame, frameVisible, hideQuery, showQuery, selectQuery, inspectQuery } = api;";
 
 export function rewriteReplSource(source) {
   let rewritten = source
@@ -79,6 +79,7 @@ export function createReplApi(viewer, graph) {
     setViewMode: (mode) => viewer.setViewMode(mode),
     defaultView: () => viewer.defaultView(),
     allView: () => viewer.allView(),
+    resetDefaultView: () => viewer.resetDefaultView(),
     setViewModeAsync: (mode) => viewer.async.setViewMode(mode),
     defaultViewAsync: () => viewer.async.defaultView(),
     allViewAsync: () => viewer.async.allView(),
@@ -99,6 +100,7 @@ export function createReplApi(viewer, graph) {
       viewer.queryIds(cypher, resource),
     hide: (ids, options = {}) => viewer.hide(ids, options),
     show: (ids, options = {}) => viewer.show(ids, options),
+    setVisible: (ids, visible, options = {}) => viewer.setVisible(ids, visible, options),
     select: (ids, options = {}) => viewer.select(ids, options),
     inspect: (ids, options = {}) => viewer.inspect(ids, options),
     addInspection: (ids, options = {}) => viewer.addInspection(ids, options),

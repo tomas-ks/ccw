@@ -77,7 +77,7 @@
           class="icon-button outliner-toggle-button"
           id="outliner-toggle-button"
           type="button"
-          aria-label="Toggle project outliner"
+          aria-label="Toggle workspace outliner"
           aria-pressed="false"
           title="Outliner"
           disabled
@@ -199,29 +199,43 @@
           <section
             class="outliner-window"
             id="project-outliner"
-            aria-label="Project outliner"
+            aria-label="Workspace outliner"
             hidden
           >
             <div class="outliner-header">
               <div>
-                <h2 class="outliner-title">Project</h2>
-                <p class="outliner-subtitle" id="outliner-subtitle">Project assets</p>
+                <h2 class="outliner-title">Workspace</h2>
+                <p class="outliner-subtitle" id="outliner-subtitle">Loaded data</p>
               </div>
-              <button
-                class="icon-button outliner-close-button"
-                id="outliner-close-button"
-                type="button"
-                aria-label="Close project outliner"
-                title="Close"
-              >
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M6 6l12 12" />
-                  <path d="M18 6L6 18" />
-                </svg>
-              </button>
+              <div class="outliner-header-actions">
+                <button
+                  class="icon-button outliner-reset-button"
+                  id="outliner-reset-button"
+                  type="button"
+                  aria-label="Reset to default view"
+                  title="Default view"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M4 7v5h5" />
+                    <path d="M5.5 12a7 7 0 1 0 2-5" />
+                  </svg>
+                </button>
+                <button
+                  class="icon-button outliner-close-button"
+                  id="outliner-close-button"
+                  type="button"
+                  aria-label="Close workspace outliner"
+                  title="Close"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M6 6l12 12" />
+                    <path d="M18 6L6 18" />
+                  </svg>
+                </button>
+              </div>
             </div>
             <div class="outliner-body" id="outliner-body">
-              <div class="outliner-empty">No project assets loaded.</div>
+              <div class="outliner-empty">No workspace data loaded.</div>
             </div>
           </section>
           <div class="pick-anchor-marker" id="pick-anchor-marker" aria-hidden="true" hidden></div>

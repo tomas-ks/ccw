@@ -12,6 +12,8 @@ mod opencode_acp;
 mod opencode_executor;
 #[path = "server/schema_reference.rs"]
 mod schema_reference;
+#[path = "server/semantic_outliner.rs"]
+mod semantic_outliner;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -88,6 +90,7 @@ const PACKAGE_API_PATH: &str = "/api/package";
 const GEOMETRY_CATALOG_API_PATH: &str = "/api/geometry/catalog";
 const GEOMETRY_INSTANCES_API_PATH: &str = "/api/geometry/instances";
 const GEOMETRY_DEFINITIONS_API_PATH: &str = "/api/geometry/definitions";
+const SEMANTIC_OUTLINER_API_PATH: &str = "/api/semantic/outliner";
 const PATH_ANNOTATIONS_API_PATH: &str = "/api/annotations/path";
 const MAX_GEOMETRY_BATCH_IDS: usize = 5_000;
 const GEOMETRY_INSTANCE_IDS_FIELD: &str = "instance_ids";
@@ -1341,6 +1344,13 @@ enum AgentUiAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resource: Option<String>,
     },
+    #[serde(rename = "elements.set_visible")]
+    ElementsSetVisible {
+        semantic_ids: Vec<String>,
+        visible: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "elements.select")]
     ElementsSelect {
         semantic_ids: Vec<String>,
@@ -1359,6 +1369,8 @@ enum AgentUiAction {
     ViewerFrameVisible,
     #[serde(rename = "viewer.clear_inspection")]
     ViewerClearInspection,
+    #[serde(rename = "viewer.reset_default_view")]
+    ViewerResetDefaultView,
     #[serde(rename = "viewer.section.set")]
     ViewerSectionSet { section: serde_json::Value },
     #[serde(rename = "viewer.section.clear")]
@@ -1419,6 +1431,7 @@ struct AgentActionCandidate {
     db_node_ids: Vec<i64>,
     resource: Option<String>,
     inspection_mode: Option<InspectionUpdateMode>,
+    visible: Option<bool>,
 }
 
 impl AgentActionCandidate {
@@ -1429,6 +1442,7 @@ impl AgentActionCandidate {
             db_node_ids,
             resource: None,
             inspection_mode: None,
+            visible: None,
         }
     }
 
@@ -1439,6 +1453,7 @@ impl AgentActionCandidate {
             db_node_ids: Vec::new(),
             resource: None,
             inspection_mode: None,
+            visible: None,
         }
     }
 
@@ -1449,6 +1464,7 @@ impl AgentActionCandidate {
             db_node_ids: Vec::new(),
             resource: None,
             inspection_mode: None,
+            visible: None,
         }
     }
 
@@ -1459,6 +1475,7 @@ impl AgentActionCandidate {
             db_node_ids: Vec::new(),
             resource: None,
             inspection_mode: None,
+            visible: None,
         }
     }
 
@@ -1473,6 +1490,7 @@ impl AgentActionCandidate {
             db_node_ids: Vec::new(),
             resource: None,
             inspection_mode: Some(mode),
+            visible: None,
         }
     }
 
@@ -1483,6 +1501,7 @@ impl AgentActionCandidate {
             db_node_ids: vec![db_node_id],
             resource: None,
             inspection_mode: None,
+            visible: None,
         }
     }
 
@@ -1493,6 +1512,7 @@ impl AgentActionCandidate {
             db_node_ids: Vec::new(),
             resource: None,
             inspection_mode: None,
+            visible: None,
         }
     }
 
@@ -1503,6 +1523,7 @@ impl AgentActionCandidate {
             db_node_ids: Vec::new(),
             resource: None,
             inspection_mode: None,
+            visible: None,
         }
     }
 
@@ -1891,6 +1912,13 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<ServerState>) -> Result<
                 serve_resources_api(&mut stream, request.method == "HEAD", state)
             } else if request_path == AGENT_CAPABILITIES_API_PATH {
                 serve_agent_capabilities_api(&mut stream, request.method == "HEAD", state)
+            } else if request_path == SEMANTIC_OUTLINER_API_PATH {
+                semantic_outliner::serve_semantic_outliner_api(
+                    &mut stream,
+                    request.method == "HEAD",
+                    &request,
+                    state,
+                )
             } else if request_path == CYPHER_API_PATH
                 || request_path == PACKAGE_API_PATH
                 || request_path == GEOMETRY_CATALOG_API_PATH
@@ -5439,6 +5467,15 @@ fn agent_ui_action_from_backend(action: BackendAgentUiAction) -> AgentUiAction {
             semantic_ids,
             resource,
         },
+        BackendAgentUiAction::ElementsSetVisible {
+            semantic_ids,
+            visible,
+            resource,
+        } => AgentUiAction::ElementsSetVisible {
+            semantic_ids,
+            visible,
+            resource,
+        },
         BackendAgentUiAction::ElementsSelect {
             semantic_ids,
             resource,
@@ -5461,6 +5498,7 @@ fn agent_ui_action_from_backend(action: BackendAgentUiAction) -> AgentUiAction {
         },
         BackendAgentUiAction::ViewerFrameVisible => AgentUiAction::ViewerFrameVisible,
         BackendAgentUiAction::ViewerClearInspection => AgentUiAction::ViewerClearInspection,
+        BackendAgentUiAction::ViewerResetDefaultView => AgentUiAction::ViewerResetDefaultView,
         BackendAgentUiAction::ViewerSectionSet { section } => {
             AgentUiAction::ViewerSectionSet { section }
         }
@@ -5826,6 +5864,20 @@ fn validate_agent_action_candidate(
                 resource: candidate.resource,
             })
         }
+        "elements.set_visible" => {
+            if !candidate.db_node_ids.is_empty() {
+                return Err("elements.set_visible does not accept dbNodeIds".to_owned());
+            }
+            let semantic_ids = normalize_agent_semantic_ids(candidate.semantic_ids)?;
+            let visible = candidate
+                .visible
+                .ok_or_else(|| "elements.set_visible requires visible".to_owned())?;
+            Ok(AgentUiAction::ElementsSetVisible {
+                semantic_ids,
+                visible,
+                resource: candidate.resource,
+            })
+        }
         "elements.select" => {
             if !candidate.db_node_ids.is_empty() {
                 return Err("elements.select does not accept dbNodeIds".to_owned());
@@ -5859,6 +5911,12 @@ fn validate_agent_action_candidate(
             }
             Ok(AgentUiAction::ViewerClearInspection)
         }
+        "viewer.reset_default_view" => {
+            if !candidate.semantic_ids.is_empty() || !candidate.db_node_ids.is_empty() {
+                return Err("viewer.reset_default_view does not accept ids".to_owned());
+            }
+            Ok(AgentUiAction::ViewerResetDefaultView)
+        }
         other => Err(format!("unsupported agent UI action kind `{other}`")),
     }
 }
@@ -5870,6 +5928,8 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
     let mut hide_seen = HashSet::new();
     let mut merged_show_groups = Vec::<(Option<String>, Vec<String>)>::new();
     let mut show_seen = HashSet::new();
+    let mut merged_set_visible_groups = Vec::<(bool, Option<String>, Vec<String>)>::new();
+    let mut set_visible_seen = HashSet::new();
     let mut merged_select_groups = Vec::<(Option<String>, Vec<String>)>::new();
     let mut select_seen = HashSet::new();
     let mut merged_inspect_groups =
@@ -5880,10 +5940,12 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
     let mut properties_show_present = false;
     let mut elements_hide_present = false;
     let mut elements_show_present = false;
+    let mut elements_set_visible_present = false;
     let mut elements_select_present = false;
     let mut inspect_modes_present = HashSet::new();
     let mut frame_visible_present = false;
     let mut clear_inspection_present = false;
+    let mut reset_default_view_present = false;
     let mut section_set_present = false;
     let mut section_clear_present = false;
     let mut latest_section = None::<serde_json::Value>;
@@ -5967,12 +6029,36 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                     );
                 }
             }
+            AgentUiAction::ElementsSetVisible {
+                semantic_ids,
+                visible,
+                resource,
+            } => {
+                if !elements_set_visible_present {
+                    order.push(4u8);
+                    elements_set_visible_present = true;
+                }
+                let group_index = merged_set_visible_groups
+                    .iter()
+                    .position(|(existing_visible, existing_resource, _)| {
+                        existing_visible == &visible && existing_resource == &resource
+                    })
+                    .unwrap_or_else(|| {
+                        merged_set_visible_groups.push((visible, resource.clone(), Vec::new()));
+                        merged_set_visible_groups.len() - 1
+                    });
+                for semantic_id in semantic_ids {
+                    if set_visible_seen.insert((visible, resource.clone(), semantic_id.clone())) {
+                        merged_set_visible_groups[group_index].2.push(semantic_id);
+                    }
+                }
+            }
             AgentUiAction::ElementsSelect {
                 semantic_ids,
                 resource,
             } => {
                 if !elements_select_present {
-                    order.push(4u8);
+                    order.push(5u8);
                     elements_select_present = true;
                 }
                 for semantic_id in semantic_ids {
@@ -5990,7 +6076,7 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                 mode,
             } => {
                 if inspect_modes_present.insert(mode) {
-                    order.push(5u8 + mode.order_key());
+                    order.push(6u8 + mode.order_key());
                 }
                 for semantic_id in semantic_ids {
                     push_inspection_action_group(
@@ -6004,26 +6090,32 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
             }
             AgentUiAction::ViewerFrameVisible => {
                 if !frame_visible_present {
-                    order.push(8u8);
+                    order.push(9u8);
                     frame_visible_present = true;
                 }
             }
             AgentUiAction::ViewerClearInspection => {
                 if !clear_inspection_present {
-                    order.push(9u8);
+                    order.push(10u8);
                     clear_inspection_present = true;
+                }
+            }
+            AgentUiAction::ViewerResetDefaultView => {
+                if !reset_default_view_present {
+                    order.push(11u8);
+                    reset_default_view_present = true;
                 }
             }
             AgentUiAction::ViewerSectionSet { section } => {
                 if !section_set_present {
-                    order.push(10u8);
+                    order.push(12u8);
                     section_set_present = true;
                 }
                 latest_section = Some(section);
             }
             AgentUiAction::ViewerSectionClear => {
                 if !section_clear_present {
-                    order.push(11u8);
+                    order.push(13u8);
                     section_clear_present = true;
                 }
             }
@@ -6036,14 +6128,14 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                 max_samples,
             } => {
                 if !annotations_show_present {
-                    order.push(12u8);
+                    order.push(14u8);
                     annotations_show_present = true;
                 }
                 latest_path_annotation = Some((resource, path, line, markers, mode, max_samples));
             }
             AgentUiAction::ViewerAnnotationsClear { resource } => {
                 if !annotations_clear_present {
-                    order.push(13u8);
+                    order.push(15u8);
                     annotations_clear_present = true;
                 }
                 latest_annotations_clear_resource = Some(resource);
@@ -6095,7 +6187,21 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                     }
                 }
             }
-            4 if merged_select_groups.iter().any(|(_, ids)| !ids.is_empty()) => {
+            4 if merged_set_visible_groups
+                .iter()
+                .any(|(_, _, ids)| !ids.is_empty()) =>
+            {
+                for (visible, resource, semantic_ids) in &merged_set_visible_groups {
+                    if !semantic_ids.is_empty() {
+                        normalized.push(AgentUiAction::ElementsSetVisible {
+                            semantic_ids: semantic_ids.clone(),
+                            visible: *visible,
+                            resource: resource.clone(),
+                        });
+                    }
+                }
+            }
+            5 if merged_select_groups.iter().any(|(_, ids)| !ids.is_empty()) => {
                 for (resource, semantic_ids) in &merged_select_groups {
                     if !semantic_ids.is_empty() {
                         normalized.push(AgentUiAction::ElementsSelect {
@@ -6105,11 +6211,11 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                     }
                 }
             }
-            5..=7 => {
+            6..=8 => {
                 let mode = match kind {
-                    5 => InspectionUpdateMode::Replace,
-                    6 => InspectionUpdateMode::Add,
-                    7 => InspectionUpdateMode::Remove,
+                    6 => InspectionUpdateMode::Replace,
+                    7 => InspectionUpdateMode::Add,
+                    8 => InspectionUpdateMode::Remove,
                     _ => unreachable!(),
                 };
                 let semantic_ids = merged_inspect_groups
@@ -6132,15 +6238,16 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                     });
                 }
             }
-            8 => normalized.push(AgentUiAction::ViewerFrameVisible),
-            9 => normalized.push(AgentUiAction::ViewerClearInspection),
-            10 => {
+            9 => normalized.push(AgentUiAction::ViewerFrameVisible),
+            10 => normalized.push(AgentUiAction::ViewerClearInspection),
+            11 => normalized.push(AgentUiAction::ViewerResetDefaultView),
+            12 => {
                 if let Some(section) = latest_section.clone() {
                     normalized.push(AgentUiAction::ViewerSectionSet { section });
                 }
             }
-            11 => normalized.push(AgentUiAction::ViewerSectionClear),
-            12 => {
+            13 => normalized.push(AgentUiAction::ViewerSectionClear),
+            14 => {
                 if let Some((resource, path, line, markers, mode, max_samples)) =
                     latest_path_annotation.clone()
                 {
@@ -6154,7 +6261,7 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                     });
                 }
             }
-            13 => normalized.push(AgentUiAction::ViewerAnnotationsClear {
+            15 => normalized.push(AgentUiAction::ViewerAnnotationsClear {
                 resource: latest_annotations_clear_resource.clone().flatten(),
             }),
             _ => {}
@@ -8357,6 +8464,7 @@ mod tests {
             db_node_ids: Vec::new(),
             resource: None,
             inspection_mode: None,
+            visible: None,
         }])
         .unwrap_err();
 
@@ -8373,6 +8481,7 @@ mod tests {
                 db_node_ids: vec![215],
                 resource: None,
                 inspection_mode: None,
+                visible: None,
             },
             AgentActionCandidate::elements_hide(vec![
                 "A".to_owned(),

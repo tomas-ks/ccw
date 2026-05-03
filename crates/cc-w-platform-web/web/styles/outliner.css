@@ -3,8 +3,8 @@
   top: 12px;
   left: 12px;
   z-index: 18;
-  width: min(320px, calc(100% - 24px));
-  max-height: min(420px, calc(100% - 24px));
+  width: min(360px, calc(100% - 24px));
+  max-height: min(75%, calc(100% - 24px));
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -26,6 +26,17 @@
   gap: 10px;
   padding: 11px 12px;
   border-bottom: 1px solid var(--border-subtle);
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+
+.outliner-window.dragging .outliner-header {
+  cursor: grabbing;
+}
+
+.outliner-header-actions {
+  cursor: default;
 }
 
 .outliner-title {
@@ -40,6 +51,14 @@
   color: var(--text-muted);
 }
 
+.outliner-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.outliner-reset-button,
 .outliner-close-button {
   width: 24px;
   height: 22px;
@@ -47,9 +66,59 @@
 }
 
 .outliner-body {
+  flex: 1 1 auto;
   min-height: 0;
-  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   padding: 8px;
+}
+
+.outliner-facet-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 0;
+  overflow-x: auto;
+  padding: 0;
+  margin: 0 0 8px;
+  border-bottom: 1px solid var(--border-subtle);
+  scrollbar-width: none;
+}
+
+.outliner-facet-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.outliner-facet-tab {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 78px;
+  margin: 0 0 -1px -1px;
+  padding: 5px 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px 6px 0 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 1.15;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.outliner-facet-tab:first-child {
+  margin-left: 0;
+}
+
+.outliner-facet-tab:hover,
+.outliner-facet-tab.active {
+  color: var(--text);
+  background: var(--surface-elevated);
+  border-color: var(--border-strong);
+  border-bottom-color: var(--surface-elevated);
 }
 
 .outliner-empty {
@@ -58,15 +127,30 @@
   font-size: 12px;
 }
 
+.outliner-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
 .outliner-row {
+  box-sizing: border-box;
   width: 100%;
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: 18px minmax(0, 1fr) 120px;
   align-items: center;
-  gap: 9px;
-  padding: 8px;
+  gap: 7px;
+  padding: 7px 6px;
   border-radius: 6px;
   color: inherit;
+}
+
+.outliner-group-row {
+  --outliner-indent: calc(var(--outliner-depth, 0) * 14px);
+}
+
+.outliner-bucket-row {
+  color: var(--text-muted);
 }
 
 .outliner-row:hover {
@@ -87,8 +171,97 @@
   font-weight: 600;
 }
 
+.outliner-name-stack {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.outliner-group-row .outliner-name-stack {
+  padding-left: var(--outliner-indent);
+}
+
+.outliner-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-soft);
+  font-size: 10px;
+}
+
+.outliner-row-meta {
+  display: grid;
+  grid-template-columns: 20px 42px 42px;
+  align-items: center;
+  gap: 5px;
+  width: auto;
+  min-width: 0;
+  justify-self: end;
+  justify-content: end;
+}
+
+.outliner-inspect-toggle {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-subtle);
+  border-radius: 5px;
+  background: var(--surface-control);
+  color: var(--text-soft);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.outliner-inspect-toggle:hover,
+.outliner-inspect-toggle.active {
+  color: var(--text);
+  background: var(--hover-accent);
+  border-color: var(--accent);
+}
+
+.outliner-inspect-toggle.mixed {
+  border-style: dashed;
+}
+
+.outliner-inspect-toggle:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.outliner-source-badge {
+  max-width: 42px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 5px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 5px;
+  color: var(--text-soft);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.outliner-source-slot {
+  width: 42px;
+  min-width: 0;
+  display: inline-flex;
+  justify-content: center;
+}
+
 .outliner-count {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   font-size: 11px;
   color: var(--text-muted);
   white-space: nowrap;
+  text-align: right;
 }

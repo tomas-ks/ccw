@@ -1616,6 +1616,7 @@ struct WebViewerViewState {
     total_elements: usize,
     total_instances: usize,
     total_definitions: usize,
+    list_element_ids: Vec<String>,
     default_element_ids: Vec<String>,
     base_visible_element_ids: Vec<String>,
     visible_element_ids: Vec<String>,
@@ -2568,6 +2569,26 @@ pub fn viewer_show_elements(ids: Array) -> Result<u32, JsValue> {
         let changed = state.runtime_scene.show_elements(ids.iter()) as u32;
         let inspection_changed = state.runtime_scene.clear_inspection() as u32;
         let events = state.commit_show_change(&ids, changed, inspection_changed)?;
+        Ok((changed, events))
+    })?;
+    dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
+    Ok(changed)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn viewer_set_elements_visible(ids: Array, visible: bool) -> Result<u32, JsValue> {
+    let (changed, events) = with_web_viewer_state_mut(|state| {
+        let ids = semantic_ids_from_array(&ids)?;
+        let changed = if visible {
+            state.runtime_scene.show_elements(ids.iter()) as u32
+        } else {
+            state.runtime_scene.hide_elements(ids.iter()) as u32
+        };
+        let mut events = vec![state.upload_runtime_scene(false)?];
+        if changed > 0 {
+            events.push(state.viewer_state_change_event("visibility")?);
+        }
         Ok((changed, events))
     })?;
     dispatch_web_events(events).map_err(|error| JsValue::from_str(&error))?;
@@ -5229,6 +5250,13 @@ impl WebViewerState {
             total_elements: catalog.elements.len(),
             total_instances: catalog.instances.len(),
             total_definitions: catalog.definitions.len(),
+            list_element_ids: semantic_ids_to_strings(
+                catalog
+                    .elements
+                    .iter()
+                    .map(|element| element.id.clone())
+                    .collect(),
+            ),
             default_element_ids: semantic_ids_to_strings(default_element_ids),
             base_visible_element_ids: semantic_ids_to_strings(
                 self.runtime_scene.base_visible_element_ids(),

@@ -279,6 +279,13 @@ pub enum PlannedUiAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resource: Option<String>,
     },
+    #[serde(rename = "elements.set_visible")]
+    ElementsSetVisible {
+        semantic_ids: Vec<String>,
+        visible: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
     #[serde(rename = "elements.select")]
     ElementsSelect {
         semantic_ids: Vec<String>,
@@ -297,6 +304,8 @@ pub enum PlannedUiAction {
     ViewerFrameVisible,
     #[serde(rename = "viewer.clear_inspection")]
     ViewerClearInspection,
+    #[serde(rename = "viewer.reset_default_view")]
+    ViewerResetDefaultView,
     #[serde(rename = "viewer.section.set")]
     ViewerSectionSet { section: Value },
     #[serde(rename = "viewer.section.clear")]
@@ -2568,6 +2577,18 @@ fn native_action_candidate_from_tool_call(
             }
             candidate
         }),
+        "elements_set_visible" | "viewer_elements_set_visible" => {
+            native_semantic_ids_from_input(input)
+                .zip(native_visible_from_input(input))
+                .map(|(semantic_ids, visible)| {
+                    let mut candidate =
+                        AgentActionCandidate::elements_set_visible(semantic_ids, visible);
+                    if let Some(resource) = native_resource_from_input(input) {
+                        candidate = candidate.with_resource(resource);
+                    }
+                    candidate
+                })
+        }
         "elements_select" => native_semantic_ids_from_input(input).map(|semantic_ids| {
             let mut candidate = AgentActionCandidate::elements_select(semantic_ids);
             if let Some(resource) = native_resource_from_input(input) {
@@ -2596,6 +2617,7 @@ fn native_action_candidate_from_tool_call(
             candidate
         }),
         "viewer_clear_inspection" => Some(AgentActionCandidate::viewer_clear_inspection()),
+        "viewer_reset_default_view" => Some(AgentActionCandidate::viewer_reset_default_view()),
         "viewer_frame_visible" => Some(AgentActionCandidate::viewer_frame_visible()),
         "viewer_section_set" => {
             native_section_from_input(input).map(AgentActionCandidate::viewer_section_set)
@@ -2827,6 +2849,14 @@ fn native_inspection_mode_from_input(
         .unwrap_or_default()
 }
 
+fn native_visible_from_input(input: &serde_json::Map<String, Value>) -> Option<bool> {
+    input
+        .get("visible")
+        .or_else(|| input.get("is_visible"))
+        .or_else(|| input.get("isVisible"))
+        .and_then(Value::as_bool)
+}
+
 fn native_db_node_ids_from_input(input: &serde_json::Map<String, Value>) -> Option<Vec<i64>> {
     let ids = input
         .get("db_node_ids")
@@ -3003,6 +3033,18 @@ fn map_planned_ui_action(action: PlannedUiAction) -> AgentActionCandidate {
                 candidate
             }
         }
+        PlannedUiAction::ElementsSetVisible {
+            semantic_ids,
+            visible,
+            resource,
+        } => {
+            let candidate = AgentActionCandidate::elements_set_visible(semantic_ids, visible);
+            if let Some(resource) = resource {
+                candidate.with_resource(resource)
+            } else {
+                candidate
+            }
+        }
         PlannedUiAction::ElementsSelect {
             semantic_ids,
             resource,
@@ -3028,6 +3070,9 @@ fn map_planned_ui_action(action: PlannedUiAction) -> AgentActionCandidate {
         }
         PlannedUiAction::ViewerFrameVisible => AgentActionCandidate::viewer_frame_visible(),
         PlannedUiAction::ViewerClearInspection => AgentActionCandidate::viewer_clear_inspection(),
+        PlannedUiAction::ViewerResetDefaultView => {
+            AgentActionCandidate::viewer_reset_default_view()
+        }
         PlannedUiAction::ViewerSectionSet { section } => {
             AgentActionCandidate::viewer_section_set(normalize_native_section_value(section))
         }
@@ -3369,8 +3414,8 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
         .expect("schema example should serialize"),
         "Allowed toolCalls kinds are only `get_schema_context`, `get_model_details`, `get_entity_reference`, `get_query_playbook`, `get_relation_reference`, `run_readonly_cypher`, `run_project_readonly_cypher`, `describe_nodes`, `get_node_properties`, `get_neighbors`, and `emit_ui_actions`.".to_owned(),
         "Do not invent `request_tools`; use the concrete tools above directly.".to_owned(),
-        "Allowed UI actions are only `graph.set_seeds`, `properties.show_node`, `elements.hide`, `elements.show`, `elements.select`, `elements.inspect`, `viewer.frame_visible`, `viewer.clear_inspection`, `viewer.section.set`, `viewer.section.clear`, `viewer.annotations.show_path`, and `viewer.annotations.clear`.".to_owned(),
-        "Use exact action payload field names: `db_node_ids` for graph seeds, `db_node_id` for properties.show_node, `semantic_ids` for element actions, `section` for `viewer.section.set`, and `resource`, `path`, optional `line`, `markers`, and optional `mode` for `viewer.annotations.show_path`.".to_owned(),
+        "Allowed UI actions are only `graph.set_seeds`, `properties.show_node`, `elements.hide`, `elements.show`, `elements.set_visible`, `elements.select`, `elements.inspect`, `viewer.frame_visible`, `viewer.clear_inspection`, `viewer.reset_default_view`, `viewer.section.set`, `viewer.section.clear`, `viewer.annotations.show_path`, and `viewer.annotations.clear`.".to_owned(),
+        "Use exact action payload field names: `db_node_ids` for graph seeds, `db_node_id` for properties.show_node, `semantic_ids` for element actions, `visible` for `elements.set_visible`, `section` for `viewer.section.set`, and `resource`, `path`, optional `line`, `markers`, and optional `mode` for `viewer.annotations.show_path`.".to_owned(),
         "`viewer.section.set` requires a `section` object with `pose.origin`, `pose.tangent`, `pose.normal`, `pose.up`, `width`, `height`, and `thickness`; `normal` is the section plane normal and `tangent` is the in-plane width direction. For a requested cross section, use `clip: \"clip-positive-normal\"` by default; use `clip: \"none\"` only for a visible overlay plane without clipping.".to_owned(),
         "`viewer.annotations.show_path` must reference an explicit path source. For IFC alignments, use `path: { kind: \"ifc_alignment\", id: <resolver_alignment_id>, measure: \"station\" }` where the id came from `ifc_alignment_catalog`; use `mode: \"add\"` for additive follow-ups and omit mode or use `replace` for a fresh annotation. For marker-only additive follow-ups, omit `line`; `line: {}` and `line: { ranges: [{}] }` mean the whole explicit path. Use `to_end: true` for a range that ends at the explicit IFC path end; never guess a numeric end station. Never include raw polyline, point, coordinate, or vertex arrays in annotation payloads.".to_owned(),
         "Path annotation ranges have two coordinate modes: `from`/`to` are absolute station or chainage values, while `from_offset`/`to_offset` are relative distances from the explicit path start. For `station 100 to 200`, emit `{ \"from\": 100, \"to\": 200 }` only. Never combine `from` with `from_offset`, never combine `to` with `to_offset`, and never combine `to_end` with `to` or `to_offset`.".to_owned(),
@@ -3396,9 +3441,9 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
         "- Read-only applies to graph/database inspection only. You are allowed to carry out approved viewer actions by returning them in `emit_ui_actions`.".to_owned(),
         "- When the user asks to hide, show, select, inspect, clear inspection, seed the graph, reveal properties, or frame the scene, prefer returning the corresponding validated viewer action instead of refusing on the grounds that this is a planning phase.".to_owned(),
         "- Treat `show`, `reveal`, or `display` for a concrete element as `elements.show`; do not also seed/open the graph unless the user explicitly asks for relations, graph, neighborhood, or connections.".to_owned(),
-        "- If the user says they are done with inspection, thanks you after an inspection, or asks to return to normal rendering, emit `viewer.clear_inspection`.".to_owned(),
+        "- If the user says they are done with inspection, thanks you after an inspection, or asks to return to normal rendering, emit `viewer.clear_inspection`. If they ask to reset everything, clear all temporary visibility, or return to the default view, emit `viewer.reset_default_view`.".to_owned(),
         "- Inspection is stateful: `elements.inspect` with `mode: \"replace\"` replaces the current inspection focus, `mode: \"add\"` preserves the existing focus and adds the returned ids, and `mode: \"remove\"` removes only those ids from the current focus.".to_owned(),
-        "- `elements.hide`, `elements.show`, `elements.select`, and `elements.inspect` require renderable semantic ids, usually returned from `GlobalId` / `global_id` columns. In project mode, carry the source IFC resource with those ids.".to_owned(),
+        "- `elements.hide`, `elements.show`, `elements.set_visible`, `elements.select`, and `elements.inspect` require renderable semantic ids, usually returned from `GlobalId` / `global_id` columns. In project mode, carry the source IFC resource with those ids. `elements.set_visible` is visibility-only and must not be used when the user expects framing/reveal behavior; use `elements.show` for user-facing show/reveal/display requests.".to_owned(),
         "- If the query only returns DB node ids, use `graph.set_seeds`; do not emit element actions from DB ids alone.".to_owned(),
         "- Learn the general difference between semantic/container nodes and visible/product nodes. Do not rely on one-off entity exceptions alone.".to_owned(),
         "- Treat facility roots, project/site/building/storey nodes, relation nodes, aggregate/group nodes, and many `*Part` subdivision nodes as likely semantic/container candidates until the live graph proves otherwise.".to_owned(),
@@ -4026,6 +4071,7 @@ fn normalize_ui_action(action: Value) -> Value {
         }
         Some("elements.hide")
         | Some("elements.show")
+        | Some("elements.set_visible")
         | Some("elements.select")
         | Some("elements.inspect") => {
             if let Some(Value::Array(ids)) = semantic_ids {
@@ -4035,6 +4081,19 @@ fn normalize_ui_action(action: Value) -> Value {
                 normalized.remove("element_ids");
                 if normalized.get("ids") == Some(&Value::Array(ids.clone())) {
                     normalized.remove("ids");
+                }
+            }
+            if matches!(
+                normalized.get("kind").and_then(Value::as_str),
+                Some("elements.set_visible")
+            ) {
+                if let Some(visible) =
+                    get_first_value(&normalized, &["visible", "is_visible", "isVisible"])
+                        .and_then(|value| value.as_bool())
+                {
+                    normalized.insert("visible".to_owned(), Value::Bool(visible));
+                    normalized.remove("is_visible");
+                    normalized.remove("isVisible");
                 }
             }
             if matches!(
@@ -4110,6 +4169,11 @@ fn normalize_ui_action_kind(kind: &str) -> Option<String> {
         "elements.show" | "elements.showElements" | "elementsShow" => {
             Some("elements.show".to_owned())
         }
+        "elements.set_visible"
+        | "elements.setVisible"
+        | "elementsSetVisible"
+        | "elements.visibility"
+        | "elementsVisibility" => Some("elements.set_visible".to_owned()),
         "elements.select" | "elements.selectElements" | "elementsSelect" => {
             Some("elements.select".to_owned())
         }
@@ -4124,6 +4188,11 @@ fn normalize_ui_action_kind(kind: &str) -> Option<String> {
         | "viewerClearInspection"
         | "clear_inspection"
         | "clearInspection" => Some("viewer.clear_inspection".to_owned()),
+        "viewer.reset_default_view"
+        | "viewer.resetDefaultView"
+        | "viewerResetDefaultView"
+        | "reset_default_view"
+        | "resetDefaultView" => Some("viewer.reset_default_view".to_owned()),
         "viewer.section.set" | "viewer.sectionSet" | "viewerSectionSet" | "section.set"
         | "sectionSet" | "setSection" => Some("viewer.section.set".to_owned()),
         "viewer.section.clear"
@@ -6153,6 +6222,7 @@ mod tests {
                         { "kind": "graphSetSeeds", "dbNodeIds": [215, 216], "sourceResource": "ifc/infra-road" },
                         { "kind": "propertiesShowNode", "dbNodeId": 215, "source_resource": "ifc/infra-road" },
                         { "kind": "elementsSelect", "semanticIds": ["wall-a"] },
+                        { "kind": "elementsSetVisible", "ids": ["hidden-spatial-a"], "visible": true, "sourceResource": "ifc/building-architecture" },
                         {
                             "kind": "setSection",
                             "spec": {
@@ -6184,6 +6254,7 @@ mod tests {
                                 ]
                             }
                         },
+                        { "kind": "resetDefaultView" },
                         { "kind": "frame" }
                     ]
                 }
@@ -6208,6 +6279,11 @@ mod tests {
                     PlannedUiAction::ElementsSelect {
                         semantic_ids: vec!["wall-a".to_owned()],
                         resource: None,
+                    },
+                    PlannedUiAction::ElementsSetVisible {
+                        semantic_ids: vec!["hidden-spatial-a".to_owned()],
+                        visible: true,
+                        resource: Some("ifc/building-architecture".to_owned()),
                     },
                     PlannedUiAction::ViewerSectionSet {
                         section: serde_json::json!({
@@ -6241,6 +6317,7 @@ mod tests {
                         mode: Some(serde_json::json!("append")),
                         max_samples: None,
                     },
+                    PlannedUiAction::ViewerResetDefaultView,
                     PlannedUiAction::ViewerFrameVisible,
                 ]
             }]

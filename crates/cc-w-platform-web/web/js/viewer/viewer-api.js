@@ -22,6 +22,7 @@ import {
   viewer_select_elements,
   viewer_selected_element_ids,
   viewer_set_clear_color,
+  viewer_set_elements_visible,
   viewer_set_profile,
   viewer_set_reference_grid_visible,
   viewer_set_view_mode,
@@ -184,6 +185,13 @@ export function createViewerApi(options = {}) {
     });
     return api.viewState();
   };
+  const resetDefaultView = () => {
+    viewer_clear_inspection();
+    const changed = viewer_reset_all_visibility();
+    streamNewlyVisibleGeometrySoon();
+    setViewModeSoon("default");
+    return changed;
+  };
   const pickAtSoon = (x, y) => {
     pickAtAsync(x, y).catch((error) => {
       console.error(`viewer pickAt(${x}, ${y}) failed`, error);
@@ -243,6 +251,16 @@ export function createViewerApi(options = {}) {
       streamNewlyVisibleGeometrySoon();
       return changed;
     },
+    setVisible: (ids, visible, options = {}) => {
+      const changed = viewer_set_elements_visible(
+        currentViewerElementIds(ids, options),
+        Boolean(visible)
+      );
+      if (visible) {
+        streamNewlyVisibleGeometrySoon();
+      }
+      return changed;
+    },
     suppress: (ids, options = {}) => {
       return viewer_suppress_elements(currentViewerElementIds(ids, options));
     },
@@ -261,6 +279,7 @@ export function createViewerApi(options = {}) {
       streamNewlyVisibleGeometrySoon();
       return changed;
     },
+    resetDefaultView,
     select: (ids, options = {}) => viewer_select_elements(currentViewerElementIds(ids, options)),
     clearSelection: () => viewer_clear_selection(),
     inspect: (ids, options = {}) => {

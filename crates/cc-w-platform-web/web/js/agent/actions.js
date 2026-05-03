@@ -239,6 +239,17 @@ export function createAgentActionApplier({
       return "elements.show";
     }
 
+    if (kind === "elements.set_visible" || kind === "elements.setvisible") {
+      const semanticIds = agentSemanticIds(action);
+      if (!semanticIds.length || typeof viewer.setVisible !== "function") {
+        return null;
+      }
+      viewer.setVisible(semanticIds, Boolean(action.visible), {
+        sourceResource: agentActionResource(action),
+      });
+      return "elements.set_visible";
+    }
+
     if (kind === "elements.select") {
       const semanticIds = agentSemanticIds(action);
       if (!semanticIds.length) {
@@ -268,6 +279,21 @@ export function createAgentActionApplier({
     if (kind === "viewer.clear_inspection" || kind === "viewer.clearinspection") {
       viewer.clearInspection();
       return "viewer.clear_inspection";
+    }
+
+    if (
+      kind === "viewer.reset_default_view" ||
+      kind === "viewer.resetdefaultview" ||
+      kind === "reset_default_view"
+    ) {
+      if (typeof viewer.resetDefaultView === "function") {
+        viewer.resetDefaultView();
+      } else {
+        viewer.clearInspection();
+        viewer.resetAllVisibility();
+        viewer.defaultView();
+      }
+      return "viewer.reset_default_view";
     }
 
     if (
