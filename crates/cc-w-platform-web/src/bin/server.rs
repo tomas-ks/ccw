@@ -178,6 +178,9 @@ const PROJECT_INFRA_MEMBERS: &[&str] = &[
 
 const PROJECT_BRIDGE_FOR_MINND_MEMBERS: &[&str] = &["ifc/bridge-for-minnd"];
 
+const PROJECT_SE_TRV_KOMPRIMERAT1_MEMBERS: &[&str] =
+    &["ifc/se-trv-bridge", "ifc/se-trv-road", "ifc/se-trv-light"];
+
 const DEFAULT_PROJECT_RESOURCE_CONFIG_NAME: &str = "project-resources.json";
 const PROJECT_GEOMETRY_LOCAL_ID_BITS: u32 = 48;
 const PROJECT_GEOMETRY_LOCAL_ID_MASK: u64 = (1u64 << PROJECT_GEOMETRY_LOCAL_ID_BITS) - 1;
@@ -197,6 +200,11 @@ const DEFAULT_PROJECT_RESOURCE_REGISTRY: &[DefaultProjectResourceSpec] = &[
         resource: "project/bridge-for-minnd",
         label: "BridgeForMINnD",
         members: PROJECT_BRIDGE_FOR_MINND_MEMBERS,
+    },
+    DefaultProjectResourceSpec {
+        resource: "project/se-trv-komprimerat1",
+        label: "SE-TRV Komprimerat1",
+        members: PROJECT_SE_TRV_KOMPRIMERAT1_MEMBERS,
     },
 ];
 
@@ -3066,6 +3074,7 @@ fn source_scope_prepared_package(
                 external_id: source_scoped_external_id(resource, &instance.external_id),
                 label: instance.label,
                 display_color: instance.display_color,
+                face_visibility: instance.face_visibility,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -7288,11 +7297,11 @@ mod tests {
         AgentTurnApiRequest, AgentUiAction, CypherResourceScope, CypherResourceTarget,
         CypherWorkerConfig, DEFAULT_CYPHER_WORKER_TIMEOUT_MS, GraphSubgraphMode,
         InspectionUpdateMode, PROJECT_BRIDGE_FOR_MINND_MEMBERS, PROJECT_BUILDING_MEMBERS,
-        PROJECT_GEOMETRY_LOCAL_ID_MASK, PROJECT_INFRA_MEMBERS, ProjectResourceConfigFile,
-        ProjectResourceRegistry, ServerState, add_cypher_source_provenance,
-        agent_capabilities_response, agent_model_provider, agent_turn_selection_summary,
-        available_server_resources, candidate_ports, content_type_for_path,
-        create_agent_session_api, dedup_sorted_ids, default_level_for_model,
+        PROJECT_GEOMETRY_LOCAL_ID_MASK, PROJECT_INFRA_MEMBERS, PROJECT_SE_TRV_KOMPRIMERAT1_MEMBERS,
+        ProjectResourceConfigFile, ProjectResourceRegistry, ServerState,
+        add_cypher_source_provenance, agent_capabilities_response, agent_model_provider,
+        agent_turn_selection_summary, available_server_resources, candidate_ports,
+        content_type_for_path, create_agent_session_api, dedup_sorted_ids, default_level_for_model,
         discovered_levels_by_model, execute_agent_turn_api, extract_db_node_ids,
         extract_project_semantic_element_ids, extract_semantic_element_ids,
         format_user_facing_agent_error, geometry_definition_batch_api_response,
@@ -7320,10 +7329,10 @@ mod tests {
         NullAgentProgressSink,
     };
     use cc_w_types::{
-        Bounds3, ExternalId, GeometryDefinitionBatch, GeometryDefinitionId, GeometryInstanceBatch,
-        GeometryInstanceCatalogEntry, GeometryInstanceId, PreparedGeometryDefinition,
-        PreparedGeometryElement, PreparedGeometryInstance, PreparedGeometryPackage, PreparedMesh,
-        SemanticElementId,
+        Bounds3, ExternalId, FaceVisibility, GeometryDefinitionBatch, GeometryDefinitionId,
+        GeometryInstanceBatch, GeometryInstanceCatalogEntry, GeometryInstanceId,
+        PreparedGeometryDefinition, PreparedGeometryElement, PreparedGeometryInstance,
+        PreparedGeometryPackage, PreparedMesh, SemanticElementId,
     };
     use cc_w_velr::CypherQueryResult;
 
@@ -7417,6 +7426,7 @@ mod tests {
             external_id: ExternalId::new(format!("external-{id}")),
             label: format!("Instance {id}"),
             display_color: None,
+            face_visibility: FaceVisibility::OneSided,
         }
     }
 
@@ -7451,6 +7461,7 @@ mod tests {
                 external_id: ExternalId::new("same-external"),
                 label: label.to_owned(),
                 display_color: None,
+                face_visibility: cc_w_types::FaceVisibility::OneSided,
             }],
         }
     }
@@ -7729,6 +7740,15 @@ mod tests {
                 .expect("BridgeForMINnD project should exist")
                 .members,
             PROJECT_BRIDGE_FOR_MINND_MEMBERS
+                .iter()
+                .map(|member| (*member).to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            project_resource_spec(&registry, "project/se-trv-komprimerat1")
+                .expect("SE-TRV project should exist")
+                .members,
+            PROJECT_SE_TRV_KOMPRIMERAT1_MEMBERS
                 .iter()
                 .map(|member| (*member).to_owned())
                 .collect::<Vec<_>>()

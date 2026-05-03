@@ -1352,6 +1352,13 @@ impl Default for PreparedMaterial {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FaceVisibility {
+    #[default]
+    OneSided,
+    DoubleSided,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedRenderDefinition {
     pub id: GeometryDefinitionId,
@@ -1376,6 +1383,7 @@ pub struct PreparedRenderInstance {
     pub world_bounds: Bounds3,
     pub material: PreparedMaterial,
     pub default_render_class: DefaultRenderClass,
+    pub face_visibility: FaceVisibility,
     pub render_role: PreparedRenderRole,
 }
 
@@ -1498,6 +1506,7 @@ pub struct PreparedGeometryDefinition {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DefaultRenderClass {
     Physical,
+    Course,
     Space,
     Zone,
     Helper,
@@ -1537,6 +1546,7 @@ pub struct PreparedGeometryInstance {
     pub external_id: ExternalId,
     pub label: String,
     pub display_color: Option<DisplayColor>,
+    pub face_visibility: FaceVisibility,
 }
 
 /// Transport-neutral boundary payload between geometry-processing backend and rendering frontend.
@@ -1617,6 +1627,7 @@ pub struct GeometryInstanceCatalogEntry {
     pub external_id: ExternalId,
     pub label: String,
     pub display_color: Option<DisplayColor>,
+    pub face_visibility: FaceVisibility,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1669,6 +1680,7 @@ impl GeometryCatalog {
                     external_id: instance.external_id.clone(),
                     label: instance.label.clone(),
                     display_color: instance.display_color,
+                    face_visibility: instance.face_visibility,
                 })
                 .collect(),
         }

@@ -909,6 +909,7 @@ impl RuntimeSceneState {
                             .element(&resident_instance.element_id)
                             .map(|element| element.default_render_class)
                             .unwrap_or(DefaultRenderClass::Physical),
+                        face_visibility: resident_instance.face_visibility,
                         render_role: self
                             .render_role_for_instance(resident_instance, inspection_active),
                     })
@@ -1129,12 +1130,14 @@ fn prepared_instance_from_catalog_entry(
         external_id: instance.external_id.clone(),
         label: instance.label.clone(),
         display_color: instance.display_color,
+        face_visibility: instance.face_visibility,
     }
 }
 
 fn default_visibility_for_class(class: DefaultRenderClass) -> bool {
     match class {
         DefaultRenderClass::Physical
+        | DefaultRenderClass::Course
         | DefaultRenderClass::Terrain
         | DefaultRenderClass::TerrainFeature
         | DefaultRenderClass::Vegetation
@@ -1459,6 +1462,7 @@ fn validate_geometry_catalog(catalog: &GeometryCatalog) -> Result<(), RuntimeErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cc_w_types::FaceVisibility;
     use cc_w_types::{
         Bounds3, DefaultRenderClass, DisplayColor, ExternalId, GeometryDefinitionId,
         GeometryInstanceId, GeometryStartViewRequest, PreparedGeometryDefinition,
@@ -1526,6 +1530,7 @@ mod tests {
                 external_id: ExternalId::new(external_id),
                 label: label.to_string(),
                 display_color: None,
+                face_visibility: FaceVisibility::OneSided,
             }],
         }
     }
@@ -1577,6 +1582,7 @@ mod tests {
                     external_id: ExternalId::new(external_id),
                     label: label.to_string(),
                     display_color: Some(DisplayColor::new(0.95, 0.56, 0.24)),
+                    face_visibility: FaceVisibility::OneSided,
                 },
                 PreparedGeometryInstance {
                     id: GeometryInstanceId(2),
@@ -1587,6 +1593,7 @@ mod tests {
                     external_id: ExternalId::new("synthetic/mapped/right"),
                     label: format!("{label} #2"),
                     display_color: Some(DisplayColor::new(0.24, 0.78, 0.55)),
+                    face_visibility: FaceVisibility::OneSided,
                 },
             ],
         }
@@ -1639,6 +1646,7 @@ mod tests {
                     external_id: ExternalId::new("synthetic/physical/item/1"),
                     label: "Physical".to_string(),
                     display_color: None,
+                    face_visibility: FaceVisibility::OneSided,
                 },
                 PreparedGeometryInstance {
                     id: GeometryInstanceId(2),
@@ -1649,6 +1657,7 @@ mod tests {
                     external_id: ExternalId::new("synthetic/space/item/1"),
                     label: "Space".to_string(),
                     display_color: None,
+                    face_visibility: FaceVisibility::OneSided,
                 },
             ],
         }
@@ -1714,6 +1723,7 @@ mod tests {
                     external_id: ExternalId::new("synthetic/stream/left/item/1"),
                     label: "Stream Left".to_string(),
                     display_color: None,
+                    face_visibility: FaceVisibility::OneSided,
                 },
                 PreparedGeometryInstance {
                     id: GeometryInstanceId(2),
@@ -1724,6 +1734,7 @@ mod tests {
                     external_id: ExternalId::new("synthetic/stream/right/item/1"),
                     label: "Stream Right".to_string(),
                     display_color: None,
+                    face_visibility: FaceVisibility::OneSided,
                 },
             ],
         }
@@ -1783,6 +1794,7 @@ mod tests {
                     external_id: ExternalId::new("synthetic/catalog/physical/item/1"),
                     label: "Catalog Physical".to_string(),
                     display_color: None,
+                    face_visibility: FaceVisibility::OneSided,
                 },
                 PreparedGeometryInstance {
                     id: GeometryInstanceId(2),
@@ -1793,6 +1805,7 @@ mod tests {
                     external_id: ExternalId::new("synthetic/catalog/space/item/1"),
                     label: "Catalog Space".to_string(),
                     display_color: None,
+                    face_visibility: FaceVisibility::OneSided,
                 },
             ],
         }
@@ -1821,6 +1834,12 @@ mod tests {
             vertices,
             indices,
         }
+    }
+
+    #[test]
+    fn default_visibility_keeps_ifc_courses_visible() {
+        assert!(default_visibility_for_class(DefaultRenderClass::Course));
+        assert!(!default_visibility_for_class(DefaultRenderClass::Space));
     }
 
     #[test]
@@ -2845,6 +2864,7 @@ mod tests {
                 external_id: ExternalId::new("synthetic/missing-definition"),
                 label: "Broken".to_string(),
                 display_color: None,
+                face_visibility: FaceVisibility::OneSided,
             }],
         };
         let source = SyntheticGeometryPackageSource::with_package("broken", package);
@@ -2875,6 +2895,7 @@ mod tests {
                 external_id: ExternalId::new("synthetic/missing-element/item/1"),
                 label: "Broken".to_string(),
                 display_color: None,
+                face_visibility: FaceVisibility::OneSided,
             }],
         };
         let source = SyntheticGeometryPackageSource::with_package("broken-elements", package);

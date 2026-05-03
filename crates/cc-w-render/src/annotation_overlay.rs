@@ -469,6 +469,7 @@ pub enum AnnotationOverlayError {
 
 pub(crate) fn annotation_overlay_geometry(
     layers: &[SceneAnnotationLayer],
+    render_origin: DVec3,
 ) -> Result<AnnotationOverlayGeometry, AnnotationOverlayError> {
     let mut geometry = AnnotationOverlayGeometry::default();
 
@@ -518,8 +519,8 @@ pub(crate) fn annotation_overlay_geometry(
                     for segment in polyline.points.windows(2) {
                         push_polyline_segment(
                             vertices,
-                            segment[0],
-                            segment[1],
+                            segment[0] - render_origin,
+                            segment[1] - render_origin,
                             polyline.width_px,
                             color,
                         );
@@ -558,7 +559,7 @@ pub(crate) fn annotation_overlay_geometry(
                     };
                     push_marker(
                         vertices,
-                        marker.position,
+                        marker.position - render_origin,
                         marker.size_px,
                         marker.kind,
                         color,
@@ -775,7 +776,8 @@ mod tests {
             SceneAnnotationPrimitive::Text(text),
         ];
 
-        let geometry = annotation_overlay_geometry(&[layer]).expect("valid annotation geometry");
+        let geometry =
+            annotation_overlay_geometry(&[layer], DVec3::ZERO).expect("valid annotation geometry");
 
         assert_eq!(geometry.layer_count, 1);
         assert_eq!(geometry.primitive_count, 3);
@@ -785,6 +787,43 @@ mod tests {
         assert_eq!(geometry.marker_draw_through_vertices.len(), 6);
         assert_eq!(geometry.text_labels.len(), 1);
         assert_eq!(geometry.polyline_depth_tested_vertices[0].color[3], 0.5);
+    }
+
+    #[test]
+    fn annotation_geometry_uploads_render_relative_positions() {
+        let render_origin = DVec3::new(6_000_000.0, 4_000_000.0, 720.0);
+        let mut layer = SceneAnnotationLayer::new("road");
+        layer
+            .primitives
+            .push(SceneAnnotationPrimitive::Polyline(ScenePolyline::new(
+                "alignment",
+                vec![
+                    render_origin + DVec3::new(10.0, 0.0, 1.0),
+                    render_origin + DVec3::new(20.0, 0.0, 1.0),
+                ],
+            )));
+        layer
+            .primitives
+            .push(SceneAnnotationPrimitive::Marker(SceneMarker::new(
+                "station",
+                render_origin + DVec3::new(15.0, 0.0, 1.0),
+            )));
+
+        let geometry = annotation_overlay_geometry(&[layer], render_origin)
+            .expect("valid annotation geometry");
+
+        assert_eq!(
+            geometry.polyline_depth_tested_vertices[0].start_position,
+            [10.0, 0.0, 1.0]
+        );
+        assert_eq!(
+            geometry.polyline_depth_tested_vertices[0].end_position,
+            [20.0, 0.0, 1.0]
+        );
+        assert_eq!(
+            geometry.marker_depth_tested_vertices[0].position,
+            [15.0, 0.0, 1.0]
+        );
     }
 
     #[test]
@@ -798,7 +837,7 @@ mod tests {
             )));
 
         assert_eq!(
-            annotation_overlay_geometry(&[layer]).unwrap_err(),
+            annotation_overlay_geometry(&[layer], DVec3::ZERO).unwrap_err(),
             AnnotationOverlayError::NonFinitePosition {
                 layer_index: 0,
                 primitive_index: 0,

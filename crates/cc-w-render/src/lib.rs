@@ -1,9 +1,9 @@
 use bytemuck::{Pod, Zeroable, bytes_of, cast_slice};
 use cc_w_types::{
-    Bounds3, DefaultRenderClass, GeometryDefinitionId, GeometryInstanceId, PickHit, PickRegion,
-    PickResult, PreparedMaterial, PreparedMesh, PreparedRenderDefinition, PreparedRenderInstance,
-    PreparedRenderRole, PreparedRenderScene, SceneAnnotationLayer, SceneTextDepthMode,
-    SceneTextLabel, SemanticElementId, WORLD_FORWARD, WORLD_RIGHT, WORLD_UP,
+    Bounds3, DefaultRenderClass, FaceVisibility, GeometryDefinitionId, GeometryInstanceId, PickHit,
+    PickRegion, PickResult, PreparedMaterial, PreparedMesh, PreparedRenderDefinition,
+    PreparedRenderInstance, PreparedRenderRole, PreparedRenderScene, SceneAnnotationLayer,
+    SceneTextDepthMode, SceneTextLabel, SemanticElementId, WORLD_FORWARD, WORLD_RIGHT, WORLD_UP,
 };
 use glam::{DMat4, DVec3, DVec4, Mat4, Vec3};
 use std::collections::{HashMap, HashSet};
@@ -37,7 +37,6 @@ use annotation_overlay::{
 pub const DEFAULT_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const ARCHITECTURAL_EDGE_WIDTH_PX: f32 = 3.5;
 const ARCHITECTURAL_CREASE_ANGLE_DEGREES: f32 = 30.0;
-const SCREEN_SPACE_OUTLINE_DEPTH_THRESHOLD: f32 = 0.004;
 pub const PICK_INDEX_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 pub const PICK_DEPTH_BITS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 const SCREEN_SPACE_OBJECT_ID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Uint;
@@ -98,12 +97,13 @@ fn vs_main(input : VertexInput) -> VertexOutput {
 }
 
 @fragment
-fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(input : VertexOutput, @builtin(front_facing) front_facing : bool) -> @location(0) vec4<f32> {
     let section_distance = dot(input.world_position, camera.clip_plane.xyz) + camera.clip_plane.w;
     if (camera.clip_params.x != 0.0 && section_distance * camera.clip_params.x > 0.0) {
         discard;
     }
-    let diffuse = max(dot(normalize(input.normal), normalize(lighting.light_direction.xyz)), 0.0);
+    let normal = normalize(select(-input.normal, input.normal, front_facing));
+    let diffuse = max(dot(normal, normalize(lighting.light_direction.xyz)), 0.0);
     let lit = lighting.factors.x + (diffuse * lighting.factors.y);
     return vec4<f32>(input.material_color.xyz * lit, input.material_color.w);
 }
@@ -164,12 +164,13 @@ fn vs_main(input : VertexInput) -> VertexOutput {
 }
 
 @fragment
-fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(input : VertexOutput, @builtin(front_facing) front_facing : bool) -> @location(0) vec4<f32> {
     let section_distance = dot(input.world_position, camera.clip_plane.xyz) + camera.clip_plane.w;
     if (camera.clip_params.x != 0.0 && section_distance * camera.clip_params.x > 0.0) {
         discard;
     }
-    let diffuse = max(dot(normalize(input.normal), normalize(lighting.light_direction.xyz)), 0.0);
+    let normal = normalize(select(-input.normal, input.normal, front_facing));
+    let diffuse = max(dot(normal, normalize(lighting.light_direction.xyz)), 0.0);
     let ambient_fill = max(lighting.factors.x, 0.46);
     let diffuse_fill = min(lighting.factors.y, 1.0 - ambient_fill);
     let lit = ambient_fill + (diffuse * diffuse_fill);
@@ -232,12 +233,13 @@ fn vs_main(input : VertexInput) -> VertexOutput {
 }
 
 @fragment
-fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(input : VertexOutput, @builtin(front_facing) front_facing : bool) -> @location(0) vec4<f32> {
     let section_distance = dot(input.world_position, camera.clip_plane.xyz) + camera.clip_plane.w;
     if (camera.clip_params.x != 0.0 && section_distance * camera.clip_params.x > 0.0) {
         discard;
     }
-    let diffuse = max(dot(normalize(input.normal), normalize(lighting.light_direction.xyz)), 0.0);
+    let normal = normalize(select(-input.normal, input.normal, front_facing));
+    let diffuse = max(dot(normal, normalize(lighting.light_direction.xyz)), 0.0);
     let lit = 0.62 + diffuse * 0.22;
     let neutral = vec3<f32>(0.48, 0.56, 0.66);
     let tint = mix(neutral, input.material_color.xyz, 0.28) * lit;
@@ -300,12 +302,13 @@ fn vs_main(input : VertexInput) -> VertexOutput {
 }
 
 @fragment
-fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(input : VertexOutput, @builtin(front_facing) front_facing : bool) -> @location(0) vec4<f32> {
     let section_distance = dot(input.world_position, camera.clip_plane.xyz) + camera.clip_plane.w;
     if (camera.clip_params.x == 0.0 || section_distance * camera.clip_params.x <= 0.0) {
         discard;
     }
-    let diffuse = max(dot(normalize(input.normal), normalize(lighting.light_direction.xyz)), 0.0);
+    let normal = normalize(select(-input.normal, input.normal, front_facing));
+    let diffuse = max(dot(normal, normalize(lighting.light_direction.xyz)), 0.0);
     let lit = 0.62 + diffuse * 0.22;
     let neutral = vec3<f32>(0.48, 0.60, 0.68);
     let tint = mix(neutral, input.material_color.xyz, 0.22) * lit;
@@ -383,7 +386,7 @@ fn decode_mask(pixel : vec4<u32>) -> u32 {
 }
 
 @fragment
-fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(input : VertexOutput, @builtin(front_facing) front_facing : bool) -> @location(0) vec4<f32> {
     let section_distance = dot(input.world_position, camera.clip_plane.xyz) + camera.clip_plane.w;
     if (camera.clip_params.x != 0.0 && section_distance * camera.clip_params.x > 0.0) {
         discard;
@@ -393,7 +396,8 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-    let diffuse = max(dot(normalize(input.normal), normalize(lighting.light_direction.xyz)), 0.0);
+    let normal = normalize(select(-input.normal, input.normal, front_facing));
+    let diffuse = max(dot(normal, normalize(lighting.light_direction.xyz)), 0.0);
     let lit = 0.68 + diffuse * 0.18;
     let neutral = vec3<f32>(0.50, 0.58, 0.68);
     let tint = mix(neutral, input.material_color.xyz, 0.18) * lit;
@@ -631,12 +635,12 @@ fn vs_main(input : VertexInput) -> VertexOutput {
 }
 
 @fragment
-fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(input : VertexOutput, @builtin(front_facing) front_facing : bool) -> @location(0) vec4<f32> {
     let section_distance = dot(input.world_position, camera.clip_plane.xyz) + camera.clip_plane.w;
     if (camera.clip_params.x != 0.0 && section_distance * camera.clip_params.x > 0.0) {
         discard;
     }
-    let normal = normalize(input.normal);
+    let normal = normalize(select(-input.normal, input.normal, front_facing));
     return vec4<f32>((normal * 0.5) + vec3<f32>(0.5), 1.0);
 }
 "#;
@@ -872,10 +876,7 @@ fn load_object_id(coord : vec2<i32>) -> u32 {
 @fragment
 fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
     let coord = vec2<i32>(floor(input.position.xy));
-    let center_depth = load_depth(coord);
     let center_id = load_object_id(coord);
-    let depth_threshold = max(camera.viewport_and_profile.w, 0.0001);
-    var depth_edge = 0.0;
     var object_edge = 0.0;
     let offsets = array<vec2<i32>, 4>(
         vec2<i32>(1, 0),
@@ -886,18 +887,13 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4<f32> {
 
     for (var i = 0u; i < 4u; i = i + 1u) {
         let neighbor_coord = coord + offsets[i];
-        let neighbor_depth = load_depth(neighbor_coord);
         let neighbor_id = load_object_id(neighbor_coord);
         if ((center_id != neighbor_id) && ((center_id != 0u) || (neighbor_id != 0u))) {
             object_edge = 1.0;
         }
-        if ((max(center_depth, neighbor_depth) > 0.000001) &&
-            (abs(center_depth - neighbor_depth) > depth_threshold)) {
-            depth_edge = 1.0;
-        }
     }
 
-    let alpha = max(object_edge * 0.74, depth_edge * 0.52);
+    let alpha = object_edge * 0.74;
     if (alpha <= 0.01) {
         discard;
     }
@@ -1129,6 +1125,120 @@ impl Default for RenderDefaults {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn create_triangle_mesh_pipeline(
+    device: &wgpu::Device,
+    label: &'static str,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    target_format: wgpu::TextureFormat,
+    blend: Option<wgpu::BlendState>,
+    defaults: RenderDefaults,
+    cull_mode: Option<wgpu::Face>,
+    depth_write_enabled: bool,
+    depth_compare: wgpu::CompareFunction,
+    depth_bias: wgpu::DepthBiasState,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[GpuVertex::layout(), GpuInstance::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: defaults.front_face,
+            cull_mode,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: defaults.depth_format,
+            depth_write_enabled: Some(depth_write_enabled),
+            depth_compare: Some(depth_compare),
+            stencil: wgpu::StencilState::default(),
+            bias: depth_bias,
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: target_format,
+                blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_pick_mesh_pipeline(
+    device: &wgpu::Device,
+    label: &'static str,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    defaults: RenderDefaults,
+    cull_mode: Option<wgpu::Face>,
+    depth_write_enabled: bool,
+    depth_compare: wgpu::CompareFunction,
+    depth_bias: wgpu::DepthBiasState,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[GpuVertex::layout(), GpuInstance::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: defaults.front_face,
+            cull_mode,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: defaults.depth_format,
+            depth_write_enabled: Some(depth_write_enabled),
+            depth_compare: Some(depth_compare),
+            stencil: wgpu::StencilState::default(),
+            bias: depth_bias,
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[
+                Some(wgpu::ColorTargetState {
+                    format: PICK_INDEX_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: PICK_DEPTH_BITS_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 pub const DEFAULT_SECTION_OVERLAY_COLOR: [f32; 4] = [0.12, 0.74, 0.92, 0.14];
 pub const DEFAULT_SECTION_OVERLAY_BORDER_COLOR: [f32; 4] = [0.03, 0.48, 0.66, 0.72];
 
@@ -1142,14 +1252,14 @@ pub enum ClipPlaneSide {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ClipPlaneUniform {
-    plane: [f32; 4],
+    plane: DVec4,
     side: f32,
 }
 
 impl ClipPlaneUniform {
     fn disabled() -> Self {
         Self {
-            plane: [0.0, 0.0, 1.0, 0.0],
+            plane: DVec4::new(0.0, 0.0, 1.0, 0.0),
             side: 0.0,
         }
     }
@@ -1177,14 +1287,22 @@ impl ClipPlaneUniform {
             ClipPlaneSide::NegativeNormal => -1.0,
         };
         Ok(Self {
-            plane: [
-                normal.x as f32,
-                normal.y as f32,
-                normal.z as f32,
-                plane_offset as f32,
-            ],
+            plane: DVec4::new(normal.x, normal.y, normal.z, plane_offset),
             side,
         })
+    }
+
+    fn normal(self) -> DVec3 {
+        DVec3::new(self.plane.x, self.plane.y, self.plane.z)
+    }
+
+    fn plane_f32(self) -> [f32; 4] {
+        [
+            self.plane.x as f32,
+            self.plane.y as f32,
+            self.plane.z as f32,
+            self.plane.w as f32,
+        ]
     }
 }
 
@@ -1397,6 +1515,59 @@ impl Camera {
     pub fn clip_from_world_f32(&self, viewport: ViewportSize) -> Mat4 {
         mat4_from_dmat4(self.clip_from_world(viewport))
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct RenderSpace {
+    origin: DVec3,
+}
+
+impl RenderSpace {
+    fn from_scene_bounds(bounds: Bounds3) -> Self {
+        Self {
+            origin: bounds.center(),
+        }
+    }
+
+    fn world_to_render(self) -> DMat4 {
+        DMat4::from_translation(-self.origin)
+    }
+
+    fn camera(self, camera: Camera) -> Camera {
+        Camera {
+            eye: camera.eye - self.origin,
+            target: camera.target - self.origin,
+            ..camera
+        }
+    }
+
+    fn point(self, point: DVec3) -> DVec3 {
+        point - self.origin
+    }
+
+    fn clip_plane(self, clip_plane: ClipPlaneUniform) -> ClipPlaneUniform {
+        if clip_plane.side == 0.0 {
+            return clip_plane;
+        }
+        let normal = clip_plane.normal();
+        ClipPlaneUniform {
+            plane: DVec4::new(
+                normal.x,
+                normal.y,
+                normal.z,
+                clip_plane.plane.w + normal.dot(self.origin),
+            ),
+            side: clip_plane.side,
+        }
+    }
+}
+
+fn render_from_object_matrix(
+    model_from_object: DMat4,
+    local_origin: DVec3,
+    render_space: RenderSpace,
+) -> DMat4 {
+    render_space.world_to_render() * model_from_object * DMat4::from_translation(local_origin)
 }
 
 pub fn fit_camera_to_mesh(mesh: &PreparedMesh) -> Camera {
@@ -1848,19 +2019,22 @@ impl CameraUniform {
         camera: Camera,
         viewport: ViewportSize,
         clip_plane: Option<ClipPlaneUniform>,
+        render_space: RenderSpace,
     ) -> Self {
         let viewport = viewport.clamped();
-        let clip_plane = clip_plane.unwrap_or_else(ClipPlaneUniform::disabled);
+        let camera = render_space.camera(camera);
+        let clip_plane =
+            render_space.clip_plane(clip_plane.unwrap_or_else(ClipPlaneUniform::disabled));
         Self {
             clip_from_world: camera.clip_from_world_f32(viewport).to_cols_array_2d(),
             viewport_and_profile: [
                 viewport.width as f32,
                 viewport.height as f32,
                 ARCHITECTURAL_EDGE_WIDTH_PX * 0.5,
-                SCREEN_SPACE_OUTLINE_DEPTH_THRESHOLD,
+                0.0,
             ],
             view_from_world: mat4_from_dmat4(camera.view_from_world()).to_cols_array_2d(),
-            clip_plane: clip_plane.plane,
+            clip_plane: clip_plane.plane_f32(),
             clip_params: [clip_plane.side, 0.0, 0.0, 0.0],
         }
     }
@@ -1922,12 +2096,14 @@ struct GpuInstanceBatch {
     instance_buffer: wgpu::Buffer,
     instance_count: u32,
     render_layer: RenderLayer,
+    face_visibility: FaceVisibility,
     instances: Vec<GpuInstance>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RenderLayer {
     Opaque,
+    TerrainFeature,
     SurfaceDecal,
     InspectionContextOpaque,
     InspectionContextSurfaceDecal,
@@ -1942,6 +2118,9 @@ impl RenderLayer {
             (PreparedRenderRole::InspectionContext, RenderLayer::Opaque) => {
                 Self::InspectionContextOpaque
             }
+            (PreparedRenderRole::InspectionContext, RenderLayer::TerrainFeature) => {
+                Self::InspectionContextOpaque
+            }
             (PreparedRenderRole::InspectionContext, RenderLayer::SurfaceDecal) => {
                 Self::InspectionContextSurfaceDecal
             }
@@ -1951,6 +2130,7 @@ impl RenderLayer {
 
     fn base_for_render_class(class: DefaultRenderClass) -> Self {
         match class {
+            DefaultRenderClass::TerrainFeature => Self::TerrainFeature,
             DefaultRenderClass::SurfaceDecal => Self::SurfaceDecal,
             _ => Self::Opaque,
         }
@@ -1966,6 +2146,15 @@ impl RenderLayer {
             || (!inspection_profile && matches!(self, Self::InspectionContextSurfaceDecal))
     }
 
+    fn draws_as_terrain_feature(self, _inspection_profile: bool) -> bool {
+        matches!(self, Self::TerrainFeature)
+    }
+
+    fn draws_as_solid_surface(self, inspection_profile: bool) -> bool {
+        self.draws_as_opaque(inspection_profile)
+            || self.draws_as_terrain_feature(inspection_profile)
+    }
+
     fn draws_as_inspection_context(self) -> bool {
         matches!(
             self,
@@ -1977,6 +2166,7 @@ impl RenderLayer {
         matches!(
             self,
             Self::Opaque
+                | Self::TerrainFeature
                 | Self::SurfaceDecal
                 | Self::InspectionContextOpaque
                 | Self::InspectionContextSurfaceDecal
@@ -1987,9 +2177,36 @@ impl RenderLayer {
         matches!(self, Self::Opaque)
     }
 
+    fn picks_as_terrain_feature(self) -> bool {
+        matches!(self, Self::TerrainFeature)
+    }
+
     fn picks_as_surface_decal(self) -> bool {
         matches!(self, Self::SurfaceDecal)
     }
+}
+
+const FACE_VISIBILITY_BUCKETS: usize = 2;
+
+fn face_visibility_index(visibility: FaceVisibility) -> usize {
+    match visibility {
+        FaceVisibility::OneSided => 0,
+        FaceVisibility::DoubleSided => 1,
+    }
+}
+
+fn face_visibility_from_index(index: usize) -> FaceVisibility {
+    match index {
+        0 => FaceVisibility::OneSided,
+        1 => FaceVisibility::DoubleSided,
+        _ => unreachable!("face visibility bucket index must be in range"),
+    }
+}
+
+fn empty_instance_buckets(mesh_count: usize) -> Vec<[Vec<GpuInstance>; FACE_VISIBILITY_BUCKETS]> {
+    (0..mesh_count)
+        .map(|_| std::array::from_fn(|_| Vec::new()))
+        .collect()
 }
 
 #[repr(C)]
@@ -2175,12 +2392,20 @@ impl ScreenSpaceAmbientOcclusionTargets {
 
 pub struct MeshRenderer {
     pipeline: wgpu::RenderPipeline,
+    double_sided_pipeline: wgpu::RenderPipeline,
     architectural_pipeline: wgpu::RenderPipeline,
+    double_sided_architectural_pipeline: wgpu::RenderPipeline,
+    terrain_feature_pipeline: wgpu::RenderPipeline,
+    double_sided_terrain_feature_pipeline: wgpu::RenderPipeline,
+    architectural_terrain_feature_pipeline: wgpu::RenderPipeline,
+    double_sided_architectural_terrain_feature_pipeline: wgpu::RenderPipeline,
     inspection_context_pipeline: wgpu::RenderPipeline,
     section_cutaway_context_pipeline: wgpu::RenderPipeline,
     inspection_context_tint_pipeline: wgpu::RenderPipeline,
     surface_decal_pipeline: wgpu::RenderPipeline,
+    double_sided_surface_decal_pipeline: wgpu::RenderPipeline,
     architectural_surface_decal_pipeline: wgpu::RenderPipeline,
+    double_sided_architectural_surface_decal_pipeline: wgpu::RenderPipeline,
     reference_grid_pipeline: wgpu::RenderPipeline,
     section_overlay_pipeline: wgpu::RenderPipeline,
     annotation_overlay_pipelines: AnnotationOverlayPipelines,
@@ -2192,7 +2417,11 @@ pub struct MeshRenderer {
     outline_id_pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
     pick_pipeline: wgpu::RenderPipeline,
+    double_sided_pick_pipeline: wgpu::RenderPipeline,
+    pick_terrain_feature_pipeline: wgpu::RenderPipeline,
+    double_sided_pick_terrain_feature_pipeline: wgpu::RenderPipeline,
     pick_surface_decal_pipeline: wgpu::RenderPipeline,
+    double_sided_pick_surface_decal_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     lighting_buffer: wgpu::Buffer,
     scene_bind_group: wgpu::BindGroup,
@@ -2203,6 +2432,7 @@ pub struct MeshRenderer {
     ssao_targets: ScreenSpaceAmbientOcclusionTargets,
     viewport: ViewportSize,
     camera: Camera,
+    render_space: RenderSpace,
     clip_plane: Option<ClipPlaneUniform>,
     defaults: RenderDefaults,
     profile: RenderProfileId,
@@ -2250,7 +2480,8 @@ impl MeshRenderer {
         defaults: RenderDefaults,
     ) -> Self {
         let clip_plane = None;
-        let camera_uniform = CameraUniform::from_camera(camera, viewport, clip_plane);
+        let render_space = RenderSpace::default();
+        let camera_uniform = CameraUniform::from_camera(camera, viewport, clip_plane, render_space);
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("w camera buffer"),
             contents: bytes_of(&camera_uniform),
@@ -2413,6 +2644,19 @@ impl MeshRenderer {
             multiview_mask: None,
             cache: None,
         });
+        let double_sided_pipeline = create_triangle_mesh_pipeline(
+            device,
+            "w double-sided mesh pipeline",
+            &pipeline_layout,
+            &shader,
+            color_format,
+            Some(wgpu::BlendState::REPLACE),
+            defaults,
+            None,
+            defaults.depth_write_enabled,
+            defaults.depth_compare,
+            wgpu::DepthBiasState::default(),
+        );
         let architectural_pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("w architectural mesh pipeline"),
@@ -2453,6 +2697,72 @@ impl MeshRenderer {
                 multiview_mask: None,
                 cache: None,
             });
+        let double_sided_architectural_pipeline = create_triangle_mesh_pipeline(
+            device,
+            "w double-sided architectural mesh pipeline",
+            &pipeline_layout,
+            &architectural_shader,
+            color_format,
+            Some(wgpu::BlendState::REPLACE),
+            defaults,
+            None,
+            defaults.depth_write_enabled,
+            defaults.depth_compare,
+            wgpu::DepthBiasState::default(),
+        );
+        let terrain_feature_bias = terrain_feature_depth_bias(defaults.depth_compare);
+        let terrain_feature_pipeline = create_triangle_mesh_pipeline(
+            device,
+            "w terrain feature mesh pipeline",
+            &pipeline_layout,
+            &shader,
+            color_format,
+            Some(wgpu::BlendState::REPLACE),
+            defaults,
+            defaults.cull_mode,
+            defaults.depth_write_enabled,
+            defaults.depth_compare,
+            terrain_feature_bias,
+        );
+        let double_sided_terrain_feature_pipeline = create_triangle_mesh_pipeline(
+            device,
+            "w double-sided terrain feature mesh pipeline",
+            &pipeline_layout,
+            &shader,
+            color_format,
+            Some(wgpu::BlendState::REPLACE),
+            defaults,
+            None,
+            defaults.depth_write_enabled,
+            defaults.depth_compare,
+            terrain_feature_bias,
+        );
+        let architectural_terrain_feature_pipeline = create_triangle_mesh_pipeline(
+            device,
+            "w architectural terrain feature mesh pipeline",
+            &pipeline_layout,
+            &architectural_shader,
+            color_format,
+            Some(wgpu::BlendState::REPLACE),
+            defaults,
+            defaults.cull_mode,
+            defaults.depth_write_enabled,
+            defaults.depth_compare,
+            terrain_feature_bias,
+        );
+        let double_sided_architectural_terrain_feature_pipeline = create_triangle_mesh_pipeline(
+            device,
+            "w double-sided architectural terrain feature mesh pipeline",
+            &pipeline_layout,
+            &architectural_shader,
+            color_format,
+            Some(wgpu::BlendState::REPLACE),
+            defaults,
+            None,
+            defaults.depth_write_enabled,
+            defaults.depth_compare,
+            terrain_feature_bias,
+        );
         let inspection_context_pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("w inspection context mesh pipeline"),
@@ -2613,6 +2923,19 @@ impl MeshRenderer {
                 multiview_mask: None,
                 cache: None,
             });
+        let double_sided_surface_decal_pipeline = create_triangle_mesh_pipeline(
+            device,
+            "w double-sided surface decal mesh pipeline",
+            &pipeline_layout,
+            &shader,
+            color_format,
+            Some(wgpu::BlendState::REPLACE),
+            defaults,
+            None,
+            false,
+            depth_compare_equal_variant(defaults.depth_compare),
+            surface_decal_depth_bias(defaults.depth_compare),
+        );
         let architectural_surface_decal_pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("w architectural surface decal mesh pipeline"),
@@ -2653,6 +2976,19 @@ impl MeshRenderer {
                 multiview_mask: None,
                 cache: None,
             });
+        let double_sided_architectural_surface_decal_pipeline = create_triangle_mesh_pipeline(
+            device,
+            "w double-sided architectural surface decal mesh pipeline",
+            &pipeline_layout,
+            &architectural_shader,
+            color_format,
+            Some(wgpu::BlendState::REPLACE),
+            defaults,
+            None,
+            false,
+            depth_compare_equal_variant(defaults.depth_compare),
+            surface_decal_depth_bias(defaults.depth_compare),
+        );
         let reference_grid_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("w reference grid shader"),
             source: wgpu::ShaderSource::Wgsl(REFERENCE_GRID_SHADER_WGSL.into()),
@@ -3174,6 +3510,39 @@ impl MeshRenderer {
             multiview_mask: None,
             cache: None,
         });
+        let double_sided_pick_pipeline = create_pick_mesh_pipeline(
+            device,
+            "w double-sided pick mesh pipeline",
+            &pipeline_layout,
+            &pick_with_depth_shader,
+            defaults,
+            None,
+            defaults.depth_write_enabled,
+            defaults.depth_compare,
+            wgpu::DepthBiasState::default(),
+        );
+        let pick_terrain_feature_pipeline = create_pick_mesh_pipeline(
+            device,
+            "w pick terrain feature mesh pipeline",
+            &pipeline_layout,
+            &pick_with_depth_shader,
+            defaults,
+            defaults.cull_mode,
+            defaults.depth_write_enabled,
+            defaults.depth_compare,
+            terrain_feature_bias,
+        );
+        let double_sided_pick_terrain_feature_pipeline = create_pick_mesh_pipeline(
+            device,
+            "w double-sided pick terrain feature mesh pipeline",
+            &pipeline_layout,
+            &pick_with_depth_shader,
+            defaults,
+            None,
+            defaults.depth_write_enabled,
+            defaults.depth_compare,
+            terrain_feature_bias,
+        );
         let pick_surface_decal_pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("w pick surface decal mesh pipeline"),
@@ -3221,15 +3590,34 @@ impl MeshRenderer {
                 multiview_mask: None,
                 cache: None,
             });
+        let double_sided_pick_surface_decal_pipeline = create_pick_mesh_pipeline(
+            device,
+            "w double-sided pick surface decal mesh pipeline",
+            &pipeline_layout,
+            &pick_with_depth_shader,
+            defaults,
+            None,
+            false,
+            depth_compare_equal_variant(defaults.depth_compare),
+            surface_decal_depth_bias(defaults.depth_compare),
+        );
 
         Self {
             pipeline,
+            double_sided_pipeline,
             architectural_pipeline,
+            double_sided_architectural_pipeline,
+            terrain_feature_pipeline,
+            double_sided_terrain_feature_pipeline,
+            architectural_terrain_feature_pipeline,
+            double_sided_architectural_terrain_feature_pipeline,
             inspection_context_pipeline,
             section_cutaway_context_pipeline,
             inspection_context_tint_pipeline,
             surface_decal_pipeline,
+            double_sided_surface_decal_pipeline,
             architectural_surface_decal_pipeline,
+            double_sided_architectural_surface_decal_pipeline,
             reference_grid_pipeline,
             section_overlay_pipeline,
             annotation_overlay_pipelines,
@@ -3241,7 +3629,11 @@ impl MeshRenderer {
             outline_id_pipeline,
             outline_pipeline,
             pick_pipeline,
+            double_sided_pick_pipeline,
+            pick_terrain_feature_pipeline,
+            double_sided_pick_terrain_feature_pipeline,
             pick_surface_decal_pipeline,
+            double_sided_pick_surface_decal_pipeline,
             camera_buffer,
             lighting_buffer,
             scene_bind_group,
@@ -3252,6 +3644,7 @@ impl MeshRenderer {
             ssao_targets: ScreenSpaceAmbientOcclusionTargets::new(device, viewport),
             viewport: viewport.clamped(),
             camera,
+            render_space,
             clip_plane,
             defaults,
             profile: RenderProfileId::Bim,
@@ -3299,6 +3692,7 @@ impl MeshRenderer {
                     world_bounds: mesh.bounds,
                     material: PreparedMaterial::default(),
                     default_render_class: DefaultRenderClass::Physical,
+                    face_visibility: FaceVisibility::OneSided,
                     render_role: PreparedRenderRole::Normal,
                 }],
             },
@@ -3319,28 +3713,41 @@ impl MeshRenderer {
         self.pick_targets.clear();
         self.reference_grid_vertex_buffer = None;
         self.reference_grid_vertex_count = 0;
+        self.render_space = RenderSpace::from_scene_bounds(scene.bounds);
 
+        let definition_indices = scene
+            .definitions
+            .iter()
+            .enumerate()
+            .map(|(index, definition)| (definition.id, index))
+            .collect::<HashMap<_, _>>();
+        let extract_edges_by_mesh = render_definition_edge_extraction_flags(scene);
         let uploads = scene
             .definitions
             .iter()
-            .map(|definition| self.upload_mesh_definition(device, definition))
+            .enumerate()
+            .map(|(index, definition)| {
+                self.upload_mesh_definition(device, definition, extract_edges_by_mesh[index])
+            })
             .collect::<Vec<_>>();
 
-        let mut opaque_instances_by_mesh = vec![Vec::new(); scene.definitions.len()];
-        let mut surface_decal_instances_by_mesh = vec![Vec::new(); scene.definitions.len()];
+        let mut opaque_instances_by_mesh = empty_instance_buckets(scene.definitions.len());
+        let mut terrain_feature_instances_by_mesh = empty_instance_buckets(scene.definitions.len());
+        let mut surface_decal_instances_by_mesh = empty_instance_buckets(scene.definitions.len());
         let mut inspection_context_opaque_instances_by_mesh =
-            vec![Vec::new(); scene.definitions.len()];
+            empty_instance_buckets(scene.definitions.len());
         let mut inspection_context_surface_decal_instances_by_mesh =
-            vec![Vec::new(); scene.definitions.len()];
+            empty_instance_buckets(scene.definitions.len());
         for instance in &scene.instances {
-            let mesh_index = scene
-                .definitions
-                .iter()
-                .position(|definition| definition.id == instance.definition_id)
+            let mesh_index = *definition_indices
+                .get(&instance.definition_id)
                 .expect("render scene instance references an uploaded definition");
             let local_origin = scene.definitions[mesh_index].mesh.local_origin;
-            let model_from_object =
-                instance.model_from_object * DMat4::from_translation(local_origin);
+            let render_from_object = render_from_object_matrix(
+                instance.model_from_object,
+                local_origin,
+                self.render_space,
+            );
             let pick_index = self.pick_targets.len() as u32 + 1;
             let world_centroid = instance.world_bounds.center();
             self.pick_targets.push(PickHit {
@@ -3351,65 +3758,118 @@ impl MeshRenderer {
                 world_anchor: world_centroid,
             });
             let gpu_instance = GpuInstance::from_instance(
-                model_from_object,
+                render_from_object,
                 instance.material,
                 pick_index,
                 instance.default_render_class,
             );
+            let face_visibility_index = face_visibility_index(instance.face_visibility);
             match RenderLayer::for_instance(instance) {
-                RenderLayer::Opaque => opaque_instances_by_mesh[mesh_index].push(gpu_instance),
+                RenderLayer::Opaque => {
+                    opaque_instances_by_mesh[mesh_index][face_visibility_index].push(gpu_instance)
+                }
+                RenderLayer::TerrainFeature => {
+                    terrain_feature_instances_by_mesh[mesh_index][face_visibility_index]
+                        .push(gpu_instance);
+                }
                 RenderLayer::SurfaceDecal => {
-                    surface_decal_instances_by_mesh[mesh_index].push(gpu_instance);
+                    surface_decal_instances_by_mesh[mesh_index][face_visibility_index]
+                        .push(gpu_instance);
                 }
                 RenderLayer::InspectionContextOpaque => {
-                    inspection_context_opaque_instances_by_mesh[mesh_index].push(gpu_instance);
+                    inspection_context_opaque_instances_by_mesh[mesh_index][face_visibility_index]
+                        .push(gpu_instance);
                 }
                 RenderLayer::InspectionContextSurfaceDecal => {
                     inspection_context_surface_decal_instances_by_mesh[mesh_index]
+                        [face_visibility_index]
                         .push(gpu_instance);
                 }
             }
         }
 
-        for (mesh_index, instances) in opaque_instances_by_mesh.into_iter().enumerate() {
-            if instances.is_empty() {
-                continue;
+        for (mesh_index, instances_by_visibility) in
+            opaque_instances_by_mesh.into_iter().enumerate()
+        {
+            for (visibility_index, instances) in instances_by_visibility.into_iter().enumerate() {
+                if instances.is_empty() {
+                    continue;
+                }
+                self.upload_instance_batch(
+                    device,
+                    mesh_index,
+                    RenderLayer::Opaque,
+                    face_visibility_from_index(visibility_index),
+                    &instances,
+                );
             }
-            self.upload_instance_batch(device, mesh_index, RenderLayer::Opaque, &instances);
         }
-        for (mesh_index, instances) in surface_decal_instances_by_mesh.into_iter().enumerate() {
-            if instances.is_empty() {
-                continue;
+        for (mesh_index, instances_by_visibility) in
+            terrain_feature_instances_by_mesh.into_iter().enumerate()
+        {
+            for (visibility_index, instances) in instances_by_visibility.into_iter().enumerate() {
+                if instances.is_empty() {
+                    continue;
+                }
+                self.upload_instance_batch(
+                    device,
+                    mesh_index,
+                    RenderLayer::TerrainFeature,
+                    face_visibility_from_index(visibility_index),
+                    &instances,
+                );
             }
-            self.upload_instance_batch(device, mesh_index, RenderLayer::SurfaceDecal, &instances);
         }
-        for (mesh_index, instances) in inspection_context_opaque_instances_by_mesh
+        for (mesh_index, instances_by_visibility) in
+            surface_decal_instances_by_mesh.into_iter().enumerate()
+        {
+            for (visibility_index, instances) in instances_by_visibility.into_iter().enumerate() {
+                if instances.is_empty() {
+                    continue;
+                }
+                self.upload_instance_batch(
+                    device,
+                    mesh_index,
+                    RenderLayer::SurfaceDecal,
+                    face_visibility_from_index(visibility_index),
+                    &instances,
+                );
+            }
+        }
+        for (mesh_index, instances_by_visibility) in inspection_context_opaque_instances_by_mesh
             .into_iter()
             .enumerate()
         {
-            if instances.is_empty() {
-                continue;
+            for (visibility_index, instances) in instances_by_visibility.into_iter().enumerate() {
+                if instances.is_empty() {
+                    continue;
+                }
+                self.upload_instance_batch(
+                    device,
+                    mesh_index,
+                    RenderLayer::InspectionContextOpaque,
+                    face_visibility_from_index(visibility_index),
+                    &instances,
+                );
             }
-            self.upload_instance_batch(
-                device,
-                mesh_index,
-                RenderLayer::InspectionContextOpaque,
-                &instances,
-            );
         }
-        for (mesh_index, instances) in inspection_context_surface_decal_instances_by_mesh
-            .into_iter()
-            .enumerate()
+        for (mesh_index, instances_by_visibility) in
+            inspection_context_surface_decal_instances_by_mesh
+                .into_iter()
+                .enumerate()
         {
-            if instances.is_empty() {
-                continue;
+            for (visibility_index, instances) in instances_by_visibility.into_iter().enumerate() {
+                if instances.is_empty() {
+                    continue;
+                }
+                self.upload_instance_batch(
+                    device,
+                    mesh_index,
+                    RenderLayer::InspectionContextSurfaceDecal,
+                    face_visibility_from_index(visibility_index),
+                    &instances,
+                );
             }
-            self.upload_instance_batch(
-                device,
-                mesh_index,
-                RenderLayer::InspectionContextSurfaceDecal,
-                &instances,
-            );
         }
 
         self.upload_reference_grid(device, scene.bounds);
@@ -3418,7 +3878,7 @@ impl MeshRenderer {
     }
 
     fn upload_reference_grid(&mut self, device: &wgpu::Device, bounds: Bounds3) {
-        let vertices = reference_grid_vertices(bounds);
+        let vertices = reference_grid_vertices(bounds, self.render_space);
         self.reference_grid_vertex_count = vertices.len() as u32;
         self.reference_grid_vertex_buffer = (!vertices.is_empty()).then(|| {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -3433,6 +3893,7 @@ impl MeshRenderer {
         &mut self,
         device: &wgpu::Device,
         definition: &PreparedRenderDefinition,
+        extract_edges: bool,
     ) -> UploadedMesh {
         let mesh = &definition.mesh;
         let gpu_vertices = mesh
@@ -3453,16 +3914,21 @@ impl MeshRenderer {
             contents: cast_slice(&mesh.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
-        let edges = ExtractedMeshEdges::extract(mesh, architectural_edge_extraction_config());
-        let edge_vertices = edge_ribbon_vertices(mesh, &edges);
-        let edge_vertex_count = edge_vertices.len() as u32;
-        let edge_vertex_buffer = (!edge_vertices.is_empty()).then(|| {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("w mesh edge ribbon vertex buffer"),
-                contents: cast_slice(&edge_vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            })
-        });
+        let (edge_vertex_buffer, edge_vertex_count) = if extract_edges {
+            let edges = ExtractedMeshEdges::extract(mesh, architectural_edge_extraction_config());
+            let edge_vertices = edge_ribbon_vertices(mesh, &edges);
+            let edge_vertex_count = edge_vertices.len() as u32;
+            let edge_vertex_buffer = (!edge_vertices.is_empty()).then(|| {
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("w mesh edge ribbon vertex buffer"),
+                    contents: cast_slice(&edge_vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+            });
+            (edge_vertex_buffer, edge_vertex_count)
+        } else {
+            (None, 0)
+        };
 
         let upload = UploadedMesh {
             mesh_id: self.next_mesh_id,
@@ -3488,6 +3954,7 @@ impl MeshRenderer {
         device: &wgpu::Device,
         mesh_index: usize,
         render_layer: RenderLayer,
+        face_visibility: FaceVisibility,
         instances: &[GpuInstance],
     ) {
         let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -3501,6 +3968,7 @@ impl MeshRenderer {
             instance_buffer,
             instance_count: instances.len() as u32,
             render_layer,
+            face_visibility,
             instances: instances.to_vec(),
         });
     }
@@ -3616,7 +4084,7 @@ impl MeshRenderer {
         device: &wgpu::Device,
         overlays: &[SectionOverlay],
     ) -> Result<(), SectionOverlayError> {
-        let vertices = section_overlay_vertices(overlays)?;
+        let vertices = section_overlay_vertices(overlays, self.render_space)?;
         self.section_overlay_vertex_count = vertices.len() as u32;
         self.section_overlay_count = overlays.len() as u32;
         self.section_overlay_vertex_buffer = (!vertices.is_empty()).then(|| {
@@ -3643,7 +4111,7 @@ impl MeshRenderer {
         queue: &wgpu::Queue,
         layers: &[SceneAnnotationLayer],
     ) -> Result<(), AnnotationOverlayError> {
-        let geometry = annotation_overlay_geometry(layers)?;
+        let geometry = annotation_overlay_geometry(layers, self.render_space.origin)?;
         self.upload_annotation_text(device, queue, &geometry.text_labels)?;
         self.annotation_overlays = AnnotationOverlayGpuState::from_geometry(device, geometry);
         Ok(())
@@ -3689,7 +4157,10 @@ impl MeshRenderer {
             let instances =
                 text_glyphs_from_layout(label, &layout, sdf_radius_px, outline_width_px)
                     .into_iter()
-                    .filter_map(TextGlyph::to_gpu);
+                    .filter_map(|mut glyph| {
+                        glyph.anchor_world = self.render_space.point(glyph.anchor_world);
+                        glyph.to_gpu()
+                    });
 
             match label.depth_mode {
                 SceneTextDepthMode::Overlay => overlay_instances.extend(instances),
@@ -3824,11 +4295,33 @@ impl MeshRenderer {
             } else {
                 &self.pipeline
             };
+            let double_sided_mesh_pipeline = if uses_architectural_surface_lighting(self.profile) {
+                &self.double_sided_architectural_pipeline
+            } else {
+                &self.double_sided_pipeline
+            };
+            let terrain_feature_pipeline = if uses_architectural_surface_lighting(self.profile) {
+                &self.architectural_terrain_feature_pipeline
+            } else {
+                &self.terrain_feature_pipeline
+            };
+            let double_sided_terrain_feature_pipeline =
+                if uses_architectural_surface_lighting(self.profile) {
+                    &self.double_sided_architectural_terrain_feature_pipeline
+                } else {
+                    &self.double_sided_terrain_feature_pipeline
+                };
             let surface_decal_pipeline = if uses_architectural_surface_lighting(self.profile) {
                 &self.architectural_surface_decal_pipeline
             } else {
                 &self.surface_decal_pipeline
             };
+            let double_sided_surface_decal_pipeline =
+                if uses_architectural_surface_lighting(self.profile) {
+                    &self.double_sided_architectural_surface_decal_pipeline
+                } else {
+                    &self.double_sided_surface_decal_pipeline
+                };
             pass.set_bind_group(0, &self.scene_bind_group, &[]);
 
             if self.reference_grid_visible {
@@ -3852,12 +4345,16 @@ impl MeshRenderer {
                 }
             }
 
-            pass.set_pipeline(mesh_pipeline);
             for batch in self.instance_batches.iter().filter(|batch| {
                 batch
                     .render_layer
                     .draws_as_opaque(inspection_context_rendering)
             }) {
+                let pipeline = match batch.face_visibility {
+                    FaceVisibility::OneSided => mesh_pipeline,
+                    FaceVisibility::DoubleSided => double_sided_mesh_pipeline,
+                };
+                pass.set_pipeline(pipeline);
                 let mesh = &self.meshes[batch.mesh_index];
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
@@ -3865,12 +4362,33 @@ impl MeshRenderer {
                 pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
             }
 
-            pass.set_pipeline(surface_decal_pipeline);
+            for batch in self.instance_batches.iter().filter(|batch| {
+                batch
+                    .render_layer
+                    .draws_as_terrain_feature(inspection_context_rendering)
+            }) {
+                let pipeline = match batch.face_visibility {
+                    FaceVisibility::OneSided => terrain_feature_pipeline,
+                    FaceVisibility::DoubleSided => double_sided_terrain_feature_pipeline,
+                };
+                pass.set_pipeline(pipeline);
+                let mesh = &self.meshes[batch.mesh_index];
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
+                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
+            }
+
             for batch in self.instance_batches.iter().filter(|batch| {
                 batch
                     .render_layer
                     .draws_as_surface_decal(inspection_context_rendering)
             }) {
+                let pipeline = match batch.face_visibility {
+                    FaceVisibility::OneSided => surface_decal_pipeline,
+                    FaceVisibility::DoubleSided => double_sided_surface_decal_pipeline,
+                };
+                pass.set_pipeline(pipeline);
                 let mesh = &self.meshes[batch.mesh_index];
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
@@ -4080,7 +4598,7 @@ impl MeshRenderer {
         for batch in self.instance_batches.iter().filter(|batch| {
             batch
                 .render_layer
-                .draws_as_opaque(inspection_context_rendering)
+                .draws_as_solid_surface(inspection_context_rendering)
         }) {
             let mesh = &self.meshes[batch.mesh_index];
             let Some(edge_vertex_buffer) = &mesh.edge_vertex_buffer else {
@@ -4159,7 +4677,7 @@ impl MeshRenderer {
         for batch in self
             .instance_batches
             .iter()
-            .filter(|batch| batch.render_layer.draws_as_opaque(true))
+            .filter(|batch| batch.render_layer.draws_as_solid_surface(true))
         {
             let mesh = &self.meshes[batch.mesh_index];
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -4274,7 +4792,7 @@ impl MeshRenderer {
         for batch in self
             .instance_batches
             .iter()
-            .filter(|batch| batch.render_layer.draws_as_opaque(false))
+            .filter(|batch| batch.render_layer.draws_as_solid_surface(false))
         {
             let mesh = &self.meshes[batch.mesh_index];
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -4365,7 +4883,7 @@ impl MeshRenderer {
         for batch in self.instance_batches.iter().filter(|batch| {
             batch
                 .render_layer
-                .draws_as_opaque(inspection_context_rendering)
+                .draws_as_solid_surface(inspection_context_rendering)
         }) {
             let mesh = &self.meshes[batch.mesh_index];
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -4468,7 +4986,6 @@ impl MeshRenderer {
             multiview_mask: None,
         });
         pass.set_scissor_rect(region.x, region.y, region.width, region.height);
-        pass.set_pipeline(&self.pick_pipeline);
         pass.set_bind_group(0, &self.scene_bind_group, &[]);
 
         for batch in self
@@ -4476,6 +4993,11 @@ impl MeshRenderer {
             .iter()
             .filter(|batch| batch.render_layer.picks_as_opaque())
         {
+            let pipeline = match batch.face_visibility {
+                FaceVisibility::OneSided => &self.pick_pipeline,
+                FaceVisibility::DoubleSided => &self.double_sided_pick_pipeline,
+            };
+            pass.set_pipeline(pipeline);
             let mesh = &self.meshes[batch.mesh_index];
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
@@ -4483,12 +5005,33 @@ impl MeshRenderer {
             pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
         }
 
-        pass.set_pipeline(&self.pick_surface_decal_pipeline);
+        for batch in self
+            .instance_batches
+            .iter()
+            .filter(|batch| batch.render_layer.picks_as_terrain_feature())
+        {
+            let pipeline = match batch.face_visibility {
+                FaceVisibility::OneSided => &self.pick_terrain_feature_pipeline,
+                FaceVisibility::DoubleSided => &self.double_sided_pick_terrain_feature_pipeline,
+            };
+            pass.set_pipeline(pipeline);
+            let mesh = &self.meshes[batch.mesh_index];
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
+            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
+        }
+
         for batch in self
             .instance_batches
             .iter()
             .filter(|batch| batch.render_layer.picks_as_surface_decal())
         {
+            let pipeline = match batch.face_visibility {
+                FaceVisibility::OneSided => &self.pick_surface_decal_pipeline,
+                FaceVisibility::DoubleSided => &self.double_sided_pick_surface_decal_pipeline,
+            };
+            pass.set_pipeline(pipeline);
             let mesh = &self.meshes[batch.mesh_index];
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
@@ -4540,6 +5083,7 @@ impl MeshRenderer {
                     instance_buffer,
                     instance_count: instances.len() as u32,
                     render_layer: batch.render_layer,
+                    face_visibility: batch.face_visibility,
                     instances,
                 })
             })
@@ -4580,13 +5124,17 @@ impl MeshRenderer {
             multiview_mask: None,
         });
         pass.set_scissor_rect(region.x, region.y, region.width, region.height);
-        pass.set_pipeline(&self.pick_pipeline);
         pass.set_bind_group(0, &self.scene_bind_group, &[]);
 
         for batch in filtered_batches
             .iter()
             .filter(|batch| batch.render_layer.picks_as_opaque())
         {
+            let pipeline = match batch.face_visibility {
+                FaceVisibility::OneSided => &self.pick_pipeline,
+                FaceVisibility::DoubleSided => &self.double_sided_pick_pipeline,
+            };
+            pass.set_pipeline(pipeline);
             let mesh = &self.meshes[batch.mesh_index];
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
@@ -4594,11 +5142,31 @@ impl MeshRenderer {
             pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
         }
 
-        pass.set_pipeline(&self.pick_surface_decal_pipeline);
+        for batch in filtered_batches
+            .iter()
+            .filter(|batch| batch.render_layer.picks_as_terrain_feature())
+        {
+            let pipeline = match batch.face_visibility {
+                FaceVisibility::OneSided => &self.pick_terrain_feature_pipeline,
+                FaceVisibility::DoubleSided => &self.double_sided_pick_terrain_feature_pipeline,
+            };
+            pass.set_pipeline(pipeline);
+            let mesh = &self.meshes[batch.mesh_index];
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
+            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..batch.instance_count);
+        }
+
         for batch in filtered_batches
             .iter()
             .filter(|batch| batch.render_layer.picks_as_surface_decal())
         {
+            let pipeline = match batch.face_visibility {
+                FaceVisibility::OneSided => &self.pick_surface_decal_pipeline,
+                FaceVisibility::DoubleSided => &self.double_sided_pick_surface_decal_pipeline,
+            };
+            pass.set_pipeline(pipeline);
             let mesh = &self.meshes[batch.mesh_index];
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
@@ -4766,7 +5334,12 @@ impl MeshRenderer {
     }
 
     fn update_camera(&self, queue: &wgpu::Queue) {
-        let uniform = CameraUniform::from_camera(self.camera, self.viewport, self.clip_plane);
+        let uniform = CameraUniform::from_camera(
+            self.camera,
+            self.viewport,
+            self.clip_plane,
+            self.render_space,
+        );
         queue.write_buffer(&self.camera_buffer, 0, bytes_of(&uniform));
     }
 
@@ -4830,7 +5403,23 @@ fn surface_decal_depth_bias(compare: wgpu::CompareFunction) -> wgpu::DepthBiasSt
     }
 }
 
-fn reference_grid_vertices(bounds: Bounds3) -> Vec<GpuReferenceGridVertex> {
+fn terrain_feature_depth_bias(compare: wgpu::CompareFunction) -> wgpu::DepthBiasState {
+    let direction = match compare {
+        wgpu::CompareFunction::Greater | wgpu::CompareFunction::GreaterEqual => -1,
+        _ => 1,
+    };
+
+    wgpu::DepthBiasState {
+        constant: direction,
+        slope_scale: direction as f32,
+        clamp: 0.0,
+    }
+}
+
+fn reference_grid_vertices(
+    bounds: Bounds3,
+    render_space: RenderSpace,
+) -> Vec<GpuReferenceGridVertex> {
     let size = bounds.size();
     let span = size.x.abs().max(size.y.abs()).max(0.01);
     let spacing = metric_reference_grid_spacing(span / 16.0);
@@ -4847,12 +5436,14 @@ fn reference_grid_vertices(bounds: Bounds3) -> Vec<GpuReferenceGridVertex> {
     let mut x = min_x;
     while x <= max_x + spacing * 0.5 {
         let alpha = reference_grid_line_alpha(x, major_spacing);
+        let start = render_space.point(DVec3::new(x, min_y, z));
+        let end = render_space.point(DVec3::new(x, max_y, z));
         vertices.push(GpuReferenceGridVertex {
-            position: [x as f32, min_y as f32, z as f32],
+            position: [start.x as f32, start.y as f32, start.z as f32],
             alpha,
         });
         vertices.push(GpuReferenceGridVertex {
-            position: [x as f32, max_y as f32, z as f32],
+            position: [end.x as f32, end.y as f32, end.z as f32],
             alpha,
         });
         x += spacing;
@@ -4861,12 +5452,14 @@ fn reference_grid_vertices(bounds: Bounds3) -> Vec<GpuReferenceGridVertex> {
     let mut y = min_y;
     while y <= max_y + spacing * 0.5 {
         let alpha = reference_grid_line_alpha(y, major_spacing);
+        let start = render_space.point(DVec3::new(min_x, y, z));
+        let end = render_space.point(DVec3::new(max_x, y, z));
         vertices.push(GpuReferenceGridVertex {
-            position: [min_x as f32, y as f32, z as f32],
+            position: [start.x as f32, start.y as f32, start.z as f32],
             alpha,
         });
         vertices.push(GpuReferenceGridVertex {
-            position: [max_x as f32, y as f32, z as f32],
+            position: [end.x as f32, end.y as f32, end.z as f32],
             alpha,
         });
         y += spacing;
@@ -4877,6 +5470,7 @@ fn reference_grid_vertices(bounds: Bounds3) -> Vec<GpuReferenceGridVertex> {
 
 fn section_overlay_vertices(
     overlays: &[SectionOverlay],
+    render_space: RenderSpace,
 ) -> Result<Vec<GpuSectionOverlayVertex>, SectionOverlayError> {
     let mut vertices = Vec::with_capacity(overlays.len() * 30);
 
@@ -4909,7 +5503,7 @@ fn section_overlay_vertices(
                     corner_index,
                 });
             }
-            corners[corner_index] = corner;
+            corners[corner_index] = render_space.point(corner);
         }
 
         push_section_overlay_quad(&mut vertices, corners, overlay.color);
@@ -5004,13 +5598,17 @@ struct RenderClassEdgeVisibility {
 
 fn edge_visibility_for_render_class(class: DefaultRenderClass) -> RenderClassEdgeVisibility {
     match class {
+        DefaultRenderClass::Course => RenderClassEdgeVisibility {
+            boundary: 0.0,
+            crease: 0.0,
+        },
         DefaultRenderClass::Terrain => RenderClassEdgeVisibility {
             boundary: 0.0,
             crease: 0.0,
         },
         DefaultRenderClass::TerrainFeature => RenderClassEdgeVisibility {
             boundary: 0.0,
-            crease: 1.0,
+            crease: 0.0,
         },
         DefaultRenderClass::Water => RenderClassEdgeVisibility {
             boundary: 0.0,
@@ -5035,10 +5633,38 @@ fn edge_visibility_for_render_class(class: DefaultRenderClass) -> RenderClassEdg
     }
 }
 
+fn render_class_uses_mesh_edges(class: DefaultRenderClass) -> bool {
+    let visibility = edge_visibility_for_render_class(class);
+    visibility.boundary > 0.0 || visibility.crease > 0.0
+}
+
+fn render_definition_edge_extraction_flags(scene: &PreparedRenderScene) -> Vec<bool> {
+    let mut extract_edges = vec![false; scene.definitions.len()];
+    let definition_indices = scene
+        .definitions
+        .iter()
+        .enumerate()
+        .map(|(index, definition)| (definition.id, index))
+        .collect::<HashMap<_, _>>();
+
+    for instance in &scene.instances {
+        if !render_class_uses_mesh_edges(instance.default_render_class) {
+            continue;
+        }
+        if let Some(index) = definition_indices.get(&instance.definition_id) {
+            extract_edges[*index] = true;
+        }
+    }
+
+    extract_edges
+}
+
 fn object_outline_visible_for_render_class(class: DefaultRenderClass) -> bool {
     !matches!(
         class,
-        DefaultRenderClass::Terrain
+        DefaultRenderClass::Course
+            | DefaultRenderClass::Terrain
+            | DefaultRenderClass::TerrainFeature
             | DefaultRenderClass::VegetationCover
             | DefaultRenderClass::Water
             | DefaultRenderClass::SurfaceDecal
@@ -5196,6 +5822,7 @@ pub async fn render_prepared_mesh_offscreen(
                 world_bounds: mesh.bounds,
                 material: PreparedMaterial::default(),
                 default_render_class: DefaultRenderClass::Physical,
+                face_visibility: FaceVisibility::OneSided,
                 render_role: PreparedRenderRole::Normal,
             }],
         },
@@ -5429,6 +6056,22 @@ mod tests {
     }
 
     #[test]
+    fn terrain_feature_depth_bias_is_opposite_surface_decal_bias() {
+        assert_eq!(
+            surface_decal_depth_bias(wgpu::CompareFunction::Greater).constant,
+            1
+        );
+        assert_eq!(
+            terrain_feature_depth_bias(wgpu::CompareFunction::Greater).constant,
+            -1
+        );
+        assert_eq!(
+            terrain_feature_depth_bias(wgpu::CompareFunction::Less).constant,
+            1
+        );
+    }
+
+    #[test]
     fn clip_plane_uniform_encodes_explicit_plane_side() {
         let clip = ClipPlaneUniform::from_origin_normal(
             DVec3::new(0.0, 5.0, 0.0),
@@ -5437,7 +6080,7 @@ mod tests {
         )
         .expect("valid clip plane");
 
-        assert_eq!(clip.plane, [0.0, 1.0, 0.0, -5.0]);
+        assert_eq!(clip.plane, DVec4::new(0.0, 1.0, 0.0, -5.0));
         assert_eq!(clip.side, 1.0);
 
         let reverse = ClipPlaneUniform::from_origin_normal(
@@ -5447,6 +6090,65 @@ mod tests {
         )
         .expect("valid clip plane");
         assert_eq!(reverse.side, -1.0);
+    }
+
+    #[test]
+    fn render_space_makes_instance_translation_scene_relative() {
+        let render_space = RenderSpace {
+            origin: DVec3::new(6_000_000.0, 4_000_000.0, 720.0),
+        };
+        let local_origin = render_space.origin + DVec3::new(12.0, -8.0, 1.5);
+        let render_from_object =
+            render_from_object_matrix(DMat4::IDENTITY, local_origin, render_space);
+
+        assert_eq!(
+            render_from_object.transform_point3(DVec3::ZERO),
+            DVec3::new(12.0, -8.0, 1.5)
+        );
+    }
+
+    #[test]
+    fn render_space_makes_camera_uniform_scene_relative() {
+        let render_space = RenderSpace {
+            origin: DVec3::new(6_000_000.0, 4_000_000.0, 720.0),
+        };
+        let camera = Camera {
+            eye: render_space.origin + DVec3::new(30.0, -80.0, 35.0),
+            target: render_space.origin + DVec3::new(5.0, 2.0, 1.0),
+            ..Camera::default()
+        };
+        let viewport = ViewportSize::new(1280, 720);
+
+        let uniform = CameraUniform::from_camera(camera, viewport, None, render_space);
+        let expected_camera = render_space.camera(camera);
+
+        assert_eq!(
+            uniform.clip_from_world,
+            expected_camera
+                .clip_from_world_f32(viewport)
+                .to_cols_array_2d()
+        );
+    }
+
+    #[test]
+    fn render_space_clip_plane_preserves_signed_distance() {
+        let render_space = RenderSpace {
+            origin: DVec3::new(6_000_000.0, 4_000_000.0, 720.0),
+        };
+        let clip = ClipPlaneUniform::from_origin_normal(
+            render_space.origin + DVec3::new(0.0, 5.0, 0.0),
+            DVec3::Y,
+            ClipPlaneSide::PositiveNormal,
+        )
+        .expect("valid clip plane");
+        let render_clip = render_space.clip_plane(clip);
+        let absolute_point = render_space.origin + DVec3::new(0.0, 8.0, 0.0);
+        let render_point = render_space.point(absolute_point);
+        let absolute_distance = clip.normal().dot(absolute_point) + clip.plane.w;
+        let render_distance = render_clip.normal().dot(render_point) + render_clip.plane.w;
+
+        assert_eq!(render_clip.plane, DVec4::new(0.0, 1.0, 0.0, -5.0));
+        assert!((absolute_distance - render_distance).abs() <= 1.0e-9);
     }
 
     #[test]
@@ -5509,6 +6211,12 @@ mod tests {
             1,
             DefaultRenderClass::Physical,
         );
+        let course = GpuInstance::from_instance(
+            DMat4::IDENTITY,
+            PreparedMaterial::default(),
+            8,
+            DefaultRenderClass::Course,
+        );
         let terrain = GpuInstance::from_instance(
             DMat4::IDENTITY,
             PreparedMaterial::default(),
@@ -5549,12 +6257,15 @@ mod tests {
         assert_eq!(physical.boundary_edge_visibility, 1.0);
         assert_eq!(physical.crease_edge_visibility, 1.0);
         assert_eq!(physical.outline_index, 1);
+        assert_eq!(course.boundary_edge_visibility, 0.0);
+        assert_eq!(course.crease_edge_visibility, 0.0);
+        assert_eq!(course.outline_index, 0);
         assert_eq!(terrain.boundary_edge_visibility, 0.0);
         assert_eq!(terrain.crease_edge_visibility, 0.0);
         assert_eq!(terrain.outline_index, 0);
         assert_eq!(terrain_feature.boundary_edge_visibility, 0.0);
-        assert_eq!(terrain_feature.crease_edge_visibility, 1.0);
-        assert_eq!(terrain_feature.outline_index, 3);
+        assert_eq!(terrain_feature.crease_edge_visibility, 0.0);
+        assert_eq!(terrain_feature.outline_index, 0);
         assert_eq!(vegetation.boundary_edge_visibility, 1.0);
         assert_eq!(vegetation.crease_edge_visibility, 0.0);
         assert_eq!(vegetation.outline_index, 4);
@@ -5570,12 +6281,77 @@ mod tests {
     }
 
     #[test]
+    fn edge_extraction_skips_definitions_used_only_by_non_edge_render_classes() {
+        let mesh = PreparedMesh {
+            local_origin: DVec3::ZERO,
+            bounds: Bounds3::zero(),
+            vertices: vec![
+                PreparedVertex {
+                    position: [0.0, 0.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                },
+                PreparedVertex {
+                    position: [1.0, 0.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                },
+                PreparedVertex {
+                    position: [0.0, 1.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                },
+            ],
+            indices: vec![0, 1, 2],
+        };
+        let scene = PreparedRenderScene {
+            bounds: Bounds3::zero(),
+            definitions: vec![
+                PreparedRenderDefinition {
+                    id: GeometryDefinitionId(10),
+                    mesh: mesh.clone(),
+                },
+                PreparedRenderDefinition {
+                    id: GeometryDefinitionId(20),
+                    mesh,
+                },
+            ],
+            instances: vec![
+                PreparedRenderInstance {
+                    id: GeometryInstanceId(1),
+                    element_id: SemanticElementId::new("course"),
+                    definition_id: GeometryDefinitionId(10),
+                    model_from_object: DMat4::IDENTITY,
+                    world_bounds: Bounds3::zero(),
+                    material: PreparedMaterial::default(),
+                    default_render_class: DefaultRenderClass::Course,
+                    face_visibility: FaceVisibility::DoubleSided,
+                    render_role: PreparedRenderRole::Normal,
+                },
+                PreparedRenderInstance {
+                    id: GeometryInstanceId(2),
+                    element_id: SemanticElementId::new("deck"),
+                    definition_id: GeometryDefinitionId(20),
+                    model_from_object: DMat4::IDENTITY,
+                    world_bounds: Bounds3::zero(),
+                    material: PreparedMaterial::default(),
+                    default_render_class: DefaultRenderClass::Physical,
+                    face_visibility: FaceVisibility::OneSided,
+                    render_role: PreparedRenderRole::Normal,
+                },
+            ],
+        };
+
+        assert_eq!(
+            render_definition_edge_extraction_flags(&scene),
+            vec![false, true]
+        );
+    }
+
+    #[test]
     fn reference_grid_vertices_follow_scene_footprint() {
         let bounds = Bounds3 {
             min: DVec3::new(-2.0, -1.0, 0.5),
             max: DVec3::new(4.0, 3.0, 4.0),
         };
-        let vertices = reference_grid_vertices(bounds);
+        let vertices = reference_grid_vertices(bounds, RenderSpace::default());
 
         assert!(!vertices.is_empty());
         assert_eq!(vertices.len() % 2, 0);
@@ -5589,6 +6365,22 @@ mod tests {
     }
 
     #[test]
+    fn reference_grid_vertices_are_render_relative() {
+        let bounds = Bounds3 {
+            min: DVec3::new(5_999_900.0, 3_999_950.0, 710.0),
+            max: DVec3::new(6_000_100.0, 4_000_050.0, 730.0),
+        };
+        let render_space = RenderSpace::from_scene_bounds(bounds);
+        let vertices = reference_grid_vertices(bounds, render_space);
+
+        assert!(!vertices.is_empty());
+        assert!(vertices.iter().all(|vertex| {
+            let [x, y, z] = vertex.position;
+            x.abs() < 1_000.0 && y.abs() < 1_000.0 && z.abs() < 1_000.0
+        }));
+    }
+
+    #[test]
     fn section_overlay_vertices_build_two_triangles_from_world_corners() {
         let overlay = SectionOverlay::new([
             DVec3::new(0.0, 0.0, 1.0),
@@ -5598,7 +6390,8 @@ mod tests {
         ])
         .with_color([0.1, 0.2, 0.3, 0.4]);
 
-        let vertices = section_overlay_vertices(&[overlay]).expect("valid overlay");
+        let vertices =
+            section_overlay_vertices(&[overlay], RenderSpace::default()).expect("valid overlay");
 
         assert_eq!(vertices.len(), 30);
         assert_eq!(vertices[0].position, [0.0, 0.0, 1.0]);
@@ -5629,7 +6422,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            section_overlay_vertices(&[overlay]).unwrap_err(),
+            section_overlay_vertices(&[overlay], RenderSpace::default()).unwrap_err(),
             SectionOverlayError::NonFiniteCorner {
                 overlay_index: 0,
                 corner_index: 1,
@@ -5645,7 +6438,7 @@ mod tests {
         .with_color([0.1, f32::NAN, 0.3, 0.4]);
 
         assert_eq!(
-            section_overlay_vertices(&[overlay]).unwrap_err(),
+            section_overlay_vertices(&[overlay], RenderSpace::default()).unwrap_err(),
             SectionOverlayError::NonFiniteColor {
                 overlay_index: 0,
                 component_index: 1,
@@ -5706,6 +6499,7 @@ mod tests {
             world_bounds: Bounds3::zero(),
             material: PreparedMaterial::default(),
             default_render_class: DefaultRenderClass::Physical,
+            face_visibility: FaceVisibility::OneSided,
             render_role: PreparedRenderRole::InspectionContext,
         };
         let opaque_layer = RenderLayer::for_instance(&base_instance);
@@ -5714,6 +6508,18 @@ mod tests {
         assert!(!opaque_layer.draws_as_opaque(true));
         assert!(opaque_layer.draws_as_inspection_context());
         assert!(!opaque_layer.picks_as_opaque());
+
+        let terrain_feature_instance = PreparedRenderInstance {
+            default_render_class: DefaultRenderClass::TerrainFeature,
+            render_role: PreparedRenderRole::Normal,
+            ..base_instance.clone()
+        };
+        let terrain_feature_layer = RenderLayer::for_instance(&terrain_feature_instance);
+        assert_eq!(terrain_feature_layer, RenderLayer::TerrainFeature);
+        assert!(!terrain_feature_layer.draws_as_opaque(false));
+        assert!(terrain_feature_layer.draws_as_terrain_feature(false));
+        assert!(terrain_feature_layer.draws_as_solid_surface(false));
+        assert!(terrain_feature_layer.picks_as_terrain_feature());
 
         let surface_decal_instance = PreparedRenderInstance {
             default_render_class: DefaultRenderClass::SurfaceDecal,
@@ -5733,6 +6539,7 @@ mod tests {
     fn all_render_layers_can_draw_section_cutaway_context() {
         for layer in [
             RenderLayer::Opaque,
+            RenderLayer::TerrainFeature,
             RenderLayer::SurfaceDecal,
             RenderLayer::InspectionContextOpaque,
             RenderLayer::InspectionContextSurfaceDecal,
@@ -5933,6 +6740,7 @@ mod tests {
                     world_bounds: mesh.bounds.transformed(left_transform),
                     material: PreparedMaterial::default(),
                     default_render_class: DefaultRenderClass::Physical,
+                    face_visibility: FaceVisibility::OneSided,
                     render_role: PreparedRenderRole::Normal,
                 },
                 PreparedRenderInstance {
@@ -5943,6 +6751,7 @@ mod tests {
                     world_bounds: mesh.bounds.transformed(right_transform),
                     material: PreparedMaterial::default(),
                     default_render_class: DefaultRenderClass::Physical,
+                    face_visibility: FaceVisibility::OneSided,
                     render_role: PreparedRenderRole::Normal,
                 },
             ],
@@ -6042,6 +6851,7 @@ mod tests {
                         world_bounds: mesh.bounds,
                         material: PreparedMaterial::default(),
                         default_render_class: DefaultRenderClass::Physical,
+                        face_visibility: FaceVisibility::DoubleSided,
                         render_role: PreparedRenderRole::Normal,
                     },
                     PreparedRenderInstance {
@@ -6054,6 +6864,7 @@ mod tests {
                             .transformed(DMat4::from_translation(DVec3::new(5.0, 0.0, 0.0))),
                         material: PreparedMaterial::new(DisplayColor::new(0.9, 0.3, 0.2)),
                         default_render_class: DefaultRenderClass::Physical,
+                        face_visibility: FaceVisibility::OneSided,
                         render_role: PreparedRenderRole::Normal,
                     },
                     PreparedRenderInstance {
@@ -6066,6 +6877,7 @@ mod tests {
                             .transformed(DMat4::from_translation(DVec3::new(2.5, 0.0, 0.0))),
                         material: PreparedMaterial::new(DisplayColor::new(1.0, 1.0, 1.0)),
                         default_render_class: DefaultRenderClass::SurfaceDecal,
+                        face_visibility: FaceVisibility::OneSided,
                         render_role: PreparedRenderRole::Normal,
                     },
                 ],
@@ -6084,18 +6896,35 @@ mod tests {
             renderer.set_reference_grid_visible(true);
             assert!(renderer.reference_grid_visible());
             assert_eq!(renderer.meshes.len(), 1);
-            assert_eq!(renderer.instance_batches.len(), 2);
+            assert_eq!(renderer.instance_batches.len(), 3);
             assert_eq!(renderer.pick_targets.len(), 3);
             assert_eq!(
                 renderer.instance_batches[0].render_layer,
                 RenderLayer::Opaque
             );
-            assert_eq!(renderer.instance_batches[0].instance_count, 2);
+            assert_eq!(
+                renderer.instance_batches[0].face_visibility,
+                FaceVisibility::OneSided
+            );
+            assert_eq!(renderer.instance_batches[0].instance_count, 1);
             assert_eq!(
                 renderer.instance_batches[1].render_layer,
-                RenderLayer::SurfaceDecal
+                RenderLayer::Opaque
+            );
+            assert_eq!(
+                renderer.instance_batches[1].face_visibility,
+                FaceVisibility::DoubleSided
             );
             assert_eq!(renderer.instance_batches[1].instance_count, 1);
+            assert_eq!(
+                renderer.instance_batches[2].render_layer,
+                RenderLayer::SurfaceDecal
+            );
+            assert_eq!(
+                renderer.instance_batches[2].face_visibility,
+                FaceVisibility::OneSided
+            );
+            assert_eq!(renderer.instance_batches[2].instance_count, 1);
             assert!(renderer.reference_grid_vertex_buffer.is_some());
             assert!(renderer.reference_grid_vertex_count > 0);
 
@@ -6222,6 +7051,7 @@ mod tests {
                         world_bounds: mesh.bounds.transformed(left_transform),
                         material: PreparedMaterial::default(),
                         default_render_class: DefaultRenderClass::Physical,
+                        face_visibility: FaceVisibility::OneSided,
                         render_role: PreparedRenderRole::Normal,
                     },
                     PreparedRenderInstance {
@@ -6232,6 +7062,7 @@ mod tests {
                         world_bounds: mesh.bounds.transformed(right_transform),
                         material: PreparedMaterial::new(DisplayColor::new(0.9, 0.3, 0.2)),
                         default_render_class: DefaultRenderClass::Physical,
+                        face_visibility: FaceVisibility::OneSided,
                         render_role: PreparedRenderRole::Normal,
                     },
                 ],

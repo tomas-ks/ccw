@@ -5,7 +5,7 @@ use cc_w_runtime::RuntimeSceneState;
 use cc_w_runtime::{DemoAsset, Engine, GeometryPackageSource, GeometryPackageSourceError};
 use cc_w_types::GeometryStartViewRequest;
 use cc_w_types::{
-    Bounds3, DefaultRenderClass, DisplayColor, ExternalId, GeometryCatalog,
+    Bounds3, DefaultRenderClass, DisplayColor, ExternalId, FaceVisibility, GeometryCatalog,
     GeometryDefinitionBatch, GeometryDefinitionBatchRequest, GeometryDefinitionCatalogEntry,
     GeometryDefinitionId, GeometryElementCatalogEntry, GeometryInstanceBatch,
     GeometryInstanceBatchRequest, GeometryInstanceCatalogEntry, GeometryInstanceId,
@@ -491,6 +491,8 @@ pub struct WebPreparedGeometryInstance {
     pub external_id: String,
     pub label: String,
     pub display_color: Option<[f32; 3]>,
+    #[serde(default = "default_web_face_visibility")]
+    pub face_visibility: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -504,6 +506,8 @@ pub struct WebProjectPreparedGeometryInstance {
     pub external_id: String,
     pub label: String,
     pub display_color: Option<[f32; 3]>,
+    #[serde(default = "default_web_face_visibility")]
+    pub face_visibility: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1236,6 +1240,7 @@ impl WebProjectPreparedGeometryInstance {
             external_id: instance.external_id.clone(),
             label: instance.label.clone(),
             display_color: instance.display_color,
+            face_visibility: instance.face_visibility.clone(),
         })
     }
 }
@@ -1356,6 +1361,7 @@ impl WebPreparedGeometryInstance {
             external_id: instance.external_id.as_str().to_string(),
             label: instance.label.clone(),
             display_color: instance.display_color.map(DisplayColor::as_rgb),
+            face_visibility: face_visibility_name(instance.face_visibility).to_string(),
         }
     }
 
@@ -1370,6 +1376,7 @@ impl WebPreparedGeometryInstance {
             external_id: instance.external_id.as_str().to_string(),
             label: instance.label.clone(),
             display_color: instance.display_color.map(DisplayColor::as_rgb),
+            face_visibility: face_visibility_name(instance.face_visibility).to_string(),
         }
     }
 
@@ -1386,6 +1393,8 @@ impl WebPreparedGeometryInstance {
             external_id: ExternalId::new(self.external_id),
             label: self.label,
             display_color: self.display_color.map(|rgb| DisplayColor { rgb }),
+            face_visibility: parse_face_visibility(&self.face_visibility)
+                .unwrap_or_else(|error| panic!("{error}")),
         }
     }
 
@@ -1402,6 +1411,8 @@ impl WebPreparedGeometryInstance {
             external_id: ExternalId::new(self.external_id),
             label: self.label,
             display_color: self.display_color.map(|rgb| DisplayColor { rgb }),
+            face_visibility: parse_face_visibility(&self.face_visibility)
+                .unwrap_or_else(|error| panic!("{error}")),
         }
     }
 }
@@ -1458,6 +1469,7 @@ impl WebPreparedVertex {
 fn default_render_class_name(class: DefaultRenderClass) -> &'static str {
     match class {
         DefaultRenderClass::Physical => "physical",
+        DefaultRenderClass::Course => "course",
         DefaultRenderClass::Space => "space",
         DefaultRenderClass::Zone => "zone",
         DefaultRenderClass::Helper => "helper",
@@ -1471,9 +1483,29 @@ fn default_render_class_name(class: DefaultRenderClass) -> &'static str {
     }
 }
 
+fn face_visibility_name(visibility: FaceVisibility) -> &'static str {
+    match visibility {
+        FaceVisibility::OneSided => "one-sided",
+        FaceVisibility::DoubleSided => "double-sided",
+    }
+}
+
+fn default_web_face_visibility() -> String {
+    face_visibility_name(FaceVisibility::OneSided).to_string()
+}
+
+fn parse_face_visibility(name: &str) -> Result<FaceVisibility, String> {
+    match name {
+        "one-sided" => Ok(FaceVisibility::OneSided),
+        "double-sided" => Ok(FaceVisibility::DoubleSided),
+        other => Err(format!("unknown face visibility `{other}`")),
+    }
+}
+
 fn parse_default_render_class(name: &str) -> Result<DefaultRenderClass, String> {
     match name {
         "physical" => Ok(DefaultRenderClass::Physical),
+        "course" => Ok(DefaultRenderClass::Course),
         "space" => Ok(DefaultRenderClass::Space),
         "zone" => Ok(DefaultRenderClass::Zone),
         "helper" => Ok(DefaultRenderClass::Helper),
@@ -1491,6 +1523,7 @@ fn parse_default_render_class(name: &str) -> Result<DefaultRenderClass, String> 
 fn web_default_visibility_for_class_name(name: &str) -> Result<bool, String> {
     Ok(match parse_default_render_class(name)? {
         DefaultRenderClass::Physical
+        | DefaultRenderClass::Course
         | DefaultRenderClass::Terrain
         | DefaultRenderClass::TerrainFeature
         | DefaultRenderClass::Vegetation
@@ -2216,22 +2249,29 @@ async fn load_resource_into_state(
     state: Rc<RefCell<WebViewerState>>,
     resource: String,
 ) -> Result<(), String> {
-    let window = {
+    let (window, load_generation) = {
         let mut state = state.borrow_mut();
-        state.begin_resource_load(&resource);
-        state.window.clone()
+        let load_generation = state.begin_resource_load(&resource);
+        (state.window.clone(), load_generation)
     };
     let runtime_scene = match fetch_runtime_scene(&window, &resource).await {
         Ok(runtime_scene) => runtime_scene,
         Err(error) => {
-            state
-                .borrow_mut()
-                .finish_resource_load_failed(&resource, &error);
+            let mut state = state.borrow_mut();
+            if state.resource_load_generation == load_generation {
+                state.finish_resource_load_failed(&resource, &error);
+            }
             return Err(error);
         }
     };
     let events = {
         let mut state = state.borrow_mut();
+        if state.resource_load_generation != load_generation {
+            log_viewer_info(&format!(
+                "w web viewer ignored stale resource load `{resource}`"
+            ));
+            return Ok(());
+        }
         state.apply_runtime_scene(resource, runtime_scene)?
     };
     dispatch_web_events(events)?;
@@ -3411,6 +3451,7 @@ impl WebViewerApp {
             pending_show_visibility_probe: None,
             show_visibility_probe_generation: 0,
             inspection_generation: 0,
+            resource_load_generation: 0,
             drag: DragState::default(),
             space_pan_modifier: false,
             last_pick_hits: Vec::new(),
@@ -3756,6 +3797,7 @@ struct WebViewerState {
     pending_show_visibility_probe: Option<ShowVisibilityProbe>,
     show_visibility_probe_generation: u64,
     inspection_generation: u64,
+    resource_load_generation: u64,
     drag: DragState,
     space_pan_modifier: bool,
     last_pick_hits: Vec<PickHit>,
@@ -3857,10 +3899,12 @@ fn dispatch_web_events(events: Vec<DeferredWebEvent>) -> Result<(), String> {
 
 #[cfg(target_arch = "wasm32")]
 impl WebViewerState {
-    fn begin_resource_load(&mut self, resource: &str) {
+    fn begin_resource_load(&mut self, resource: &str) -> u64 {
+        self.resource_load_generation = self.resource_load_generation.wrapping_add(1);
         self.resource_picker.set_disabled(true);
         self.resource_picker.set_value(resource);
         self.set_status(&format!("Loading {}...", friendly_resource_label(resource)));
+        self.resource_load_generation
     }
 
     fn finish_resource_load_failed(&mut self, resource: &str, error: &str) {
@@ -4015,6 +4059,45 @@ impl WebViewerState {
 
     fn upload_runtime_scene(&mut self, reset_camera: bool) -> Result<DeferredWebEvent, String> {
         let render_scene = self.runtime_scene.compose_render_scene();
+        let draw_count = render_scene.draw_count();
+        let triangle_count = render_scene.triangle_count();
+        let bounds = render_scene.bounds;
+        let bounds_size = bounds.size();
+        let bounds_are_finite = bounds.min.is_finite() && bounds.max.is_finite();
+        let next_camera = reset_camera.then(|| fit_camera_to_render_scene(&render_scene));
+        if reset_camera || draw_count == 0 || !bounds_are_finite {
+            let camera = next_camera.unwrap_or_else(|| self.renderer.camera());
+            log_viewer_info(&format!(
+                "w web viewer uploading resource={} reset_camera={} meshes={} draws={} tris={} bounds_min=({:.3},{:.3},{:.3}) bounds_max=({:.3},{:.3},{:.3}) bounds_size=({:.3},{:.3},{:.3}) bounds_finite={} camera_eye=({:.3},{:.3},{:.3}) camera_target=({:.3},{:.3},{:.3})",
+                self.current_resource,
+                reset_camera,
+                render_scene.definitions.len(),
+                draw_count,
+                triangle_count,
+                bounds.min.x,
+                bounds.min.y,
+                bounds.min.z,
+                bounds.max.x,
+                bounds.max.y,
+                bounds.max.z,
+                bounds_size.x,
+                bounds_size.y,
+                bounds_size.z,
+                bounds_are_finite,
+                camera.eye.x,
+                camera.eye.y,
+                camera.eye.z,
+                camera.target.x,
+                camera.target.y,
+                camera.target.z,
+            ));
+            if draw_count == 0 || !bounds_are_finite {
+                log_viewer_error(&format!(
+                    "w web viewer resource={} has suspicious render scene: draws={} bounds_finite={}",
+                    self.current_resource, draw_count, bounds_are_finite
+                ));
+            }
+        }
         self.renderer
             .upload_prepared_scene(&self.device, &self.queue, &render_scene);
         let annotation_layers = self
@@ -4028,7 +4111,7 @@ impl WebViewerState {
             .map_err(|error| format!("failed to upload annotation layers: {error}"))?;
         if reset_camera {
             self.camera_transition = None;
-            let camera = fit_camera_to_render_scene(&render_scene);
+            let camera = next_camera.expect("reset camera path computes the next camera");
             self.orbit = OrbitCameraController::from_camera(camera);
             self.renderer.set_camera(&self.queue, self.orbit.camera());
         }
@@ -6773,6 +6856,11 @@ fn rotate_vec2(vector: Vec2, radians: f32) -> Vec2 {
         (vector.x * cos) - (vector.y * sin),
         (vector.x * sin) + (vector.y * cos),
     )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn log_viewer_info(message: &str) {
+    web_sys::console::log_1(&JsValue::from_str(message));
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -1,10 +1,10 @@
 use cc_w_types::{
     Axis3, CircularArc2, CircularArc3, CircularProfileSweep, ConvexPolygon, CurveSegment2,
-    CurveSegment3, DefaultRenderClass, DisplayColor, ExternalId, GeometryDefinition,
-    GeometryDefinitionId, GeometryError, GeometryInstance, GeometryInstanceId, GeometryPrimitive,
-    ImportMetadata, IndexedPolygon, LengthUnit, LineSegment2, LineSegment3, MeshDocument,
-    Polycurve2, Polycurve3, Profile2, ProfileLoop2, SemanticElementId, SourceSpace, SweepPath,
-    SweptSolid, TessellatedGeometry,
+    CurveSegment3, DefaultRenderClass, DisplayColor, ExternalId, FaceVisibility,
+    GeometryDefinition, GeometryDefinitionId, GeometryError, GeometryInstance, GeometryInstanceId,
+    GeometryPrimitive, ImportMetadata, IndexedPolygon, LengthUnit, LineSegment2, LineSegment3,
+    MeshDocument, Polycurve2, Polycurve3, Profile2, ProfileLoop2, SemanticElementId, SourceSpace,
+    SweepPath, SweptSolid, TessellatedGeometry,
 };
 use glam::{DMat4, DVec2, DVec3};
 use std::f64::consts::TAU;
@@ -53,6 +53,7 @@ pub struct GeometryResourceInstance {
     pub declared_entity: String,
     pub default_render_class: DefaultRenderClass,
     pub display_color: Option<DisplayColor>,
+    pub face_visibility: FaceVisibility,
 }
 
 /// Adapter-facing generic geometry resource that still lives in an external source basis/unit
@@ -80,6 +81,7 @@ pub struct ImportedGeometryResourceInstance {
     pub declared_entity: String,
     pub default_render_class: DefaultRenderClass,
     pub display_color: Option<DisplayColor>,
+    pub face_visibility: FaceVisibility,
 }
 
 /// Backend-side repository boundary for geometry and scene projection data.
@@ -274,6 +276,7 @@ impl InMemoryGraphRepository {
                     declared_entity: "DemoGeometry".to_string(),
                     default_render_class: DefaultRenderClass::Physical,
                     display_color: Some(DisplayColor::new(0.95, 0.56, 0.24)),
+                    face_visibility: FaceVisibility::OneSided,
                 },
                 GeometryResourceInstance {
                     instance: GeometryInstance {
@@ -287,6 +290,7 @@ impl InMemoryGraphRepository {
                     declared_entity: "DemoGeometry".to_string(),
                     default_render_class: DefaultRenderClass::Physical,
                     display_color: Some(DisplayColor::new(0.24, 0.78, 0.55)),
+                    face_visibility: FaceVisibility::OneSided,
                 },
             ],
         }
@@ -498,6 +502,7 @@ pub fn import_geometry_scene_resource(
                 declared_entity: instance.declared_entity,
                 default_render_class: instance.default_render_class,
                 display_color: instance.display_color,
+                face_visibility: instance.face_visibility,
             })
             .collect(),
     }
@@ -683,6 +688,7 @@ fn geometry_resource_from_mesh_document(document: MeshDocument) -> GeometryResou
             declared_entity: "DemoGeometry".to_string(),
             default_render_class: DefaultRenderClass::Physical,
             display_color: None,
+            face_visibility: FaceVisibility::OneSided,
         }],
     }
 }
@@ -785,6 +791,7 @@ fn geometry_resource_from_primitive(
             declared_entity: "IfcProduct".to_string(),
             default_render_class: DefaultRenderClass::Physical,
             display_color: None,
+            face_visibility: FaceVisibility::OneSided,
         }],
         source_space: SourceSpace::w_world_metric(),
     })
@@ -1151,6 +1158,7 @@ mod tests {
                     declared_entity: "IfcProduct".to_string(),
                     default_render_class: DefaultRenderClass::Physical,
                     display_color: None,
+                    face_visibility: FaceVisibility::OneSided,
                 },
                 ImportedGeometryResourceInstance {
                     instance: GeometryInstance {
@@ -1164,6 +1172,7 @@ mod tests {
                     declared_entity: "IfcProduct".to_string(),
                     default_render_class: DefaultRenderClass::Physical,
                     display_color: None,
+                    face_visibility: FaceVisibility::OneSided,
                 },
             ],
             source_space: SourceSpace::right_handed_y_up_millimeters(),
@@ -1226,6 +1235,7 @@ mod tests {
                 declared_entity: "IfcProduct".to_string(),
                 default_render_class: DefaultRenderClass::Physical,
                 display_color: None,
+                face_visibility: FaceVisibility::OneSided,
             }],
             source_space: SourceSpace::right_handed_y_up_millimeters(),
         };
@@ -1282,6 +1292,7 @@ mod tests {
                 declared_entity: "IfcProduct".to_string(),
                 default_render_class: DefaultRenderClass::Physical,
                 display_color: None,
+                face_visibility: FaceVisibility::OneSided,
             }],
             source_space: SourceSpace::right_handed_y_up_millimeters(),
         };
@@ -1334,6 +1345,7 @@ mod tests {
                 declared_entity: "IfcProduct".to_string(),
                 default_render_class: DefaultRenderClass::Physical,
                 display_color: None,
+                face_visibility: FaceVisibility::OneSided,
             }],
             source_space: SourceSpace::right_handed_y_up_millimeters(),
         };

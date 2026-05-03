@@ -11,7 +11,7 @@ use cc_w_backend::{GeometryBackend, GeometryBackendError};
 use cc_w_db::{ImportedGeometryResourceInstance, ImportedGeometrySceneResource};
 use cc_w_types::{
     Bounds3, CoordinateFrame, CurveSegment2, DefaultRenderClass, DisplayColor, ExternalId,
-    GeometryDefinition, GeometryDefinitionId, GeometryInstance, GeometryInstanceId,
+    FaceVisibility, GeometryDefinition, GeometryDefinitionId, GeometryInstance, GeometryInstanceId,
     GeometryPrimitive, IndexedPolygon, LengthUnit, LineSegment2, Polycurve2,
     PreparedGeometryDefinition, PreparedGeometryElement, PreparedGeometryInstance,
     PreparedGeometryPackage, PreparedMesh, PreparedVertex, Profile2, ProfileLoop2,
@@ -36,8 +36,9 @@ query {
 }
 "#;
 
-const BODY_PACKAGE_CACHE_VERSION: u32 = 39;
+const BODY_PACKAGE_CACHE_VERSION: u32 = 40;
 const BODY_PACKAGE_CACHE_FILE: &str = "prepared-package.json";
+const POLYGONAL_FACE_SET_GEOMETRY_QUERY_CHUNK_SIZE: usize = 128;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IfcSchemaId {
     Ifc2x3Tc1,
@@ -484,6 +485,7 @@ struct CachedPreparedGeometryInstance {
     external_id: String,
     label: String,
     display_color: Option<[f32; 3]>,
+    face_visibility: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -602,6 +604,7 @@ impl CachedPreparedGeometryInstance {
             external_id: instance.external_id.as_str().to_string(),
             label: instance.label.clone(),
             display_color: instance.display_color.map(DisplayColor::as_rgb),
+            face_visibility: cached_face_visibility_name(instance.face_visibility).to_string(),
         }
     }
 
@@ -617,6 +620,7 @@ impl CachedPreparedGeometryInstance {
             display_color: self
                 .display_color
                 .map(|rgb| DisplayColor::new(rgb[0], rgb[1], rgb[2])),
+            face_visibility: parse_cached_face_visibility(&self.face_visibility),
         }
     }
 }
@@ -689,6 +693,7 @@ pub struct IfcBodyInstanceSummary {
     pub external_id: String,
     pub label: String,
     pub display_color: Option<DisplayColor>,
+    pub face_visibility: FaceVisibility,
     pub bounds_min: DVec3,
     pub bounds_max: DVec3,
     pub bounds_center: DVec3,
@@ -717,6 +722,7 @@ struct IfcBodyRecord {
     type_predefined_type: Option<String>,
     classification_identification: Option<String>,
     display_color: Option<DisplayColor>,
+    face_visibility: FaceVisibility,
     declared_entity: String,
     item_transform: DMat4,
     primitive: Arc<GeometryPrimitive>,
@@ -1059,19 +1065,6 @@ impl VelrIfcModel {
 
         let mut timings = Vec::new();
 
-        eprintln!("w velr body diagnostic phase placement_transforms start");
-        let start = Instant::now();
-        let placement_transforms = self.resolve_object_placement_transforms()?;
-        eprintln!(
-            "w velr body diagnostic phase placement_transforms done rows={}",
-            placement_transforms.len()
-        );
-        timings.push(phase_timing(
-            "placement_transforms",
-            start.elapsed(),
-            Some(placement_transforms.len()),
-        ));
-
         eprintln!("w velr body diagnostic phase triangulated_body_records start");
         let start = Instant::now();
         let mut records = self.query_body_triangulated_records()?;
@@ -1084,6 +1077,20 @@ impl VelrIfcModel {
             start.elapsed(),
             Some(records.len()),
         ));
+
+        eprintln!("w velr body diagnostic phase terrain_surface_records start");
+        let start = Instant::now();
+        let terrain_surface_records = self.query_terrain_surface_triangulated_records()?;
+        eprintln!(
+            "w velr body diagnostic phase terrain_surface_records done rows={}",
+            terrain_surface_records.len()
+        );
+        timings.push(phase_timing(
+            "terrain_surface_records",
+            start.elapsed(),
+            Some(terrain_surface_records.len()),
+        ));
+        records.extend(terrain_surface_records);
 
         eprintln!("w velr body diagnostic phase polygonal_face_set_body_records start");
         let start = Instant::now();
@@ -1166,6 +1173,20 @@ impl VelrIfcModel {
         timings.extend(brep_query.timings);
         records.extend(brep_query.records);
 
+        eprintln!("w velr body diagnostic phase placement_transforms start");
+        let start = Instant::now();
+        let placement_ids = body_record_placement_ids(&records);
+        let placement_transforms = self.resolve_object_placement_transforms_for(placement_ids)?;
+        eprintln!(
+            "w velr body diagnostic phase placement_transforms done rows={}",
+            placement_transforms.len()
+        );
+        timings.push(phase_timing(
+            "placement_transforms",
+            start.elapsed(),
+            Some(placement_transforms.len()),
+        ));
+
         let source_space = self.query_body_source_space()?;
 
         eprintln!(
@@ -1241,22 +1262,25 @@ impl VelrIfcModel {
     pub fn extract_body_scene_resource(
         &self,
     ) -> Result<ImportedGeometrySceneResource, VelrIfcError> {
-        let placement_transforms = self.resolve_object_placement_transforms()?;
         let mut records = self.query_body_triangulated_records()?;
+        records.extend(self.query_terrain_surface_triangulated_records()?);
         records.extend(self.query_body_polygonal_face_set_records()?);
         records.extend(self.query_body_extruded_records()?);
         records.extend(self.query_body_mapped_polygonal_face_set_records()?);
         records.extend(self.query_body_sectioned_solid_horizontal_records()?);
         records.extend(self.query_body_mapped_extruded_records()?);
         records.extend(self.query_body_faceted_brep_records()?);
+        let placement_ids = body_record_placement_ids(&records);
+        let placement_transforms = self.resolve_object_placement_transforms_for(placement_ids)?;
         let source_space = self.query_body_source_space()?;
         imported_scene_resource_from_body_records(records, &placement_transforms, source_space)
     }
 
     fn query_body_triangulated_records(&self) -> Result<Vec<IfcBodyRecord>, VelrIfcError> {
-        let rows = self.execute_cypher_rows(
+        self.query_triangulated_records(
             r#"
 MATCH (p:IfcProduct)-[:REPRESENTATION]->(:IfcProductDefinitionShape)-[:REPRESENTATIONS]->(rep:IfcShapeRepresentation)-[:ITEMS]->(item:IfcTriangulatedFaceSet)-[:COORDINATES]->(pl:IfcCartesianPointList3D)
+WHERE rep.RepresentationIdentifier = 'Body'
 OPTIONAL MATCH (p)-[:OBJECT_PLACEMENT]->(placement)
 OPTIONAL MATCH (p)<-[:RELATED_ELEMENTS]-(:IfcRelContainedInSpatialStructure)-[:RELATING_STRUCTURE]->(:IfcProduct)-[:OBJECT_PLACEMENT]->(container_placement)
 OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelDefinesByType)-[:RELATING_TYPE]->(type_node)
@@ -1265,21 +1289,66 @@ OPTIONAL MATCH (item)<-[:ITEM]-(styled:IfcStyledItem)
 OPTIONAL MATCH (styled)-[:STYLES]->(style_assignment:IfcPresentationStyleAssignment)
 OPTIONAL MATCH (style_assignment)-[:STYLES]->(assigned_surface_style:IfcSurfaceStyle)
 OPTIONAL MATCH (styled)-[:STYLES]->(surface_style:IfcSurfaceStyle)
-OPTIONAL MATCH (surface_style)-[:STYLES]->(rendering:IfcSurfaceStyleRendering)
-OPTIONAL MATCH (rendering)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
-OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_rendering:IfcSurfaceStyleRendering)
-OPTIONAL MATCH (assigned_rendering)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
-WHERE rep.RepresentationIdentifier = 'Body'
+OPTIONAL MATCH (surface_style)-[:STYLES]->(surface_colour_style)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
+OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_surface_colour_style)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
 WITH p, placement, item, pl,
      head(collect(DISTINCT container_placement)) AS container_placement_id,
      head(collect(DISTINCT { object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType })) AS type_semantics,
      head(collect(DISTINCT classification_ref.Identification)) AS classification_identification,
      head(collect(DISTINCT { red: rgb.Red, green: rgb.Green, blue: rgb.Blue })) AS surface_rgb,
-     head(collect(DISTINCT { red: assigned_rgb.Red, green: assigned_rgb.Green, blue: assigned_rgb.Blue })) AS assigned_surface_rgb
-RETURN id(p) AS product_id, id(placement) AS placement_id, container_placement_id, id(item) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, pl.CoordList AS coord_list, item.CoordIndex AS coord_index, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue, assigned_surface_rgb.red AS assigned_style_red, assigned_surface_rgb.green AS assigned_style_green, assigned_surface_rgb.blue AS assigned_style_blue
+     head(collect(DISTINCT { red: assigned_rgb.Red, green: assigned_rgb.Green, blue: assigned_rgb.Blue })) AS assigned_surface_rgb,
+     head(collect(DISTINCT surface_style.Side)) AS surface_side,
+     head(collect(DISTINCT assigned_surface_style.Side)) AS assigned_surface_side
+RETURN id(p) AS product_id, id(placement) AS placement_id, container_placement_id, id(item) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, pl.CoordList AS coord_list, item.CoordIndex AS coord_index, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue, assigned_surface_rgb.red AS assigned_style_red, assigned_surface_rgb.green AS assigned_style_green, assigned_surface_rgb.blue AS assigned_style_blue, surface_side, assigned_surface_side
 ORDER BY item_id
 "#,
-        )?;
+        )
+    }
+
+    fn query_terrain_surface_triangulated_records(
+        &self,
+    ) -> Result<Vec<IfcBodyRecord>, VelrIfcError> {
+        self.query_triangulated_records(
+            r#"
+MATCH (p:IfcProduct)-[:REPRESENTATION]->(:IfcProductDefinitionShape)-[:REPRESENTATIONS]->(rep:IfcShapeRepresentation)-[:ITEMS]->(item:IfcTriangulatedFaceSet)-[:COORDINATES]->(pl:IfcCartesianPointList3D)
+WHERE rep.RepresentationIdentifier = 'Surface'
+  AND (
+    p.declared_entity = 'IfcSite'
+    OR p.declared_entity = 'IfcTopographyElement'
+    OR p.declared_entity = 'IfcGeographicElement'
+    OR p.declared_entity = 'IfcGeotechnicalStratum'
+    OR p.declared_entity = 'IfcSurfaceFeature'
+    OR p.declared_entity = 'IfcWater'
+    OR p.declared_entity = 'IfcEarthworksCut'
+    OR p.declared_entity = 'IfcEarthworksFill'
+    OR (p.declared_entity = 'IfcDistributionChamberElement' AND p.PredefinedType = 'TRENCH')
+  )
+OPTIONAL MATCH (p)-[:OBJECT_PLACEMENT]->(placement)
+OPTIONAL MATCH (p)<-[:RELATED_ELEMENTS]-(:IfcRelContainedInSpatialStructure)-[:RELATING_STRUCTURE]->(:IfcProduct)-[:OBJECT_PLACEMENT]->(container_placement)
+OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelDefinesByType)-[:RELATING_TYPE]->(type_node)
+OPTIONAL MATCH (p)<-[:RELATED_OBJECTS]-(:IfcRelAssociatesClassification)-[:RELATING_CLASSIFICATION]->(classification_ref)
+OPTIONAL MATCH (item)<-[:ITEM]-(styled:IfcStyledItem)
+OPTIONAL MATCH (styled)-[:STYLES]->(style_assignment:IfcPresentationStyleAssignment)
+OPTIONAL MATCH (style_assignment)-[:STYLES]->(assigned_surface_style:IfcSurfaceStyle)
+OPTIONAL MATCH (styled)-[:STYLES]->(surface_style:IfcSurfaceStyle)
+OPTIONAL MATCH (surface_style)-[:STYLES]->(surface_colour_style)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
+OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_surface_colour_style)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
+WITH p, placement, item, pl,
+     head(collect(DISTINCT container_placement)) AS container_placement_id,
+     head(collect(DISTINCT { object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType })) AS type_semantics,
+     head(collect(DISTINCT classification_ref.Identification)) AS classification_identification,
+     head(collect(DISTINCT { red: rgb.Red, green: rgb.Green, blue: rgb.Blue })) AS surface_rgb,
+     head(collect(DISTINCT { red: assigned_rgb.Red, green: assigned_rgb.Green, blue: assigned_rgb.Blue })) AS assigned_surface_rgb,
+     head(collect(DISTINCT surface_style.Side)) AS surface_side,
+     head(collect(DISTINCT assigned_surface_style.Side)) AS assigned_surface_side
+RETURN id(p) AS product_id, id(placement) AS placement_id, container_placement_id, id(item) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, pl.CoordList AS coord_list, item.CoordIndex AS coord_index, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue, assigned_surface_rgb.red AS assigned_style_red, assigned_surface_rgb.green AS assigned_style_green, assigned_surface_rgb.blue AS assigned_style_blue, surface_side, assigned_surface_side
+ORDER BY item_id
+"#,
+        )
+    }
+
+    fn query_triangulated_records(&self, cypher: &str) -> Result<Vec<IfcBodyRecord>, VelrIfcError> {
+        let rows = self.execute_cypher_rows(cypher)?;
 
         let records: Vec<IfcBodyRecord> = rows
             .rows
@@ -1306,6 +1375,8 @@ ORDER BY item_id
                     row.get(18),
                     row.get(19),
                 )?;
+                let face_visibility =
+                    parse_optional_face_visibility_cells(row.get(20), row.get(21))?;
                 let declared_entity =
                     parse_required_string_cell(row.get(11), "declared_entity")?.to_string();
                 let Some(geometry) = tessellated_geometry_from_row(
@@ -1333,6 +1404,7 @@ ORDER BY item_id
                     type_predefined_type,
                     classification_identification,
                     display_color,
+                    face_visibility,
                     declared_entity,
                     item_transform: DMat4::IDENTITY,
                     primitive,
@@ -1395,30 +1467,48 @@ LIMIT 1
         if let Some(item_ids) = item_ids {
             let mut item_ids = item_ids.iter().copied().collect::<Vec<_>>();
             item_ids.sort_unstable();
+            if item_ids.is_empty() {
+                return Ok(HashMap::new());
+            }
+
             let mut geometry_by_item = HashMap::new();
-            for (index, item_id) in item_ids.iter().copied().enumerate() {
-                if index == 0 || (index + 1) % 10 == 0 || index + 1 == item_ids.len() {
+            let total_chunks = item_ids
+                .len()
+                .div_ceil(POLYGONAL_FACE_SET_GEOMETRY_QUERY_CHUNK_SIZE);
+            for (index, chunk) in item_ids
+                .chunks(POLYGONAL_FACE_SET_GEOMETRY_QUERY_CHUNK_SIZE)
+                .enumerate()
+            {
+                if total_chunks > 1 {
                     eprintln!(
-                        "w velr polygonal geometry item {}/{}",
+                        "w velr polygonal geometry chunk {}/{} items={}",
                         index + 1,
-                        item_ids.len()
+                        total_chunks,
+                        chunk.len()
                     );
                 }
                 geometry_by_item
-                    .extend(self.query_polygonal_face_set_geometry_by_single_item(Some(item_id))?);
+                    .extend(self.query_polygonal_face_set_geometry_by_item_chunk(Some(chunk))?);
             }
             return Ok(geometry_by_item);
         }
 
-        self.query_polygonal_face_set_geometry_by_single_item(None)
+        self.query_polygonal_face_set_geometry_by_item_chunk(None)
     }
 
-    fn query_polygonal_face_set_geometry_by_single_item(
+    fn query_polygonal_face_set_geometry_by_item_chunk(
         &self,
-        item_id: Option<u64>,
+        item_ids: Option<&[u64]>,
     ) -> Result<HashMap<u64, Arc<GeometryPrimitive>>, VelrIfcError> {
-        let item_filter = item_id
-            .map(|item_id| format!("WITH item WHERE id(item) = {item_id}"))
+        let item_filter = item_ids
+            .map(|item_ids| {
+                let item_ids = item_ids
+                    .iter()
+                    .map(|item_id| item_id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("WHERE id(item) IN [{item_ids}]")
+            })
             .unwrap_or_default();
         let coord_rows = self.execute_cypher_rows(&format!(
             r#"
@@ -1498,17 +1588,17 @@ OPTIONAL MATCH (item)<-[:ITEM]-(styled:IfcStyledItem)
 OPTIONAL MATCH (styled)-[:STYLES]->(style_assignment:IfcPresentationStyleAssignment)
 OPTIONAL MATCH (style_assignment)-[:STYLES]->(assigned_surface_style:IfcSurfaceStyle)
 OPTIONAL MATCH (styled)-[:STYLES]->(surface_style:IfcSurfaceStyle)
-OPTIONAL MATCH (surface_style)-[:STYLES]->(rendering:IfcSurfaceStyleRendering)
-OPTIONAL MATCH (rendering)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
-OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_rendering:IfcSurfaceStyleRendering)
-OPTIONAL MATCH (assigned_rendering)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
+OPTIONAL MATCH (surface_style)-[:STYLES]->(surface_colour_style)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
+OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_surface_colour_style)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
 WITH p, placement, item,
      head(collect(DISTINCT container_placement)) AS container_placement_id,
      head(collect(DISTINCT { object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType })) AS type_semantics,
      head(collect(DISTINCT classification_ref.Identification)) AS classification_identification,
      head(collect(DISTINCT { red: rgb.Red, green: rgb.Green, blue: rgb.Blue })) AS surface_rgb,
-     head(collect(DISTINCT { red: assigned_rgb.Red, green: assigned_rgb.Green, blue: assigned_rgb.Blue })) AS assigned_surface_rgb
-RETURN id(p) AS product_id, id(placement) AS placement_id, container_placement_id, id(item) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue, assigned_surface_rgb.red AS assigned_style_red, assigned_surface_rgb.green AS assigned_style_green, assigned_surface_rgb.blue AS assigned_style_blue
+     head(collect(DISTINCT { red: assigned_rgb.Red, green: assigned_rgb.Green, blue: assigned_rgb.Blue })) AS assigned_surface_rgb,
+     head(collect(DISTINCT surface_style.Side)) AS surface_side,
+     head(collect(DISTINCT assigned_surface_style.Side)) AS assigned_surface_side
+RETURN id(p) AS product_id, id(placement) AS placement_id, container_placement_id, id(item) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue, assigned_surface_rgb.red AS assigned_style_red, assigned_surface_rgb.green AS assigned_style_green, assigned_surface_rgb.blue AS assigned_style_blue, surface_side, assigned_surface_side
 ORDER BY item_id
 "#,
         )?;
@@ -1548,6 +1638,8 @@ ORDER BY item_id
                     row.get(16),
                     row.get(17),
                 )?;
+                let face_visibility =
+                    parse_optional_face_visibility_cells(row.get(18), row.get(19))?;
                 let declared_entity =
                     parse_required_string_cell(row.get(11), "declared_entity")?.to_string();
 
@@ -1564,6 +1656,7 @@ ORDER BY item_id
                     type_predefined_type,
                     classification_identification,
                     display_color,
+                    face_visibility,
                     declared_entity,
                     item_transform: DMat4::IDENTITY,
                     primitive,
@@ -1668,6 +1761,7 @@ ORDER BY item_id
                         row.get(15),
                         row.get(16),
                     )?,
+                    face_visibility: FaceVisibility::OneSided,
                     item_transform: DMat4::IDENTITY,
                     primitive,
                 })
@@ -1732,6 +1826,7 @@ ORDER BY item_id
                         row.get(16),
                         row.get(17),
                     )?,
+                    face_visibility: FaceVisibility::OneSided,
                     item_transform: mapped_transform,
                     primitive,
                 })
@@ -1914,10 +2009,8 @@ OPTIONAL MATCH (solid)<-[:ITEM]-(styled:IfcStyledItem)
 OPTIONAL MATCH (styled)-[:STYLES]->(style_assignment:IfcPresentationStyleAssignment)
 OPTIONAL MATCH (style_assignment)-[:STYLES]->(assigned_surface_style:IfcSurfaceStyle)
 OPTIONAL MATCH (styled)-[:STYLES]->(surface_style:IfcSurfaceStyle)
-OPTIONAL MATCH (surface_style)-[:STYLES]->(rendering:IfcSurfaceStyleRendering)
-OPTIONAL MATCH (rendering)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
-OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_rendering:IfcSurfaceStyleRendering)
-OPTIONAL MATCH (assigned_rendering)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
+OPTIONAL MATCH (surface_style)-[:STYLES]->(surface_colour_style)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
+OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_surface_colour_style)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
 WITH p, placement, solid, dir, solid_position,
      point_rows,
      head(collect(DISTINCT { object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType })) AS type_semantics,
@@ -1987,6 +2080,7 @@ ORDER BY item_id
                     type_predefined_type,
                     classification_identification,
                     display_color,
+                    face_visibility: FaceVisibility::OneSided,
                     declared_entity,
                     item_transform,
                     primitive,
@@ -2098,10 +2192,8 @@ OPTIONAL MATCH (solid)<-[:ITEM]-(styled:IfcStyledItem)
 OPTIONAL MATCH (styled)-[:STYLES]->(style_assignment:IfcPresentationStyleAssignment)
 OPTIONAL MATCH (style_assignment)-[:STYLES]->(assigned_surface_style:IfcSurfaceStyle)
 OPTIONAL MATCH (styled)-[:STYLES]->(surface_style:IfcSurfaceStyle)
-OPTIONAL MATCH (surface_style)-[:STYLES]->(rendering:IfcSurfaceStyleRendering)
-OPTIONAL MATCH (rendering)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
-OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_rendering:IfcSurfaceStyleRendering)
-OPTIONAL MATCH (assigned_rendering)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
+OPTIONAL MATCH (surface_style)-[:STYLES]->(surface_colour_style)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
+OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_surface_colour_style)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
 WITH mapped, p, placement, solid,
      head(collect(DISTINCT { object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType })) AS type_semantics,
      head(collect(DISTINCT classification_ref.Identification)) AS classification_identification,
@@ -2163,6 +2255,7 @@ ORDER BY mapped_item_id, item_id
                     type_predefined_type,
                     classification_identification,
                     display_color,
+                    face_visibility: FaceVisibility::OneSided,
                     declared_entity,
                     item_transform: mapped_transform * geometry.item_transform,
                     primitive: geometry.primitive,
@@ -2222,17 +2315,17 @@ OPTIONAL MATCH (item)<-[:ITEM]-(styled:IfcStyledItem)
 OPTIONAL MATCH (styled)-[:STYLES]->(style_assignment:IfcPresentationStyleAssignment)
 OPTIONAL MATCH (style_assignment)-[:STYLES]->(assigned_surface_style:IfcSurfaceStyle)
 OPTIONAL MATCH (styled)-[:STYLES]->(surface_style:IfcSurfaceStyle)
-OPTIONAL MATCH (surface_style)-[:STYLES]->(rendering:IfcSurfaceStyleRendering)
-OPTIONAL MATCH (rendering)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
-OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_rendering:IfcSurfaceStyleRendering)
-OPTIONAL MATCH (assigned_rendering)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
+OPTIONAL MATCH (surface_style)-[:STYLES]->(surface_colour_style)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
+OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_surface_colour_style)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
 WITH mapped, p, placement, item,
      head(collect(DISTINCT container_placement)) AS container_placement_id,
      head(collect(DISTINCT { object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType })) AS type_semantics,
      head(collect(DISTINCT classification_ref.Identification)) AS classification_identification,
      head(collect(DISTINCT { red: rgb.Red, green: rgb.Green, blue: rgb.Blue })) AS surface_rgb,
-     head(collect(DISTINCT { red: assigned_rgb.Red, green: assigned_rgb.Green, blue: assigned_rgb.Blue })) AS assigned_surface_rgb
-RETURN id(mapped) AS mapped_item_id, id(p) AS product_id, id(placement) AS placement_id, container_placement_id, id(item) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue, assigned_surface_rgb.red AS assigned_style_red, assigned_surface_rgb.green AS assigned_style_green, assigned_surface_rgb.blue AS assigned_style_blue
+     head(collect(DISTINCT { red: assigned_rgb.Red, green: assigned_rgb.Green, blue: assigned_rgb.Blue })) AS assigned_surface_rgb,
+     head(collect(DISTINCT surface_style.Side)) AS surface_side,
+     head(collect(DISTINCT assigned_surface_style.Side)) AS assigned_surface_side
+RETURN id(mapped) AS mapped_item_id, id(p) AS product_id, id(placement) AS placement_id, container_placement_id, id(item) AS item_id, p.GlobalId AS global_id, p.Name AS name, p.ObjectType AS object_type, p.PredefinedType AS predefined_type, type_semantics.object_type AS type_object_type, type_semantics.predefined_type AS type_predefined_type, classification_identification, p.declared_entity AS declared_entity, surface_rgb.red AS style_red, surface_rgb.green AS style_green, surface_rgb.blue AS style_blue, assigned_surface_rgb.red AS assigned_style_red, assigned_surface_rgb.green AS assigned_style_green, assigned_surface_rgb.blue AS assigned_style_blue, surface_side, assigned_surface_side
 ORDER BY mapped_item_id, item_id
 "#,
         )?;
@@ -2294,6 +2387,8 @@ ORDER BY mapped_item_id, item_id
                     row.get(17),
                     row.get(18),
                 )?;
+                let face_visibility =
+                    parse_optional_face_visibility_cells(row.get(19), row.get(20))?;
                 let declared_entity =
                     parse_required_string_cell(row.get(12), "declared_entity")?.to_string();
 
@@ -2310,6 +2405,7 @@ ORDER BY mapped_item_id, item_id
                     type_predefined_type,
                     classification_identification,
                     display_color,
+                    face_visibility,
                     declared_entity,
                     item_transform: mapped_transform,
                     primitive,
@@ -2353,10 +2449,8 @@ OPTIONAL MATCH (item)<-[:ITEM]-(styled:IfcStyledItem)
 OPTIONAL MATCH (styled)-[:STYLES]->(style_assignment:IfcPresentationStyleAssignment)
 OPTIONAL MATCH (style_assignment)-[:STYLES]->(assigned_surface_style:IfcSurfaceStyle)
 OPTIONAL MATCH (styled)-[:STYLES]->(surface_style:IfcSurfaceStyle)
-OPTIONAL MATCH (surface_style)-[:STYLES]->(rendering:IfcSurfaceStyleRendering)
-OPTIONAL MATCH (rendering)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
-OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_rendering:IfcSurfaceStyleRendering)
-OPTIONAL MATCH (assigned_rendering)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
+OPTIONAL MATCH (surface_style)-[:STYLES]->(surface_colour_style)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
+OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_surface_colour_style)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
 WITH p, placement, item, directrix,
      head(collect(DISTINCT container_placement)) AS container_placement_id,
      head(collect(DISTINCT { object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType })) AS type_semantics,
@@ -2440,6 +2534,7 @@ ORDER BY item_id
                     type_predefined_type: parse_optional_string_cell(row.get(11)),
                     classification_identification: parse_optional_string_cell(row.get(12)),
                     display_color,
+                    face_visibility: FaceVisibility::OneSided,
                     declared_entity,
                     item_transform: DMat4::IDENTITY,
                     primitive,
@@ -3159,7 +3254,15 @@ RETURN id(mapped) AS mapped_item_id, id(origin) AS origin_id, id(target) AS targ
             .collect()
     }
 
-    fn resolve_object_placement_transforms(&self) -> Result<HashMap<u64, DMat4>, VelrIfcError> {
+    fn resolve_object_placement_transforms_for(
+        &self,
+        placement_ids: impl IntoIterator<Item = u64>,
+    ) -> Result<HashMap<u64, DMat4>, VelrIfcError> {
+        let placement_ids = placement_ids.into_iter().collect::<HashSet<_>>();
+        if placement_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
         let placements = self.query_local_placement_records()?;
         let local_by_id = placements
             .into_iter()
@@ -3172,30 +3275,34 @@ RETURN id(mapped) AS mapped_item_id, id(origin) AS origin_id, id(target) AS targ
         let mut visiting_local = HashSet::new();
         let mut visiting_linear = HashSet::new();
 
-        for placement_id in local_by_id.keys().copied().collect::<Vec<_>>() {
-            resolve_local_placement_transform(
-                placement_id,
-                &local_by_id,
-                &linear_by_id,
-                &curves,
-                &mut resolved_local,
-                &mut resolved_linear,
-                &mut visiting_local,
-                &mut visiting_linear,
-            )?;
-        }
-
-        for placement_id in linear_by_id.keys().copied().collect::<Vec<_>>() {
-            resolve_linear_placement_transform(
-                placement_id,
-                &local_by_id,
-                &linear_by_id,
-                &curves,
-                &mut resolved_local,
-                &mut resolved_linear,
-                &mut visiting_local,
-                &mut visiting_linear,
-            )?;
+        for placement_id in placement_ids {
+            if local_by_id.contains_key(&placement_id) {
+                resolve_local_placement_transform(
+                    placement_id,
+                    &local_by_id,
+                    &linear_by_id,
+                    &curves,
+                    &mut resolved_local,
+                    &mut resolved_linear,
+                    &mut visiting_local,
+                    &mut visiting_linear,
+                )?;
+            } else if linear_by_id.contains_key(&placement_id) {
+                resolve_linear_placement_transform(
+                    placement_id,
+                    &local_by_id,
+                    &linear_by_id,
+                    &curves,
+                    &mut resolved_local,
+                    &mut resolved_linear,
+                    &mut visiting_local,
+                    &mut visiting_linear,
+                )?;
+            } else {
+                return Err(VelrIfcError::IfcGeometryData(format!(
+                    "referenced placement `{placement_id}` was not returned by the placement query"
+                )));
+            }
         }
 
         resolved_local.extend(resolved_linear);
@@ -3563,7 +3670,7 @@ fn is_ifc_terrain_body(record: &IfcBodyRecord) -> bool {
     let entity = record.declared_entity.as_str();
     if matches!(
         entity,
-        "IfcSite" | "IfcSurfaceFeature" | "IfcTopographyElement"
+        "IfcGeotechnicalStratum" | "IfcSite" | "IfcSurfaceFeature" | "IfcTopographyElement"
     ) {
         return true;
     }
@@ -3682,10 +3789,8 @@ OPTIONAL MATCH (solid)<-[:ITEM]-(styled:IfcStyledItem)
 OPTIONAL MATCH (styled)-[:STYLES]->(style_assignment:IfcPresentationStyleAssignment)
 OPTIONAL MATCH (style_assignment)-[:STYLES]->(assigned_surface_style:IfcSurfaceStyle)
 OPTIONAL MATCH (styled)-[:STYLES]->(surface_style:IfcSurfaceStyle)
-OPTIONAL MATCH (surface_style)-[:STYLES]->(rendering:IfcSurfaceStyleRendering)
-OPTIONAL MATCH (rendering)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
-OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_rendering:IfcSurfaceStyleRendering)
-OPTIONAL MATCH (assigned_rendering)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
+OPTIONAL MATCH (surface_style)-[:STYLES]->(surface_colour_style)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
+OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_surface_colour_style)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
 WITH p, placement, solid,
      head(collect(DISTINCT {{ object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType }})) AS type_semantics,
      head(collect(DISTINCT classification_ref.Identification)) AS classification_identification,
@@ -3721,10 +3826,8 @@ OPTIONAL MATCH (solid)<-[:ITEM]-(styled:IfcStyledItem)
 OPTIONAL MATCH (styled)-[:STYLES]->(style_assignment:IfcPresentationStyleAssignment)
 OPTIONAL MATCH (style_assignment)-[:STYLES]->(assigned_surface_style:IfcSurfaceStyle)
 OPTIONAL MATCH (styled)-[:STYLES]->(surface_style:IfcSurfaceStyle)
-OPTIONAL MATCH (surface_style)-[:STYLES]->(rendering:IfcSurfaceStyleRendering)
-OPTIONAL MATCH (rendering)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
-OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_rendering:IfcSurfaceStyleRendering)
-OPTIONAL MATCH (assigned_rendering)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
+OPTIONAL MATCH (surface_style)-[:STYLES]->(surface_colour_style)-[:SURFACE_COLOUR]->(rgb:IfcColourRgb)
+OPTIONAL MATCH (assigned_surface_style)-[:STYLES]->(assigned_surface_colour_style)-[:SURFACE_COLOUR]->(assigned_rgb:IfcColourRgb)
 WITH mapped, p, placement, solid,
      head(collect(DISTINCT {{ object_type: type_node.ObjectType, predefined_type: type_node.PredefinedType }})) AS type_semantics,
      head(collect(DISTINCT classification_ref.Identification)) AS classification_identification,
@@ -3769,6 +3872,7 @@ fn summarize_body_instances(package: &PreparedGeometryPackage) -> Vec<IfcBodyIns
             external_id: instance.external_id.as_str().to_string(),
             label: instance.label.clone(),
             display_color: instance.display_color,
+            face_visibility: instance.face_visibility,
             bounds_min: instance.bounds.min,
             bounds_max: instance.bounds.max,
             bounds_center: instance.bounds.center(),
@@ -3861,35 +3965,54 @@ fn imported_scene_resource_from_body_records(
         .iter()
         .enumerate()
         .map(
-            |(instance_index, record)| ImportedGeometryResourceInstance {
-                instance: GeometryInstance {
-                    id: GeometryInstanceId((instance_index as u64) + 1),
-                    definition_id: GeometryDefinitionId(record.item_id),
-                    transform: record
-                        .placement_id
-                        .and_then(|placement_id| placement_transforms.get(&placement_id))
-                        .copied()
-                        .unwrap_or(DMat4::IDENTITY)
-                        * record.item_transform,
-                },
-                element_id: ifc_element_id_for_record(record),
-                external_id: ExternalId::new(external_id_for_body_record(record)),
-                label: record
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| record.declared_entity.clone()),
-                declared_entity: record.declared_entity.clone(),
-                default_render_class: default_render_class_for_ifc_body_record(record),
-                display_color: record.display_color,
+            |(instance_index, record)| -> Result<ImportedGeometryResourceInstance, VelrIfcError> {
+                let placement_transform = match record.placement_id {
+                    Some(placement_id) => {
+                        placement_transforms.get(&placement_id).copied().ok_or_else(|| {
+                            VelrIfcError::IfcGeometryData(format!(
+                                "body record for product `{}` references unresolved object placement `{placement_id}`",
+                                record.product_id
+                            ))
+                        })?
+                    }
+                    None => DMat4::IDENTITY,
+                };
+
+                Ok(ImportedGeometryResourceInstance {
+                    instance: GeometryInstance {
+                        id: GeometryInstanceId((instance_index as u64) + 1),
+                        definition_id: GeometryDefinitionId(record.item_id),
+                        transform: placement_transform * record.item_transform,
+                    },
+                    element_id: ifc_element_id_for_record(record),
+                    external_id: ExternalId::new(external_id_for_body_record(record)),
+                    label: record
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| record.declared_entity.clone()),
+                    declared_entity: record.declared_entity.clone(),
+                    default_render_class: default_render_class_for_ifc_body_record(record),
+                    display_color: record.display_color,
+                    face_visibility: record.face_visibility,
+                })
             },
         )
-        .collect();
+        .collect::<Result<Vec<_>, VelrIfcError>>()?;
 
     Ok(ImportedGeometrySceneResource {
         definitions,
         instances,
         source_space,
     })
+}
+
+fn body_record_placement_ids(records: &[IfcBodyRecord]) -> Vec<u64> {
+    let mut seen = HashSet::new();
+    records
+        .iter()
+        .filter_map(|record| record.placement_id)
+        .filter(|placement_id| seen.insert(*placement_id))
+        .collect()
 }
 
 fn external_id_for_body_record(record: &IfcBodyRecord) -> String {
@@ -3933,6 +4056,7 @@ fn default_render_class_for_ifc_body_record(record: &IfcBodyRecord) -> DefaultRe
     }
 
     match record.declared_entity.as_str() {
+        "IfcCourse" => DefaultRenderClass::Course,
         "IfcSpace" => DefaultRenderClass::Space,
         "IfcSpatialZone" => DefaultRenderClass::Zone,
         "IfcBuildingElementProxy" if is_ifc_building_element_proxy_helper(record) => {
@@ -3945,6 +4069,7 @@ fn default_render_class_for_ifc_body_record(record: &IfcBodyRecord) -> DefaultRe
 fn cached_render_class_name(class: DefaultRenderClass) -> &'static str {
     match class {
         DefaultRenderClass::Physical => "physical",
+        DefaultRenderClass::Course => "course",
         DefaultRenderClass::Space => "space",
         DefaultRenderClass::Zone => "zone",
         DefaultRenderClass::Helper => "helper",
@@ -3958,9 +4083,25 @@ fn cached_render_class_name(class: DefaultRenderClass) -> &'static str {
     }
 }
 
+fn cached_face_visibility_name(visibility: FaceVisibility) -> &'static str {
+    match visibility {
+        FaceVisibility::OneSided => "one-sided",
+        FaceVisibility::DoubleSided => "double-sided",
+    }
+}
+
+fn parse_cached_face_visibility(value: &str) -> FaceVisibility {
+    match value {
+        "one-sided" => FaceVisibility::OneSided,
+        "double-sided" => FaceVisibility::DoubleSided,
+        other => panic!("unsupported cached face visibility `{other}`"),
+    }
+}
+
 fn parse_cached_render_class(value: &str) -> DefaultRenderClass {
     match value {
         "physical" => DefaultRenderClass::Physical,
+        "course" => DefaultRenderClass::Course,
         "space" => DefaultRenderClass::Space,
         "zone" => DefaultRenderClass::Zone,
         "helper" => DefaultRenderClass::Helper,
@@ -4129,6 +4270,39 @@ fn parse_optional_db_style_color_cells(
         return Ok(direct_color);
     }
     parse_optional_display_color_cells(assigned_red, assigned_green, assigned_blue)
+}
+
+fn parse_optional_face_visibility_cells(
+    side: Option<&String>,
+    assigned_side: Option<&String>,
+) -> Result<FaceVisibility, VelrIfcError> {
+    let side =
+        parse_optional_ifc_enum_cell(side).or_else(|| parse_optional_ifc_enum_cell(assigned_side));
+    let Some(side) = side else {
+        return Ok(FaceVisibility::OneSided);
+    };
+
+    match side.as_str() {
+        "BOTH" => Ok(FaceVisibility::DoubleSided),
+        "POSITIVE" => Ok(FaceVisibility::OneSided),
+        other => Err(VelrIfcError::IfcGeometryData(format!(
+            "unsupported IfcSurfaceStyle.Side `{other}` for body face visibility"
+        ))),
+    }
+}
+
+fn parse_optional_ifc_enum_cell(cell: Option<&String>) -> Option<String> {
+    let value = parse_optional_string_cell(cell)?;
+    if value.eq_ignore_ascii_case("null") {
+        return None;
+    }
+    let normalized = value
+        .trim_matches('.')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_ascii_uppercase();
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn parse_dvec3_cell(cell: Option<&String>, label: &'static str) -> Result<DVec3, VelrIfcError> {
@@ -6177,6 +6351,44 @@ mod tests {
     use velr_graphql_core::JsonValue;
 
     #[test]
+    fn ifc_surface_style_side_both_maps_to_double_sided_face_visibility() {
+        let direct_side = ".BOTH.".to_string();
+
+        assert_eq!(
+            parse_optional_face_visibility_cells(Some(&direct_side), None).unwrap(),
+            FaceVisibility::DoubleSided
+        );
+    }
+
+    #[test]
+    fn ifc_surface_style_missing_or_positive_side_stays_one_sided() {
+        let positive_side = "POSITIVE".to_string();
+
+        assert_eq!(
+            parse_optional_face_visibility_cells(None, None).unwrap(),
+            FaceVisibility::OneSided
+        );
+        assert_eq!(
+            parse_optional_face_visibility_cells(Some(&positive_side), None).unwrap(),
+            FaceVisibility::OneSided
+        );
+    }
+
+    #[test]
+    fn unknown_ifc_surface_style_side_fails_loudly() {
+        let unknown_side = "SIDEWAYS".to_string();
+
+        assert!(parse_optional_face_visibility_cells(Some(&unknown_side), None).is_err());
+    }
+
+    #[test]
+    fn negative_ifc_surface_style_side_fails_until_back_side_rendering_is_supported() {
+        let negative_side = "NEGATIVE".to_string();
+
+        assert!(parse_optional_face_visibility_cells(Some(&negative_side), None).is_err());
+    }
+
+    #[test]
     fn curated_fixture_catalog_matches_expected_local_corpus() {
         let slugs = curated_fixture_specs()
             .iter()
@@ -6234,6 +6446,7 @@ mod tests {
             type_predefined_type: None,
             classification_identification: None,
             display_color: None,
+            face_visibility: FaceVisibility::OneSided,
             declared_entity: "IfcBuildingElementProxy".to_string(),
             item_transform: DMat4::IDENTITY,
             primitive: GeometryPrimitive::Tessellated(
@@ -6327,6 +6540,7 @@ mod tests {
             type_predefined_type: None,
             classification_identification: None,
             display_color: None,
+            face_visibility: FaceVisibility::OneSided,
             declared_entity: declared_entity.to_string(),
             item_transform: DMat4::IDENTITY,
             primitive: GeometryPrimitive::Tessellated(
@@ -6356,8 +6570,16 @@ mod tests {
             DefaultRenderClass::Physical
         );
         assert_eq!(
+            default_render_class_for_ifc_body_record(&semantic_body("IfcCourse")),
+            DefaultRenderClass::Course
+        );
+        assert_eq!(
             default_render_class_for_ifc_body_record(&semantic_body("IfcEarthworksFill")),
             DefaultRenderClass::TerrainFeature
+        );
+        assert_eq!(
+            default_render_class_for_ifc_body_record(&semantic_body("IfcGeotechnicalStratum")),
+            DefaultRenderClass::Terrain
         );
         assert_eq!(
             default_render_class_for_ifc_body_record(&semantic_body("IfcWater")),
@@ -6385,6 +6607,7 @@ mod tests {
                 type_predefined_type: type_predefined_type.map(str::to_string),
                 classification_identification: classification_identification.map(str::to_string),
                 display_color: None,
+                face_visibility: FaceVisibility::OneSided,
                 declared_entity: declared_entity.to_string(),
                 item_transform: DMat4::IDENTITY,
                 primitive: GeometryPrimitive::Tessellated(
@@ -6514,6 +6737,7 @@ mod tests {
                     type_predefined_type: None,
                     classification_identification: None,
                     display_color: None,
+                    face_visibility: FaceVisibility::OneSided,
                     declared_entity: declared_entity.to_string(),
                     item_transform: DMat4::IDENTITY,
                     primitive: triangle_primitive(),
@@ -7583,6 +7807,7 @@ mod tests {
                 type_predefined_type: None,
                 classification_identification: None,
                 display_color: Some(DisplayColor::new(0.95, 0.56, 0.24)),
+                face_visibility: FaceVisibility::OneSided,
                 declared_entity: "IfcBuildingElementProxy".to_string(),
                 item_transform: DMat4::from_translation(DVec3::new(1.5, 0.0, 0.0)),
                 primitive: primitive.clone(),
@@ -7600,6 +7825,7 @@ mod tests {
                 type_predefined_type: None,
                 classification_identification: None,
                 display_color: Some(DisplayColor::new(0.24, 0.78, 0.55)),
+                face_visibility: FaceVisibility::OneSided,
                 declared_entity: "IfcBuildingElementProxy".to_string(),
                 item_transform: DMat4::from_translation(DVec3::new(0.0, 2.0, 0.0)),
                 primitive,
@@ -7728,6 +7954,7 @@ mod tests {
                     declared_entity: "IfcProduct".to_string(),
                     default_render_class: DefaultRenderClass::Physical,
                     display_color: None,
+                    face_visibility: FaceVisibility::OneSided,
                 }],
                 source_space: SourceSpace::w_world_metric(),
             };
@@ -7761,6 +7988,7 @@ mod tests {
                         declared_entity: "IfcProduct".to_string(),
                         default_render_class: DefaultRenderClass::Physical,
                         display_color: None,
+                        face_visibility: FaceVisibility::OneSided,
                     }],
                     source_space: SourceSpace::w_world_metric(),
                 };
@@ -7838,6 +8066,7 @@ mod tests {
                 external_id: ExternalId::new("9/item/7"),
                 label: "demo".to_string(),
                 display_color: Some(DisplayColor::new(0.25, 0.5, 0.75)),
+                face_visibility: FaceVisibility::OneSided,
             }],
         }
     }

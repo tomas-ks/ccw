@@ -163,6 +163,22 @@ function createWindow(baseUrl) {
   });
   mainWindow = window;
 
+  window.webContents.on("console-message", (_event, level, message, line, sourceId) => {
+    const prefix = level >= 2 ? "w web renderer error" : "w web renderer";
+    console.log(`${prefix}: ${message} (${sourceId}:${line})`);
+  });
+  window.webContents.on("render-process-gone", (_event, details) => {
+    console.error(
+      `w web renderer process gone: reason=${details.reason} exitCode=${details.exitCode}`
+    );
+  });
+  window.on("unresponsive", () => {
+    console.error("w web renderer window became unresponsive");
+  });
+  window.on("responsive", () => {
+    console.log("w web renderer window became responsive");
+  });
+
   installEditAccelerators(window);
   window.loadURL(viewerUrl(baseUrl));
   syncWindowState(window);

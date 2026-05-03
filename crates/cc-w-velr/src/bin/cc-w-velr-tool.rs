@@ -502,12 +502,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 );
                 println!(
-                    "instance_id={} definition_id={} label={} external_id={} color={} center=({:.3}, {:.3}, {:.3}) size=({:.3}, {:.3}, {:.3}) min=({:.3}, {:.3}, {:.3}) max=({:.3}, {:.3}, {:.3})",
+                    "instance_id={} definition_id={} label={} external_id={} color={} face_visibility={} center=({:.3}, {:.3}, {:.3}) size=({:.3}, {:.3}, {:.3}) min=({:.3}, {:.3}, {:.3}) max=({:.3}, {:.3}, {:.3})",
                     instance.instance_id,
                     instance.definition_id,
                     instance.label,
                     instance.external_id,
                     color,
+                    match instance.face_visibility {
+                        cc_w_types::FaceVisibility::OneSided => "one-sided",
+                        cc_w_types::FaceVisibility::DoubleSided => "double-sided",
+                    },
                     instance.bounds_center.x,
                     instance.bounds_center.y,
                     instance.bounds_center.z,

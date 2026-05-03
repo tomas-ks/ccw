@@ -131,6 +131,7 @@ where
                 external_id: instance.external_id.clone(),
                 label: instance.label.clone(),
                 display_color: instance.display_color,
+                face_visibility: instance.face_visibility,
             });
 
             if let Some(&element_index) = element_indices.get(&instance.element_id) {
@@ -196,8 +197,8 @@ mod tests {
     use super::*;
     use cc_w_db::{GeometryResourceInstance, InMemoryGraphRepository};
     use cc_w_types::{
-        DefaultRenderClass, ExternalId, GeometryDefinition, GeometryDefinitionId, GeometryInstance,
-        GeometryInstanceId, GeometryPrimitive, IndexedPolygon, SemanticElementId,
+        DefaultRenderClass, ExternalId, FaceVisibility, GeometryDefinition, GeometryDefinitionId,
+        GeometryInstance, GeometryInstanceId, GeometryPrimitive, IndexedPolygon, SemanticElementId,
         TessellatedGeometry,
     };
     use glam::{DMat4, DVec3};
@@ -276,6 +277,7 @@ mod tests {
                     declared_entity: "SceneGeometry".to_string(),
                     default_render_class: DefaultRenderClass::Physical,
                     display_color: None,
+                    face_visibility: FaceVisibility::OneSided,
                 },
                 GeometryResourceInstance {
                     instance: GeometryInstance {
@@ -289,6 +291,7 @@ mod tests {
                     declared_entity: "SceneGeometry".to_string(),
                     default_render_class: DefaultRenderClass::Physical,
                     display_color: None,
+                    face_visibility: FaceVisibility::OneSided,
                 },
             ],
         };
@@ -320,6 +323,7 @@ mod tests {
                 declared_entity: "SceneGeometry".to_string(),
                 default_render_class: DefaultRenderClass::Physical,
                 display_color: None,
+                face_visibility: FaceVisibility::OneSided,
             }],
         };
 
@@ -367,6 +371,7 @@ mod tests {
                     declared_entity: "SceneGeometry".to_string(),
                     default_render_class: DefaultRenderClass::Physical,
                     display_color: None,
+                    face_visibility: FaceVisibility::OneSided,
                 },
                 GeometryResourceInstance {
                     instance: GeometryInstance {
@@ -380,6 +385,7 @@ mod tests {
                     declared_entity: "SceneGeometry".to_string(),
                     default_render_class: DefaultRenderClass::Physical,
                     display_color: None,
+                    face_visibility: FaceVisibility::OneSided,
                 },
             ],
         };
