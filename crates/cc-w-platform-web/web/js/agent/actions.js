@@ -68,6 +68,30 @@ function agentPathAnnotation(action, resource) {
   return annotation;
 }
 
+function agentPathPartVisibility(action, resource) {
+  const path = tryGetFirst(action, ["path"]);
+  if (!path || typeof path !== "object" || Array.isArray(path)) {
+    return null;
+  }
+  const drawing = {
+    resource,
+    path,
+  };
+  for (const [target, keys] of [
+    ["part", ["part", "path_part", "pathPart"]],
+    ["visible", ["visible", "visibility"]],
+    ["line", ["line", "line_range", "lineRange", "line_ranges", "lineRanges", "ranges"]],
+    ["markers", ["markers", "marker_groups", "markerGroups"]],
+    ["max_samples", ["max_samples", "maxSamples"]],
+  ]) {
+    const value = tryGetFirst(action, keys);
+    if (value !== undefined && value !== null && value !== "") {
+      drawing[target] = value;
+    }
+  }
+  return drawing;
+}
+
 export function createAgentActionApplier({
   viewer,
   graph,
@@ -318,6 +342,32 @@ export function createAgentActionApplier({
     ) {
       viewer.section.clear();
       return "viewer.section.clear";
+    }
+
+    if (
+      kind === "viewer.drawings.set_path_part_visible" ||
+      kind === "viewer.drawings.setpathpartvisible" ||
+      kind === "drawings.set_path_part_visible" ||
+      kind === "drawings.setpathpartvisible"
+    ) {
+      const resource = agentActionResource(action);
+      if (!isIfcResource(resource)) {
+        return null;
+      }
+      const drawing = agentPathPartVisibility(action, resource);
+      if (!drawing) {
+        return null;
+      }
+      const drawings = viewer.drawings;
+      if (typeof drawings?.setPathPartVisible === "function") {
+        await drawings.setPathPartVisible(drawing);
+        return "viewer.drawings.set_path_part_visible";
+      }
+      if (typeof drawings?.set_path_part_visible === "function") {
+        await drawings.set_path_part_visible(drawing);
+        return "viewer.drawings.set_path_part_visible";
+      }
+      return null;
     }
 
     if (kind === "viewer.annotations.show_path" || kind === "viewer.annotations.showpath") {

@@ -1,6 +1,9 @@
+export const DRAWINGS_FACET_ID = "drawings";
+
 export const DEFAULT_SEMANTIC_OUTLINER_FACETS = Object.freeze([
   Object.freeze({ id: "workspace", label: "Workspace" }),
   Object.freeze({ id: "layers", label: "Layers" }),
+  Object.freeze({ id: DRAWINGS_FACET_ID, label: "Drawings" }),
   Object.freeze({ id: "classes", label: "Classes" }),
   Object.freeze({ id: "spatial", label: "Spatial" }),
   Object.freeze({ id: "materials", label: "Materials" }),
@@ -16,6 +19,10 @@ const FACET_ALIASES = new Map([
   ["layers", "layers"],
   ["presentation-layer", "layers"],
   ["presentation-layers", "layers"],
+  ["drawing", DRAWINGS_FACET_ID],
+  ["drawings", DRAWINGS_FACET_ID],
+  ["path-drawing", DRAWINGS_FACET_ID],
+  ["path-drawings", DRAWINGS_FACET_ID],
   ["material", "materials"],
   ["materials", "materials"],
   ["spatial", "spatial"],
@@ -48,6 +55,32 @@ function firstPresent(...values) {
     return value;
   }
   return undefined;
+}
+
+function structuredValue(value) {
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) {
+      return undefined;
+    }
+    if (
+      (text.startsWith("{") && text.endsWith("}")) ||
+      (text.startsWith("[") && text.endsWith("]"))
+    ) {
+      try {
+        return JSON.parse(text);
+      } catch {
+        return undefined;
+      }
+    }
+    return text;
+  }
+  return value == null ? undefined : value;
+}
+
+function numericValue(value) {
+  const number = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(number) ? number : undefined;
 }
 
 function slugify(value) {
@@ -147,6 +180,319 @@ function firstSourceResource(input) {
     }
   }
   return "";
+}
+
+const DRAWING_PART_LABELS = Object.freeze({
+  line: "Line",
+  stations: "Stations",
+});
+
+function normalizeDrawingPath(value) {
+  if (value == null || value === "") {
+    return undefined;
+  }
+  if (typeof value === "object" && !Array.isArray(value)) {
+    const path = { ...value };
+    const kind = stringValue(firstPresent(path.kind, path.type));
+    const id = stringValue(firstPresent(path.id, path.pathId, path.path_id));
+    if (kind) {
+      path.kind = kind;
+    }
+    if (id) {
+      path.id = id;
+    }
+    return path;
+  }
+  return stringValue(value) || undefined;
+}
+
+function normalizeDrawingPartToken(value) {
+  const raw =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? firstPresent(
+          value.drawingPart,
+          value.drawing_part,
+          value.part,
+          value.kind,
+          value.type,
+          value.id,
+          value.label
+        )
+      : value;
+  const token = slugify(raw).replace(/-/g, "_");
+  if (["line", "path_line", "alignment_line"].includes(token)) {
+    return "line";
+  }
+  if (
+    [
+      "station",
+      "stations",
+      "marker",
+      "markers",
+      "tick",
+      "ticks",
+      "chainage",
+      "chainages",
+    ].includes(token)
+  ) {
+    return "stations";
+  }
+  return "";
+}
+
+function drawingPartEntriesFromValue(value) {
+  const values = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(/[,|]/)
+      : value == null
+        ? []
+        : [value];
+  const entries = [];
+  const seen = new Set();
+  for (const entry of values) {
+    const part = normalizeDrawingPartToken(entry);
+    if (!part || seen.has(part)) {
+      continue;
+    }
+    seen.add(part);
+    entries.push({ part, input: entry });
+  }
+  return entries;
+}
+
+function drawingPartEntries(input, metadata) {
+  const entries = [];
+  const seen = new Set();
+  const push = (entry) => {
+    if (!entry?.part || seen.has(entry.part)) {
+      return;
+    }
+    seen.add(entry.part);
+    entries.push(entry);
+  };
+
+  for (const value of [
+    input?.drawingParts,
+    input?.drawing_parts,
+    input?.parts,
+    metadata?.drawingParts,
+    metadata?.drawing_parts,
+    metadata?.parts,
+  ]) {
+    for (const entry of drawingPartEntriesFromValue(value)) {
+      push(entry);
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(input || {}, "line") && input.line !== false) {
+    push({ part: "line", input: input.line });
+  }
+  if (
+    (Object.prototype.hasOwnProperty.call(input || {}, "stations") &&
+      input.stations !== false) ||
+    (Object.prototype.hasOwnProperty.call(input || {}, "markers") &&
+      input.markers !== false)
+  ) {
+    push({ part: "stations", input: firstPresent(input.stations, input.markers) });
+  }
+  return entries;
+}
+
+function drawingGroupsFromInput(input) {
+  if (Array.isArray(input)) {
+    return input;
+  }
+  if (!input || typeof input !== "object") {
+    return [];
+  }
+  for (const key of ["groups", "alignments", "paths", "drawings"]) {
+    if (Array.isArray(input[key])) {
+      return input[key];
+    }
+  }
+  return [];
+}
+
+function syntheticDrawingPartGroup(parent, entry, inherited) {
+  const partInput =
+    entry.input && typeof entry.input === "object" && !Array.isArray(entry.input)
+      ? entry.input
+      : {};
+  const metadataInput =
+    partInput.metadata && typeof partInput.metadata === "object" ? partInput.metadata : {};
+  const metadata = {
+    ...parent.metadata,
+    ...metadataInput,
+    drawingPart: entry.part,
+  };
+  const path = normalizeDrawingPath(
+    firstPresent(partInput.path, partInput.drawingPath, metadata.path, inherited.path)
+  );
+  if (path !== undefined) {
+    metadata.path = path;
+  }
+  const resource = stringValue(
+    firstPresent(partInput.resource, metadata.resource, inherited.resource)
+  );
+  if (resource) {
+    metadata.resource = resource;
+  }
+  const explicitLayerId = stringValue(
+    firstPresent(
+      partInput.layerId,
+      partInput.layer_id,
+      partInput.annotationLayerId,
+      partInput.annotation_layer_id,
+      metadata.layerId,
+      metadata.layer_id,
+      metadata.annotationLayerId,
+      metadata.annotation_layer_id
+    )
+  );
+  if (explicitLayerId) {
+    metadata.layerId = explicitLayerId;
+  }
+  const line = structuredValue(
+    firstPresent(partInput.line, metadataInput.line, metadata.line, inherited.line)
+  );
+  if (line !== undefined && entry.part === "line") {
+    metadata.line = line;
+  }
+  const markers = structuredValue(
+    firstPresent(
+      partInput.markers,
+      metadataInput.markers,
+      metadata.markers,
+      metadata.stationMarkers,
+      metadata.station_markers,
+      inherited.markers
+    )
+  );
+  if (markers !== undefined && entry.part === "stations") {
+    metadata.markers = markers;
+  }
+  const maxSamples = numericValue(
+    firstPresent(
+      partInput.maxSamples,
+      partInput.max_samples,
+      metadataInput.maxSamples,
+      metadataInput.max_samples,
+      metadata.maxSamples,
+      metadata.max_samples,
+      inherited.maxSamples
+    )
+  );
+  if (maxSamples !== undefined) {
+    metadata.maxSamples = maxSamples;
+  }
+
+  const label =
+    stringValue(firstPresent(partInput.label, DRAWING_PART_LABELS[entry.part])) ||
+    DRAWING_PART_LABELS[entry.part];
+
+  return {
+    id: `${parent.id}:${entry.part}`,
+    label,
+    sourceKind: parent.sourceKind,
+    sourceDetail: parent.sourceDetail,
+    sourceResource: parent.sourceResource,
+    semanticIds: [],
+    children: [],
+    counts: { total: 1 },
+    metadata,
+    diagnostics: [],
+  };
+}
+
+function normalizeDrawingGroup(input, inherited = {}) {
+  const group = normalizeSemanticGroup(input, inherited);
+  if (!group) {
+    return null;
+  }
+
+  const metadata = input?.metadata && typeof input.metadata === "object" ? input.metadata : {};
+  let path = normalizeDrawingPath(
+    firstPresent(
+      input.path,
+      input.drawingPath,
+      input.drawing_path,
+      metadata.path,
+      metadata.drawingPath,
+      metadata.drawing_path,
+      inherited.path
+    )
+  );
+  if (path === undefined) {
+    const kind = stringValue(firstPresent(metadata.pathKind, metadata.path_kind));
+    const id = stringValue(firstPresent(metadata.pathId, metadata.path_id));
+    if (kind && id) {
+      const measure = stringValue(firstPresent(metadata.pathMeasure, metadata.path_measure));
+      path = measure ? { kind, id, measure } : { kind, id };
+    }
+  }
+  if (path !== undefined) {
+    group.metadata.path = path;
+  }
+  const resource = stringValue(
+    firstPresent(input.resource, metadata.resource, inherited.resource)
+  );
+  if (resource) {
+    group.metadata.resource = resource;
+  }
+  const drawingPart = normalizeDrawingPartToken(
+    firstPresent(
+      input.drawingPart,
+      input.drawing_part,
+      input.part,
+      metadata.drawingPart,
+      metadata.drawing_part,
+      metadata.part
+    )
+  );
+  if (drawingPart) {
+    group.metadata.drawingPart = drawingPart;
+  }
+
+  const childScope = {
+    sourceKind: group.sourceKind,
+    sourceDetail: group.sourceDetail,
+    sourceResource: group.sourceResource,
+    path: group.metadata.path,
+    resource: group.metadata.resource,
+  };
+  const children = (Array.isArray(input.children) ? input.children : [])
+    .map((child) => normalizeDrawingGroup(child, childScope))
+    .filter(Boolean);
+  const childParts = new Set(children.map((child) => drawingGroupPart(child)).filter(Boolean));
+  for (const entry of drawingPartEntries(input, group.metadata)) {
+    if (!childParts.has(entry.part)) {
+      children.push(syntheticDrawingPartGroup(group, entry, childScope));
+      childParts.add(entry.part);
+    }
+  }
+  group.children = children;
+  return group;
+}
+
+export function normalizeDrawingsFacet(input, { resource = "" } = {}) {
+  const facetInput =
+    input && typeof input === "object" && !Array.isArray(input)
+      ? input
+      : { id: DRAWINGS_FACET_ID, groups: drawingGroupsFromInput(input) };
+  const groups = drawingGroupsFromInput(facetInput)
+    .map((group) => normalizeDrawingGroup(group, { resource }))
+    .filter(Boolean);
+  const diagnostics = Array.isArray(facetInput?.diagnostics)
+    ? facetInput.diagnostics.map(semanticDiagnosticMessage).filter(Boolean)
+    : [];
+  return {
+    id: DRAWINGS_FACET_ID,
+    label: stringValue(facetInput?.label) || "Drawings",
+    sourceKind: stringValue(facetInput?.provenance),
+    groups,
+    diagnostics,
+  };
 }
 
 export function normalizeSemanticFacetId(id, label = "") {
@@ -263,6 +609,7 @@ export function normalizeSemanticOutliner(payload) {
   );
   const extraFacets = [];
   const facets = Array.isArray(payload?.facets) ? payload.facets : [];
+  let hasDrawingsFacet = false;
 
   for (const inputFacet of facets) {
     if (!inputFacet || typeof inputFacet !== "object" || Array.isArray(inputFacet)) {
@@ -277,26 +624,42 @@ export function normalizeSemanticOutliner(payload) {
       stringValue(inputFacet.label) ||
       existing?.label ||
       humanizeSlug(firstPresent(inputFacet.id, id));
-    const groups = Array.isArray(inputFacet.groups)
-      ? inputFacet.groups
-          .map((group) => normalizeSemanticGroup(group))
-          .filter(Boolean)
-      : [];
-    const diagnostics = Array.isArray(inputFacet.diagnostics)
-      ? inputFacet.diagnostics.map(semanticDiagnosticMessage).filter(Boolean)
-      : [];
-    const normalized = {
-      id,
-      label,
-      sourceKind: stringValue(inputFacet.provenance),
-      groups,
-      diagnostics,
-    };
+    const normalized =
+      id === DRAWINGS_FACET_ID
+        ? {
+            ...normalizeDrawingsFacet({ ...inputFacet, label }, {
+              resource: stringValue(payload?.resource),
+            }),
+            label,
+          }
+        : {
+            id,
+            label,
+            sourceKind: stringValue(inputFacet.provenance),
+            groups: Array.isArray(inputFacet.groups)
+              ? inputFacet.groups
+                  .map((group) => normalizeSemanticGroup(group))
+                  .filter(Boolean)
+              : [],
+            diagnostics: Array.isArray(inputFacet.diagnostics)
+              ? inputFacet.diagnostics.map(semanticDiagnosticMessage).filter(Boolean)
+              : [],
+          };
+    if (id === DRAWINGS_FACET_ID) {
+      hasDrawingsFacet = true;
+    }
     if (existing) {
       knownFacets.set(id, normalized);
     } else {
       extraFacets.push(normalized);
     }
+  }
+
+  if (!hasDrawingsFacet && payload?.drawings != null) {
+    knownFacets.set(
+      DRAWINGS_FACET_ID,
+      normalizeDrawingsFacet(payload.drawings, { resource: stringValue(payload?.resource) })
+    );
   }
 
   const diagnostics = Array.isArray(payload?.diagnostics)
@@ -341,6 +704,217 @@ export function semanticGroupIdEntries(group) {
     seen.add(key);
     return true;
   });
+}
+
+function annotationIdFragment(value) {
+  let fragment = "";
+  let pushedSeparator = false;
+  for (const character of stringValue(value)) {
+    if (/^[a-z0-9]$/i.test(character)) {
+      fragment += character.toLowerCase();
+      pushedSeparator = false;
+    } else if (fragment && !pushedSeparator) {
+      fragment += "-";
+      pushedSeparator = true;
+    }
+  }
+  return fragment.replace(/-+$/g, "") || "path";
+}
+
+export function drawingGroupPart(group) {
+  const metadata = group?.metadata && typeof group.metadata === "object" ? group.metadata : {};
+  return normalizeDrawingPartToken(
+    firstPresent(metadata.drawingPart, metadata.drawing_part, metadata.part)
+  );
+}
+
+export function drawingGroupPath(group) {
+  const metadata = group?.metadata && typeof group.metadata === "object" ? group.metadata : {};
+  const path = normalizeDrawingPath(
+    firstPresent(metadata.path, metadata.drawingPath, metadata.drawing_path)
+  );
+  if (path !== undefined) {
+    return path;
+  }
+  const kind = stringValue(firstPresent(metadata.pathKind, metadata.path_kind));
+  const id = stringValue(firstPresent(metadata.pathId, metadata.path_id));
+  if (!kind || !id) {
+    return undefined;
+  }
+  const measure = stringValue(firstPresent(metadata.pathMeasure, metadata.path_measure));
+  return measure ? { kind, id, measure } : { kind, id };
+}
+
+export function drawingGroupResource(group, fallbackResource = "") {
+  const metadata = group?.metadata && typeof group.metadata === "object" ? group.metadata : {};
+  return stringValue(firstPresent(metadata.resource, fallbackResource));
+}
+
+function drawingPathKindAndId(group) {
+  const metadata = group?.metadata && typeof group.metadata === "object" ? group.metadata : {};
+  const path = drawingGroupPath(group);
+  const pathObject = path && typeof path === "object" && !Array.isArray(path) ? path : {};
+  return {
+    kind: stringValue(
+      firstPresent(
+        metadata.pathKind,
+        metadata.path_kind,
+        pathObject.kind,
+        pathObject.type
+      )
+    ),
+    id: stringValue(
+      firstPresent(
+        metadata.pathId,
+        metadata.path_id,
+        metadata.drawingPathId,
+        metadata.drawing_path_id,
+        pathObject.id,
+        pathObject.pathId,
+        pathObject.path_id
+      )
+    ),
+  };
+}
+
+export function drawingGroupLayerId(group) {
+  const metadata = group?.metadata && typeof group.metadata === "object" ? group.metadata : {};
+  const explicit = stringValue(
+    firstPresent(
+      metadata.layerId,
+      metadata.layer_id,
+      metadata.annotationLayerId,
+      metadata.annotation_layer_id
+    )
+  );
+  if (explicit) {
+    return explicit;
+  }
+  const part = drawingGroupPart(group);
+  const { kind, id } = drawingPathKindAndId(group);
+  if (!part || !kind || !id) {
+    return "";
+  }
+  const resource = drawingGroupResource(group);
+  return `path-annotations-${annotationIdFragment(resource)}-${annotationIdFragment(kind)}-${annotationIdFragment(id)}-${annotationIdFragment(part)}`;
+}
+
+function drawingGroupStructuredMetadata(group, ...keys) {
+  const metadata = group?.metadata && typeof group.metadata === "object" ? group.metadata : {};
+  return structuredValue(firstPresent(...keys.map((key) => metadata[key])));
+}
+
+function drawingGroupCommand(group, resource) {
+  const part = drawingGroupPart(group);
+  const path = drawingGroupPath(group);
+  if (!part || !path) {
+    return null;
+  }
+  const command = {
+    resource: drawingGroupResource(group, resource),
+    path,
+    drawingPart: part,
+    layerId: drawingGroupLayerId(group),
+  };
+  const line = drawingGroupStructuredMetadata(group, "line", "lineRange", "line_range");
+  if (line !== undefined && part === "line") {
+    command.line = line;
+  }
+  const markers = drawingGroupStructuredMetadata(
+    group,
+    "markers",
+    "markerGroups",
+    "marker_groups"
+  );
+  if (markers !== undefined && part === "stations") {
+    command.markers = markers;
+  }
+  const maxSamples = numericValue(
+    drawingGroupStructuredMetadata(group, "maxSamples", "max_samples")
+  );
+  if (maxSamples !== undefined) {
+    command.maxSamples = maxSamples;
+  }
+  return command;
+}
+
+function appendDrawingGroupCommands(group, resource, commands) {
+  const command = drawingGroupCommand(group, resource);
+  if (command) {
+    commands.push(command);
+  }
+  if (!command) {
+    for (const child of group?.children || []) {
+      appendDrawingGroupCommands(child, resource, commands);
+    }
+  }
+}
+
+export function drawingGroupVisibilityCommands(group, resource = "") {
+  const commands = [];
+  const seen = new Set();
+  appendDrawingGroupCommands(group, resource, commands);
+  return commands.filter((command) => {
+    const key = [
+      command.resource,
+      JSON.stringify(command.path),
+      command.drawingPart,
+      command.layerId,
+    ].join("\u0000");
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function annotationLayerVisibilityById(viewState) {
+  const layers = viewState?.annotations?.layers;
+  const entries = Array.isArray(layers)
+    ? layers
+    : layers && typeof layers === "object"
+      ? Object.values(layers)
+      : [];
+  const map = new Map();
+  for (const layer of entries) {
+    const id = stringValue(layer?.id);
+    if (id) {
+      map.set(id, layer?.visible !== false);
+    }
+  }
+  return map;
+}
+
+export function drawingGroupOutlinerState(group, viewState, resource = "") {
+  const commands = drawingGroupVisibilityCommands(group, resource);
+  const layerMap = annotationLayerVisibilityById(viewState);
+  const layerIds = uniqueStrings(commands.map((command) => command.layerId));
+  const knownLayerIds = layerIds.filter((id) => layerMap.has(id));
+  const visibleLayerIds = layerIds.filter((id) => layerMap.get(id) === true);
+  const enabledCount = visibleLayerIds.length;
+  const totalCount = layerIds.length || commands.length;
+  return {
+    commands,
+    layerIds,
+    knownLayerIds,
+    visibleLayerIds,
+    enabledCount,
+    totalCount,
+    checked: layerIds.length > 0 && enabledCount > 0,
+    disabled: commands.length === 0,
+    indeterminate:
+      layerIds.length > 0 && enabledCount > 0 && enabledCount < layerIds.length,
+  };
+}
+
+export function drawingGroupVisibilityOperation(group, viewState, resource, visible) {
+  const state = drawingGroupOutlinerState(group, viewState, resource);
+  return {
+    action: visible ? "show" : "hide",
+    commands: state.commands,
+    state,
+  };
 }
 
 function viewStateElementIds(viewState, key) {

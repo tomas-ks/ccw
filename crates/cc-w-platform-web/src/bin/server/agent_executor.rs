@@ -295,6 +295,20 @@ pub enum AgentUiAction {
     ViewerSectionSet { section: Value },
     #[serde(rename = "viewer.section.clear")]
     ViewerSectionClear,
+    #[serde(rename = "viewer.drawings.set_path_part_visible")]
+    ViewerDrawingsSetPathPartVisible {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+        path: Value,
+        part: String,
+        visible: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        markers: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_samples: Option<Value>,
+    },
     #[serde(rename = "viewer.annotations.show_path")]
     ViewerAnnotationsShowPath {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -512,6 +526,19 @@ impl AgentActionCandidate {
             visible: None,
             section: None,
             annotation: Some(annotation),
+        }
+    }
+
+    pub fn viewer_drawings_set_path_part_visible(drawing: Value) -> Self {
+        Self {
+            kind: "viewer.drawings.set_path_part_visible".to_owned(),
+            semantic_ids: Vec::new(),
+            db_node_ids: Vec::new(),
+            resource: None,
+            inspection_mode: None,
+            visible: None,
+            section: None,
+            annotation: Some(drawing),
         }
     }
 
@@ -963,6 +990,28 @@ pub fn validate_agent_action_candidate(
             }
             Ok(AgentUiAction::ViewerSectionClear)
         }
+        "viewer.drawings.set_path_part_visible" => {
+            if !candidate.semantic_ids.is_empty() || !candidate.db_node_ids.is_empty() {
+                return Err("viewer.drawings.set_path_part_visible does not accept ids".to_owned());
+            }
+            let drawing = candidate.annotation.ok_or_else(|| {
+                "viewer.drawings.set_path_part_visible requires a drawing object".to_owned()
+            })?;
+            let drawing = normalize_path_part_visibility(
+                drawing,
+                candidate.resource.as_deref(),
+                candidate.visible,
+            )?;
+            Ok(AgentUiAction::ViewerDrawingsSetPathPartVisible {
+                resource: drawing.resource,
+                path: drawing.path,
+                part: drawing.part,
+                visible: drawing.visible,
+                line: drawing.line,
+                markers: drawing.markers,
+                max_samples: drawing.max_samples,
+            })
+        }
         "viewer.annotations.show_path" => {
             if !candidate.semantic_ids.is_empty() || !candidate.db_node_ids.is_empty() {
                 return Err("viewer.annotations.show_path does not accept ids".to_owned());
@@ -998,6 +1047,16 @@ struct PathAnnotationAction {
     line: Option<Value>,
     markers: Option<Value>,
     mode: Option<Value>,
+    max_samples: Option<Value>,
+}
+
+struct PathPartVisibilityAction {
+    resource: Option<String>,
+    path: Value,
+    part: String,
+    visible: bool,
+    line: Option<Value>,
+    markers: Option<Value>,
     max_samples: Option<Value>,
 }
 
@@ -1046,6 +1105,94 @@ fn normalize_path_annotation(
         mode,
         max_samples: normalize_annotation_interval(&object, &["max_samples", "maxSamples"])?,
     })
+}
+
+fn normalize_path_part_visibility(
+    value: Value,
+    fallback_resource: Option<&str>,
+    fallback_visible: Option<bool>,
+) -> Result<PathPartVisibilityAction, String> {
+    let Value::Object(object) = value else {
+        return Err("viewer.drawings.set_path_part_visible requires a drawing object".to_owned());
+    };
+    if object.contains_key("points")
+        || object.contains_key("polyline")
+        || object.contains_key("polylines")
+        || object.contains_key("vertices")
+        || object.contains_key("coordinates")
+    {
+        return Err(
+            "viewer.drawings.set_path_part_visible does not accept raw geometry arrays".to_owned(),
+        );
+    }
+    let path = normalize_annotation_value(&object, &["path"])
+        .filter(|path| path.is_object())
+        .ok_or_else(|| "viewer.drawings.set_path_part_visible requires path".to_owned())?;
+    let resource = get_object_string(&object, &["resource", "source_resource", "sourceResource"])
+        .or_else(|| {
+            fallback_resource
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        });
+    let part = get_object_string(&object, &["part", "path_part", "pathPart"])
+        .ok_or_else(|| "viewer.drawings.set_path_part_visible requires part".to_owned())
+        .and_then(|part| normalize_path_part_token(&part))?;
+    let visible = normalize_path_part_visible(&object, fallback_visible)?;
+    Ok(PathPartVisibilityAction {
+        resource,
+        path,
+        part,
+        visible,
+        line: normalize_path_annotation_line(&object),
+        markers: normalize_path_annotation_markers(&object),
+        max_samples: normalize_annotation_value(&object, &["max_samples", "maxSamples"]),
+    })
+}
+
+fn normalize_path_part_token(value: &str) -> Result<String, String> {
+    let token = value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch == ' ' || ch == '-' { '_' } else { ch })
+        .collect::<String>();
+    if matches!(token.as_str(), "line" | "path_line" | "alignment_line") {
+        return Ok("line".to_owned());
+    }
+    if matches!(
+        token.as_str(),
+        "stations" | "station" | "markers" | "marker" | "ticks" | "tick"
+    ) {
+        return Ok("stations".to_owned());
+    }
+    Err("viewer.drawings.set_path_part_visible requires part `line` or `stations`".to_owned())
+}
+
+fn normalize_path_part_visible(
+    object: &serde_json::Map<String, Value>,
+    fallback: Option<bool>,
+) -> Result<bool, String> {
+    let Some(value) = normalize_annotation_value(object, &["visible", "visibility"]) else {
+        return fallback
+            .ok_or_else(|| "viewer.drawings.set_path_part_visible requires visible".to_owned());
+    };
+    match value {
+        Value::Bool(value) => Ok(value),
+        Value::Number(value) => value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(|value| value != 0.0)
+            .ok_or_else(|| {
+                "viewer.drawings.set_path_part_visible visible must be boolean".to_owned()
+            }),
+        Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "y" | "on" => Ok(true),
+            "0" | "false" | "no" | "n" | "off" => Ok(false),
+            _ => Err("viewer.drawings.set_path_part_visible visible must be boolean".to_owned()),
+        },
+        _ => Err("viewer.drawings.set_path_part_visible visible must be boolean".to_owned()),
+    }
 }
 
 fn should_drop_default_path_line_for_marker_add(
@@ -1369,6 +1516,16 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
     let mut section_set_present = false;
     let mut section_clear_present = false;
     let mut latest_section = None::<Value>;
+    let mut drawings_set_path_part_visible_present = false;
+    let mut path_part_visibility_actions = Vec::<(
+        Option<String>,
+        Value,
+        String,
+        bool,
+        Option<Value>,
+        Option<Value>,
+        Option<Value>,
+    )>::new();
     let mut annotations_show_present = false;
     let mut annotations_clear_present = false;
     let mut latest_path_annotation = None::<(
@@ -1539,6 +1696,29 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                     section_clear_present = true;
                 }
             }
+            AgentUiAction::ViewerDrawingsSetPathPartVisible {
+                resource,
+                path,
+                part,
+                visible,
+                line,
+                markers,
+                max_samples,
+            } => {
+                if !drawings_set_path_part_visible_present {
+                    order.push(14u8);
+                    drawings_set_path_part_visible_present = true;
+                }
+                path_part_visibility_actions.push((
+                    resource,
+                    path,
+                    part,
+                    visible,
+                    line,
+                    markers,
+                    max_samples,
+                ));
+            }
             AgentUiAction::ViewerAnnotationsShowPath {
                 resource,
                 path,
@@ -1548,14 +1728,14 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                 max_samples,
             } => {
                 if !annotations_show_present {
-                    order.push(14u8);
+                    order.push(15u8);
                     annotations_show_present = true;
                 }
                 latest_path_annotation = Some((resource, path, line, markers, mode, max_samples));
             }
             AgentUiAction::ViewerAnnotationsClear { resource } => {
                 if !annotations_clear_present {
-                    order.push(15u8);
+                    order.push(16u8);
                     annotations_clear_present = true;
                 }
                 latest_annotations_clear_resource = Some(resource);
@@ -1668,6 +1848,21 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
             }
             13 => normalized.push(AgentUiAction::ViewerSectionClear),
             14 => {
+                for (resource, path, part, visible, line, markers, max_samples) in
+                    &path_part_visibility_actions
+                {
+                    normalized.push(AgentUiAction::ViewerDrawingsSetPathPartVisible {
+                        resource: resource.clone(),
+                        path: path.clone(),
+                        part: part.clone(),
+                        visible: *visible,
+                        line: line.clone(),
+                        markers: markers.clone(),
+                        max_samples: max_samples.clone(),
+                    });
+                }
+            }
+            15 => {
                 if let Some((resource, path, line, markers, mode, max_samples)) =
                     latest_path_annotation.clone()
                 {
@@ -1681,7 +1876,7 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                     });
                 }
             }
-            15 => normalized.push(AgentUiAction::ViewerAnnotationsClear {
+            16 => normalized.push(AgentUiAction::ViewerAnnotationsClear {
                 resource: latest_annotations_clear_resource.clone().flatten(),
             }),
             _ => {}
@@ -2156,6 +2351,62 @@ mod tests {
                 mode: None,
                 max_samples: None,
             }]
+        );
+    }
+
+    #[test]
+    fn viewer_drawings_set_path_part_visible_accepts_path_part_payloads() {
+        let path = serde_json::json!({
+            "kind": "ifc_alignment",
+            "id": "curve:42",
+            "measure": "station"
+        });
+        let actions = validate_agent_action_candidates(vec![
+            AgentActionCandidate::viewer_drawings_set_path_part_visible(serde_json::json!({
+                "resource": "ifc/infra-road",
+                "path": path.clone(),
+                "part": "station",
+                "visible": "true",
+                "markers": [
+                    { "range": { "from": 100.0, "to": "end" }, "interval": "20m", "label": "measure" }
+                ]
+            })),
+            AgentActionCandidate::viewer_drawings_set_path_part_visible(serde_json::json!({
+                "resource": "ifc/infra-road",
+                "path": path.clone(),
+                "part": "line",
+                "visible": false,
+                "line_range": { "from": 0.0, "to": 120.0 }
+            })),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            actions,
+            vec![
+                AgentUiAction::ViewerDrawingsSetPathPartVisible {
+                    resource: Some("ifc/infra-road".to_owned()),
+                    path: path.clone(),
+                    part: "stations".to_owned(),
+                    visible: true,
+                    line: None,
+                    markers: Some(serde_json::json!([
+                        { "range": { "from": 100.0, "to": "end" }, "interval": "20m", "label": "measure" }
+                    ])),
+                    max_samples: None,
+                },
+                AgentUiAction::ViewerDrawingsSetPathPartVisible {
+                    resource: Some("ifc/infra-road".to_owned()),
+                    path,
+                    part: "line".to_owned(),
+                    visible: false,
+                    line: Some(serde_json::json!({
+                        "ranges": [{ "from": 0.0, "to": 120.0 }]
+                    })),
+                    markers: None,
+                    max_samples: None,
+                },
+            ]
         );
     }
 

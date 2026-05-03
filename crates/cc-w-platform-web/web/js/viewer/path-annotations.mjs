@@ -36,6 +36,29 @@ const booleanishTrue = (value) => {
   return ["1", "true", "yes", "y", "on"].includes(value.trim().toLowerCase());
 };
 
+const booleanishValue = (value, fallback = false) => {
+  if (value === undefined || value === null || value === "") {
+    return fallback;
+  }
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value !== 0 : fallback;
+  }
+  if (typeof value === "string") {
+    const token = value.trim().toLowerCase();
+    if (["1", "true", "yes", "y", "on"].includes(token)) {
+      return true;
+    }
+    if (["0", "false", "no", "n", "off"].includes(token)) {
+      return false;
+    }
+    return fallback;
+  }
+  return Boolean(value);
+};
+
 const isExplicitPathEndToken = (value) => {
   if (typeof value !== "string") {
     return false;
@@ -207,25 +230,29 @@ export const diagnosticMessage = (diagnostic) => {
   return base;
 };
 
-export function normalizePathAnnotationRequest(spec = {}, fallbackResource = "") {
-  const mode = normalizeAnnotationUpdateMode(
-    firstPresent(spec.mode, spec.operation, spec.update, spec.behavior)
-  );
-  const inputPath = spec.path;
+const normalizePathSource = (inputPath, label) => {
   if (!inputPath || typeof inputPath !== "object" || Array.isArray(inputPath)) {
-    throw new Error("viewer.annotations.showPath requires path.");
+    throw new Error(`${label} requires path.`);
   }
   const path = {
     kind: String(firstPresent(inputPath.kind, inputPath.type) || "").trim(),
     id: String(inputPath.id || "").trim(),
   };
   if (!path.kind || !path.id) {
-    throw new Error("viewer.annotations.showPath requires path.kind and path.id.");
+    throw new Error(`${label} requires path.kind and path.id.`);
   }
   const measure = firstPresent(inputPath.measure, inputPath.measureKind);
   if (measure !== undefined && measure !== null && measure !== "") {
     path.measure = String(measure).trim();
   }
+  return path;
+};
+
+export function normalizePathAnnotationRequest(spec = {}, fallbackResource = "") {
+  const mode = normalizeAnnotationUpdateMode(
+    firstPresent(spec.mode, spec.operation, spec.update, spec.behavior)
+  );
+  const path = normalizePathSource(spec.path, "viewer.annotations.showPath");
 
   const payload = {
     resource: String(firstPresent(spec.resource, fallbackResource) || "").trim(),
@@ -265,4 +292,92 @@ export function normalizePathAnnotationRequest(spec = {}, fallbackResource = "")
   }
 
   return { mode, payload };
+}
+
+function annotationIdFragment(value) {
+  let fragment = "";
+  let pushedSeparator = false;
+  for (const character of String(value ?? "").trim()) {
+    if (/^[a-z0-9]$/i.test(character)) {
+      fragment += character.toLowerCase();
+      pushedSeparator = false;
+    } else if (fragment && !pushedSeparator) {
+      fragment += "-";
+      pushedSeparator = true;
+    }
+  }
+  return fragment.replace(/-+$/g, "") || "path";
+}
+
+export const deterministicPathPartLayerId = ({ resource = "", path, part }) => {
+  return [
+    "path-annotations",
+    annotationIdFragment(resource),
+    annotationIdFragment(path?.kind || ""),
+    annotationIdFragment(path?.id || ""),
+    annotationIdFragment(part),
+  ].join("-");
+};
+
+export const normalizePathPart = (value) => {
+  const token = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  if (["line", "path_line", "alignment_line"].includes(token)) {
+    return "line";
+  }
+  if (["stations", "station", "markers", "marker", "ticks", "tick"].includes(token)) {
+    return "stations";
+  }
+  throw new Error("viewer.drawings.setPathPartVisible requires part `line` or `stations`.");
+};
+
+export function normalizePathPartVisibilityRequest(spec = {}, fallbackResource = "") {
+  if (!spec || typeof spec !== "object" || Array.isArray(spec)) {
+    throw new Error("viewer.drawings.setPathPartVisible requires a spec object.");
+  }
+  const resource = String(firstPresent(spec.resource, fallbackResource) || "").trim();
+  const path = normalizePathSource(spec.path, "viewer.drawings.setPathPartVisible");
+  const part = normalizePathPart(firstPresent(spec.part, spec.path_part, spec.pathPart));
+  const visible = booleanishValue(firstPresent(spec.visible, spec.visibility), true);
+  const explicitLayerId = String(
+    firstPresent(spec.layer_id, spec.layerId, spec.annotation_layer_id, spec.annotationLayerId) || ""
+  ).trim();
+  const layer_id =
+    explicitLayerId || deterministicPathPartLayerId({ resource, path, part });
+
+  const line = normalizePathLine(
+    firstPresent(
+      spec.line,
+      spec.line_range,
+      spec.lineRange,
+      spec.line_ranges,
+      spec.lineRanges,
+      spec.ranges
+    )
+  );
+  const markers = normalizePathMarkers(
+    firstPresent(spec.markers, spec.marker_groups, spec.markerGroups)
+  );
+
+  const payload = {
+    resource,
+    path,
+    part,
+    layer_id,
+  };
+  if (visible) {
+    if (part === "line") {
+      payload.line = line || {};
+    } else if (markers?.length) {
+      payload.markers = markers;
+    }
+    const maxSamples = firstPresent(spec.max_samples, spec.maxSamples);
+    if (maxSamples !== undefined) {
+      payload.max_samples = Math.max(1, Math.floor(positiveNumberOr(maxSamples, 500)));
+    }
+  }
+
+  return { visible, resource, path, part, layer_id, payload };
 }

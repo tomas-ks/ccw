@@ -401,21 +401,12 @@ fn compile_alignment_annotations_from_explicit_path(
     ));
 
     let layer = AnnotationLayerJson {
-        id: format!(
-            "path-annotations-{}",
-            station_id_fragment(curve_node_id as f64)
-        ),
-        source: Some(format!("path:{}:{}", request.path.kind, path_id)),
+        id: annotation_layer_id(request, path_id, curve_node_id, plan.part),
+        source: Some(annotation_layer_source(request, path_id, plan.part)),
         visible: true,
         lifecycle: "temporary",
         primitives,
-        provenance: vec![
-            "endpoint=/api/annotations/path".to_owned(),
-            format!("resource={}", request.resource),
-            format!("path_kind={}", request.path.kind),
-            format!("path_id={path_id}"),
-            "basis=explicit_ifc_gradient_curve".to_owned(),
-        ],
+        provenance: annotation_layer_provenance(request, path_id, plan.part),
     };
 
     AlignmentAnnotationsApiResponse {
@@ -424,15 +415,105 @@ fn compile_alignment_annotations_from_explicit_path(
     }
 }
 
+fn annotation_layer_id(
+    request: &AlignmentAnnotationsApiRequest,
+    path_id: &str,
+    curve_node_id: i64,
+    part: Option<PathAnnotationPart>,
+) -> String {
+    if let Some(layer_id) = request.valid_layer_id() {
+        return layer_id.to_owned();
+    }
+    let Some(part) = part else {
+        return format!(
+            "path-annotations-{}",
+            station_id_fragment(curve_node_id as f64)
+        );
+    };
+    format!(
+        "path-annotations-{}-{}-{}-{}",
+        annotation_id_fragment(&request.resource),
+        annotation_id_fragment(&request.path.kind),
+        annotation_id_fragment(path_id),
+        part.layer_id_fragment()
+    )
+}
+
+fn annotation_layer_source(
+    request: &AlignmentAnnotationsApiRequest,
+    path_id: &str,
+    part: Option<PathAnnotationPart>,
+) -> String {
+    match part {
+        Some(part) => format!(
+            "path:{}:{}:part={}",
+            request.path.kind,
+            path_id,
+            part.name()
+        ),
+        None => format!("path:{}:{}", request.path.kind, path_id),
+    }
+}
+
+fn annotation_layer_provenance(
+    request: &AlignmentAnnotationsApiRequest,
+    path_id: &str,
+    part: Option<PathAnnotationPart>,
+) -> Vec<String> {
+    let mut provenance = vec![
+        "endpoint=/api/annotations/path".to_owned(),
+        format!("resource={}", request.resource),
+        format!("path_kind={}", request.path.kind),
+        format!("path_id={path_id}"),
+        "basis=explicit_ifc_gradient_curve".to_owned(),
+    ];
+    if let Some(part) = part {
+        provenance.push(format!("part={}", part.name()));
+    }
+    provenance
+}
+
+fn annotation_id_fragment(value: &str) -> String {
+    let mut fragment = String::new();
+    let mut pushed_separator = false;
+    for character in value.trim().chars() {
+        if character.is_ascii_alphanumeric() {
+            fragment.push(character.to_ascii_lowercase());
+            pushed_separator = false;
+        } else if !fragment.is_empty() && !pushed_separator {
+            fragment.push('-');
+            pushed_separator = true;
+        }
+    }
+    while fragment.ends_with('-') {
+        fragment.pop();
+    }
+    if fragment.is_empty() {
+        "path".to_owned()
+    } else {
+        fragment
+    }
+}
+
 fn compile_path_annotation_plan(
     explicit_station_range: (f64, f64),
     request: &AlignmentAnnotationsApiRequest,
     max_samples: usize,
 ) -> Result<CompiledPathAnnotationPlan, AnnotationDiagnostic> {
-    let line_ranges = requested_path_line_ranges(explicit_station_range, request)?;
-    let marker_groups = requested_path_marker_groups(explicit_station_range, request, max_samples)?;
+    let part = request.annotation_part()?;
+    let line_ranges = if part.is_none_or(PathAnnotationPart::includes_line) {
+        requested_path_line_ranges_for_part(explicit_station_range, request, part)?
+    } else {
+        Vec::new()
+    };
+    let marker_groups = if part.is_none_or(PathAnnotationPart::includes_stations) {
+        requested_path_marker_groups(explicit_station_range, request, max_samples)?
+    } else {
+        Vec::new()
+    };
     Ok(CompiledPathAnnotationPlan {
         explicit_station_range,
+        part,
         line_ranges,
         marker_groups,
     })
@@ -579,32 +660,52 @@ fn validate_request(request: &AlignmentAnnotationsApiRequest) -> Vec<AnnotationD
             ));
         }
     }
-    if request.line.is_none() && request.markers.is_empty() {
+    let part = match request.annotation_part() {
+        Ok(part) => part,
+        Err(error) => {
+            diagnostics.push(error);
+            None
+        }
+    };
+    let needs_line = part.is_none_or(PathAnnotationPart::includes_line);
+    let needs_stations = part.is_none_or(PathAnnotationPart::includes_stations);
+    if part.is_none() && request.line.is_none() && request.markers.is_empty() {
         diagnostics.push(AnnotationDiagnostic::error(
             "missing_path_annotation_primitives",
             "Path annotation compilation requires at least one line range or marker group.",
             BTreeMap::new(),
         ));
     }
-    if let Some(line) = &request.line {
-        for (index, range) in line.ranges.iter().enumerate() {
-            validate_measure_range(format!("line.ranges[{index}]"), range, &mut diagnostics);
+    if part == Some(PathAnnotationPart::Stations) && request.markers.is_empty() {
+        diagnostics.push(AnnotationDiagnostic::error(
+            "missing_path_station_markers",
+            "Station-only path annotation compilation requires explicit marker request data.",
+            BTreeMap::new(),
+        ));
+    }
+    if needs_line {
+        if let Some(line) = &request.line {
+            for (index, range) in line.ranges.iter().enumerate() {
+                validate_measure_range(format!("line.ranges[{index}]"), range, &mut diagnostics);
+            }
         }
     }
-    for (index, marker) in request.markers.iter().enumerate() {
-        let prefix = format!("markers[{index}]");
-        if !marker
-            .every
-            .is_some_and(|every| every.is_finite() && every > 0.0)
-        {
-            diagnostics.push(AnnotationDiagnostic::error(
-                "invalid_marker_interval",
-                format!("{prefix}.every must be a finite positive number."),
-                BTreeMap::new(),
-            ));
-        }
-        if let Some(range) = &marker.range {
-            validate_measure_range(format!("{prefix}.range"), range, &mut diagnostics);
+    if needs_stations {
+        for (index, marker) in request.markers.iter().enumerate() {
+            let prefix = format!("markers[{index}]");
+            if !marker
+                .every
+                .is_some_and(|every| every.is_finite() && every > 0.0)
+            {
+                diagnostics.push(AnnotationDiagnostic::error(
+                    "invalid_marker_interval",
+                    format!("{prefix}.every must be a finite positive number."),
+                    BTreeMap::new(),
+                ));
+            }
+            if let Some(range) = &marker.range {
+                validate_measure_range(format!("{prefix}.range"), range, &mut diagnostics);
+            }
         }
     }
     diagnostics
@@ -1011,6 +1112,20 @@ fn requested_path_line_ranges(
         .collect())
 }
 
+fn requested_path_line_ranges_for_part(
+    explicit_range: (f64, f64),
+    request: &AlignmentAnnotationsApiRequest,
+    part: Option<PathAnnotationPart>,
+) -> Result<Vec<CompiledPathLineRange>, AnnotationDiagnostic> {
+    if part == Some(PathAnnotationPart::Line) && request.line.is_none() {
+        return Ok(vec![CompiledPathLineRange {
+            id_fragment: measure_range_id_fragment("line", 0, explicit_range),
+            measure_range: explicit_range,
+        }]);
+    }
+    requested_path_line_ranges(explicit_range, request)
+}
+
 fn requested_path_marker_groups(
     explicit_range: (f64, f64),
     request: &AlignmentAnnotationsApiRequest,
@@ -1411,6 +1526,10 @@ struct AlignmentAnnotationsApiRequest {
     resource: String,
     path: PathSourceRequest,
     #[serde(default)]
+    part: Option<String>,
+    #[serde(default, alias = "layerId")]
+    layer_id: Option<String>,
+    #[serde(default)]
     line: Option<PathLineRequest>,
     #[serde(default)]
     markers: Vec<PathMarkerRequest>,
@@ -1422,6 +1541,34 @@ impl AlignmentAnnotationsApiRequest {
     fn path_id(&self) -> Option<&str> {
         self.path
             .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+    }
+
+    fn annotation_part(&self) -> Result<Option<PathAnnotationPart>, AnnotationDiagnostic> {
+        let Some(part) = self
+            .part
+            .as_deref()
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        else {
+            return Ok(None);
+        };
+        PathAnnotationPart::parse(part).map(Some).ok_or_else(|| {
+            AnnotationDiagnostic::error(
+                "unsupported_path_annotation_part",
+                "Path annotation part must be `line` or `stations` when provided.",
+                BTreeMap::from([(
+                    "part".to_owned(),
+                    serde_json::Value::String(part.to_owned()),
+                )]),
+            )
+        })
+    }
+
+    fn valid_layer_id(&self) -> Option<&str> {
+        self.layer_id
             .as_deref()
             .map(str::trim)
             .filter(|id| !id.is_empty())
@@ -1709,6 +1856,7 @@ struct SourceSegmentCounts {
 #[derive(Debug, Clone)]
 struct CompiledPathAnnotationPlan {
     explicit_station_range: (f64, f64),
+    part: Option<PathAnnotationPart>,
     line_ranges: Vec<CompiledPathLineRange>,
     marker_groups: Vec<CompiledPathMarkerGroup>,
 }
@@ -1732,6 +1880,41 @@ struct CompiledPathMarkerGroup {
 enum PathMarkerLabel {
     None,
     Measure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathAnnotationPart {
+    Line,
+    Stations,
+}
+
+impl PathAnnotationPart {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "line" => Some(Self::Line),
+            "stations" => Some(Self::Stations),
+            _ => None,
+        }
+    }
+
+    fn includes_line(self) -> bool {
+        self == Self::Line
+    }
+
+    fn includes_stations(self) -> bool {
+        self == Self::Stations
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Line => "line",
+            Self::Stations => "stations",
+        }
+    }
+
+    fn layer_id_fragment(self) -> &'static str {
+        self.name()
+    }
 }
 
 #[cfg(test)]
@@ -2216,6 +2399,93 @@ mod tests {
 
         assert!(line_primitive_ids(&layer).is_empty());
         assert_eq!(marker_label_texts(&layer), vec!["400", "450", "500"]);
+    }
+
+    #[test]
+    fn endpoint_replay_part_line_defaults_to_whole_path_and_excludes_stations() {
+        let request = request_with_path(serde_json::json!({
+            "part": "line",
+            "markers": [
+                { "range": { "from": 100.0, "to": 140.0 }, "every": 20.0, "label": "measure" }
+            ]
+        }));
+
+        let layer = compile_fixture_layer(&request);
+
+        assert_eq!(primitive_ids(&layer), vec!["path-line-line0-0-500"]);
+        assert_eq!(line_primitive_ids(&layer), vec!["path-line-line0-0-500"]);
+        assert!(marker_label_texts(&layer).is_empty());
+    }
+
+    #[test]
+    fn endpoint_replay_part_stations_excludes_line_and_keeps_marker_labels() {
+        let request = request_with_path(serde_json::json!({
+            "part": "stations",
+            "line": { "ranges": [{ "from": 0.0, "to": 500.0 }] },
+            "markers": [
+                { "range": { "from": 100.0, "to": 140.0 }, "every": 20.0, "label": "measure" }
+            ]
+        }));
+
+        let layer = compile_fixture_layer(&request);
+        let ids = primitive_ids(&layer);
+
+        assert!(line_primitive_ids(&layer).is_empty());
+        assert!(ids.iter().any(|id| id == "path-marker-marker0-100-140-100"));
+        assert!(
+            ids.iter()
+                .any(|id| id == "path-marker-label-leader-marker0-100-140-100")
+        );
+        assert_eq!(marker_label_texts(&layer), vec!["100", "120", "140"]);
+    }
+
+    #[test]
+    fn endpoint_replay_part_layer_ids_are_deterministic_and_independent() {
+        let line_request = request_with_path(serde_json::json!({
+            "part": "line"
+        }));
+        let stations_request = request_with_path(serde_json::json!({
+            "part": "stations",
+            "markers": [
+                { "range": { "from": 100.0, "to": 140.0 }, "every": 20.0, "label": "measure" }
+            ]
+        }));
+
+        let line_layer = compile_fixture_layer(&line_request);
+        let line_layer_again = compile_fixture_layer(&line_request);
+        let stations_layer = compile_fixture_layer(&stations_request);
+
+        assert_eq!(line_layer.id, line_layer_again.id);
+        assert_eq!(
+            line_layer.id,
+            "path-annotations-ifc-bridge-for-minnd-ifc-alignment-curve-215711-line"
+        );
+        assert_eq!(
+            stations_layer.id,
+            "path-annotations-ifc-bridge-for-minnd-ifc-alignment-curve-215711-stations"
+        );
+        assert_ne!(line_layer.id, stations_layer.id);
+    }
+
+    #[test]
+    fn endpoint_replay_layer_id_alias_overrides_part_layer_id_when_valid() {
+        let request = request_with_path(serde_json::json!({
+            "part": "line",
+            "layerId": "  alignment-line-custom  "
+        }));
+        let fallback_request = request_with_path(serde_json::json!({
+            "part": "line",
+            "layer_id": "   "
+        }));
+
+        let layer = compile_fixture_layer(&request);
+        let fallback_layer = compile_fixture_layer(&fallback_request);
+
+        assert_eq!(layer.id, "alignment-line-custom");
+        assert_eq!(
+            fallback_layer.id,
+            "path-annotations-ifc-bridge-for-minnd-ifc-alignment-curve-215711-line"
+        );
     }
 
     #[test]

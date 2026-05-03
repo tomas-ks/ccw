@@ -310,6 +310,20 @@ pub enum PlannedUiAction {
     ViewerSectionSet { section: Value },
     #[serde(rename = "viewer.section.clear")]
     ViewerSectionClear,
+    #[serde(rename = "viewer.drawings.set_path_part_visible")]
+    ViewerDrawingsSetPathPartVisible {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+        path: Value,
+        part: String,
+        visible: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        markers: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_samples: Option<Value>,
+    },
     #[serde(rename = "viewer.annotations.show_path")]
     ViewerAnnotationsShowPath {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2625,6 +2639,8 @@ fn native_action_candidate_from_tool_call(
         "viewer_section_clear" => Some(AgentActionCandidate::viewer_section_clear()),
         "viewer_annotations_show_path" => native_path_annotation_from_input(input)
             .map(AgentActionCandidate::viewer_annotations_show_path),
+        "viewer_drawings_set_path_part_visible" => native_path_part_visibility_from_input(input)
+            .map(AgentActionCandidate::viewer_drawings_set_path_part_visible),
         "viewer_annotations_clear" => {
             let mut candidate = AgentActionCandidate::viewer_annotations_clear();
             if let Some(resource) = native_resource_from_input(input) {
@@ -2675,6 +2691,40 @@ fn native_path_annotation_from_input(input: &serde_json::Map<String, Value>) -> 
     Some(Value::Object(annotation))
 }
 
+fn native_path_part_visibility_from_input(input: &serde_json::Map<String, Value>) -> Option<Value> {
+    if let Some(Value::Object(drawing)) = input
+        .get("drawing")
+        .or_else(|| input.get("annotation"))
+        .or_else(|| input.get("spec"))
+    {
+        let mut drawing = drawing.clone();
+        normalize_native_path_part_visibility_fields(&mut drawing);
+        return Some(Value::Object(drawing));
+    }
+
+    let path = get_first_value(input, &["path"])?;
+    let part = get_first_value(input, &["part", "path_part", "pathPart"])?;
+    let visible = get_first_value(input, &["visible", "visibility"])?;
+    let mut drawing = serde_json::Map::new();
+    if let Some(resource) = native_resource_from_input(input) {
+        drawing.insert("resource".to_owned(), Value::String(resource));
+    }
+    drawing.insert("path".to_owned(), path);
+    drawing.insert("part".to_owned(), part);
+    drawing.insert("visible".to_owned(), visible);
+    if let Some(line) = native_path_annotation_line(input) {
+        drawing.insert("line".to_owned(), line);
+    }
+    if let Some(markers) = get_first_value(input, &["markers", "marker_groups", "markerGroups"]) {
+        drawing.insert("markers".to_owned(), markers);
+    }
+    if let Some(max_samples) = get_first_value(input, &["max_samples", "maxSamples"]) {
+        drawing.insert("max_samples".to_owned(), max_samples);
+    }
+    normalize_native_path_part_visibility_fields(&mut drawing);
+    Some(Value::Object(drawing))
+}
+
 fn normalize_native_path_annotation_fields(annotation: &mut serde_json::Map<String, Value>) {
     if let Some(value) = get_first_value(annotation, &["operation", "update", "behavior"]) {
         annotation.insert("mode".to_owned(), value);
@@ -2700,6 +2750,19 @@ fn normalize_native_path_annotation_fields(annotation: &mut serde_json::Map<Stri
         annotation.insert("markers".to_owned(), markers);
         annotation.remove("marker_groups");
         annotation.remove("markerGroups");
+    }
+}
+
+fn normalize_native_path_part_visibility_fields(drawing: &mut serde_json::Map<String, Value>) {
+    normalize_native_path_annotation_fields(drawing);
+    if let Some(part) = get_first_value(drawing, &["path_part", "pathPart"]) {
+        drawing.insert("part".to_owned(), part);
+        drawing.remove("path_part");
+        drawing.remove("pathPart");
+    }
+    if let Some(visible) = get_first_value(drawing, &["visibility"]) {
+        drawing.insert("visible".to_owned(), visible);
+        drawing.remove("visibility");
     }
 }
 
@@ -3077,6 +3140,33 @@ fn map_planned_ui_action(action: PlannedUiAction) -> AgentActionCandidate {
             AgentActionCandidate::viewer_section_set(normalize_native_section_value(section))
         }
         PlannedUiAction::ViewerSectionClear => AgentActionCandidate::viewer_section_clear(),
+        PlannedUiAction::ViewerDrawingsSetPathPartVisible {
+            resource,
+            path,
+            part,
+            visible,
+            line,
+            markers,
+            max_samples,
+        } => {
+            let mut drawing = serde_json::Map::new();
+            if let Some(resource) = resource {
+                drawing.insert("resource".to_owned(), Value::String(resource));
+            }
+            drawing.insert("path".to_owned(), path);
+            drawing.insert("part".to_owned(), Value::String(part));
+            drawing.insert("visible".to_owned(), Value::Bool(visible));
+            if let Some(line) = line {
+                drawing.insert("line".to_owned(), line);
+            }
+            if let Some(markers) = markers {
+                drawing.insert("markers".to_owned(), markers);
+            }
+            if let Some(max_samples) = max_samples {
+                drawing.insert("max_samples".to_owned(), max_samples);
+            }
+            AgentActionCandidate::viewer_drawings_set_path_part_visible(Value::Object(drawing))
+        }
         PlannedUiAction::ViewerAnnotationsShowPath {
             resource,
             path,
@@ -3404,6 +3494,8 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
                         { "kind": "elements.select", "semantic_ids": ["2iPwJwpPDCSgMheXwk9cBT"], "resource": "ifc/building-architecture" },
                         { "kind": "elements.inspect", "semantic_ids": ["2iPwJwpPDCSgMheXwk9cBT"], "resource": "ifc/building-architecture", "mode": "replace" },
                         { "kind": "viewer.frame_visible" },
+                        { "kind": "viewer.drawings.set_path_part_visible", "resource": "ifc/infra-road", "path": { "kind": "ifc_alignment", "id": "curve:123", "measure": "station" }, "part": "line", "visible": true, "line": { "ranges": [{ "from": 0, "to": 140 }] } },
+                        { "kind": "viewer.drawings.set_path_part_visible", "resource": "ifc/infra-road", "path": { "kind": "ifc_alignment", "id": "curve:123", "measure": "station" }, "part": "stations", "visible": true, "markers": [{ "range": { "from": 0, "to": 120 }, "every": 20, "label": "measure" }] },
                         { "kind": "viewer.annotations.show_path", "resource": "ifc/infra-road", "path": { "kind": "ifc_alignment", "id": "curve:123", "measure": "station" }, "line": { "ranges": [{ "from": 0, "to": 140 }] }, "markers": [{ "range": { "from": 0, "to": 120 }, "every": 20, "label": "measure" }, { "range": { "from": 120, "to_end": true }, "every": 50, "label": "measure" }] },
                         { "kind": "viewer.section.clear" }
                     ]
@@ -3414,10 +3506,11 @@ fn build_prompt(request: &OpencodeTurnRequest, native_agent: bool) -> String {
         .expect("schema example should serialize"),
         "Allowed toolCalls kinds are only `get_schema_context`, `get_model_details`, `get_entity_reference`, `get_query_playbook`, `get_relation_reference`, `run_readonly_cypher`, `run_project_readonly_cypher`, `describe_nodes`, `get_node_properties`, `get_neighbors`, and `emit_ui_actions`.".to_owned(),
         "Do not invent `request_tools`; use the concrete tools above directly.".to_owned(),
-        "Allowed UI actions are only `graph.set_seeds`, `properties.show_node`, `elements.hide`, `elements.show`, `elements.set_visible`, `elements.select`, `elements.inspect`, `viewer.frame_visible`, `viewer.clear_inspection`, `viewer.reset_default_view`, `viewer.section.set`, `viewer.section.clear`, `viewer.annotations.show_path`, and `viewer.annotations.clear`.".to_owned(),
-        "Use exact action payload field names: `db_node_ids` for graph seeds, `db_node_id` for properties.show_node, `semantic_ids` for element actions, `visible` for `elements.set_visible`, `section` for `viewer.section.set`, and `resource`, `path`, optional `line`, `markers`, and optional `mode` for `viewer.annotations.show_path`.".to_owned(),
+        "Allowed UI actions are only `graph.set_seeds`, `properties.show_node`, `elements.hide`, `elements.show`, `elements.set_visible`, `elements.select`, `elements.inspect`, `viewer.frame_visible`, `viewer.clear_inspection`, `viewer.reset_default_view`, `viewer.section.set`, `viewer.section.clear`, `viewer.drawings.set_path_part_visible`, `viewer.annotations.show_path`, and `viewer.annotations.clear`.".to_owned(),
+        "Use exact action payload field names: `db_node_ids` for graph seeds, `db_node_id` for properties.show_node, `semantic_ids` for element actions, `visible` for `elements.set_visible`, `section` for `viewer.section.set`, `resource`, `path`, `part`, `visible`, optional `line`, `markers`, and optional `max_samples` for `viewer.drawings.set_path_part_visible`, and `resource`, `path`, optional `line`, `markers`, and optional `mode` for `viewer.annotations.show_path`.".to_owned(),
         "`viewer.section.set` requires a `section` object with `pose.origin`, `pose.tangent`, `pose.normal`, `pose.up`, `width`, `height`, and `thickness`; `normal` is the section plane normal and `tangent` is the in-plane width direction. For a requested cross section, use `clip: \"clip-positive-normal\"` by default; use `clip: \"none\"` only for a visible overlay plane without clipping.".to_owned(),
         "`viewer.annotations.show_path` must reference an explicit path source. For IFC alignments, use `path: { kind: \"ifc_alignment\", id: <resolver_alignment_id>, measure: \"station\" }` where the id came from `ifc_alignment_catalog`; use `mode: \"add\"` for additive follow-ups and omit mode or use `replace` for a fresh annotation. For marker-only additive follow-ups, omit `line`; `line: {}` and `line: { ranges: [{}] }` mean the whole explicit path. Use `to_end: true` for a range that ends at the explicit IFC path end; never guess a numeric end station. Never include raw polyline, point, coordinate, or vertex arrays in annotation payloads.".to_owned(),
+        "`viewer.drawings.set_path_part_visible` is the shared path drawing toggle. Use `part: \"line\"` to show or hide the path line and `part: \"stations\"` to show or hide station markers. Use `visible: false` to clear only that path part's deterministic drawing layer. For `visible: true`, include `line` for line spans and `markers` for station sampling; never include raw polyline, point, coordinate, or vertex arrays.".to_owned(),
         "Path annotation ranges have two coordinate modes: `from`/`to` are absolute station or chainage values, while `from_offset`/`to_offset` are relative distances from the explicit path start. For `station 100 to 200`, emit `{ \"from\": 100, \"to\": 200 }` only. Never combine `from` with `from_offset`, never combine `to` with `to_offset`, and never combine `to_end` with `to` or `to_offset`.".to_owned(),
         "`elements.inspect` also accepts `mode`: `replace`, `add`, or `remove`. Use `replace` for a new/only inspection focus, `add` for wording like `add`, `also`, `include`, or `plus`, and `remove` for wording like `remove`, `exclude`, or `subtract`.".to_owned(),
         "When a DB node id comes from a project-wide query result, include its `source_resource` as the UI action `resource`; DB node ids are only meaningful inside one IFC database.".to_owned(),
@@ -4129,6 +4222,37 @@ fn normalize_ui_action(action: Value) -> Value {
                 normalized.remove("spec");
             }
         }
+        Some("viewer.drawings.set_path_part_visible") => {
+            normalize_native_path_part_visibility_fields(&mut normalized);
+            if let Some(visible) = get_first_value(&normalized, &["visible", "visibility"])
+                .and_then(|value| parse_boolish_value(&value))
+            {
+                normalized.insert("visible".to_owned(), Value::Bool(visible));
+                normalized.remove("visibility");
+            }
+            if let Some(Value::Object(mut drawing)) = normalized
+                .remove("drawing")
+                .or_else(|| normalized.remove("annotation"))
+                .or_else(|| normalized.remove("spec"))
+            {
+                normalize_native_path_part_visibility_fields(&mut drawing);
+                if let Some(value) =
+                    get_first_value(&drawing, &["resource", "sourceResource", "source_resource"])
+                {
+                    normalized.insert("resource".to_owned(), value);
+                }
+                for key in ["path", "part", "line", "markers", "max_samples"] {
+                    if let Some(value) = get_first_value(&drawing, &[key]) {
+                        normalized.insert(key.to_owned(), value);
+                    }
+                }
+                if let Some(visible) = get_first_value(&drawing, &["visible", "visibility"])
+                    .and_then(|value| parse_boolish_value(&value))
+                {
+                    normalized.insert("visible".to_owned(), Value::Bool(visible));
+                }
+            }
+        }
         Some("viewer.annotations.show_path") => {
             normalize_native_path_annotation_fields(&mut normalized);
             if let Some(Value::Object(mut annotation)) = normalized
@@ -4201,6 +4325,12 @@ fn normalize_ui_action_kind(kind: &str) -> Option<String> {
         | "section.clear"
         | "sectionClear"
         | "clearSection" => Some("viewer.section.clear".to_owned()),
+        "viewer.drawings.set_path_part_visible"
+        | "viewer.drawings.setPathPartVisible"
+        | "viewerDrawingsSetPathPartVisible"
+        | "drawings.set_path_part_visible"
+        | "drawings.setPathPartVisible"
+        | "setPathPartVisible" => Some("viewer.drawings.set_path_part_visible".to_owned()),
         "viewer.annotations.show_path"
         | "viewer.annotations.showPath"
         | "viewerAnnotationsShowPath"
@@ -4212,6 +4342,22 @@ fn normalize_ui_action_kind(kind: &str) -> Option<String> {
         | "viewerAnnotationsClear"
         | "annotations.clear"
         | "clearAnnotations" => Some("viewer.annotations.clear".to_owned()),
+        _ => None,
+    }
+}
+
+fn parse_boolish_value(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(value) => Some(*value),
+        Value::Number(value) => value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(|value| value != 0.0),
+        Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "y" | "on" => Some(true),
+            "0" | "false" | "no" | "n" | "off" => Some(false),
+            _ => None,
+        },
         _ => None,
     }
 }

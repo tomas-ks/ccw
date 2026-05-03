@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  deterministicPathPartLayerId,
   diagnosticMessage,
   normalizePathAnnotationRequest,
+  normalizePathPartVisibilityRequest,
 } from "./path-annotations.mjs";
 
 const path = {
@@ -132,6 +134,68 @@ test("explicit end tokens normalize to to_end", () => {
 
   assert.deepEqual(payload.line.ranges, [{ from: 400, to_end: true }]);
   assert.deepEqual(payload.markers, [{ range: { from: 400, to_end: true }, every: 50 }]);
+});
+
+test("path drawing normalization defaults a visible line to the explicit path", () => {
+  const { visible, layer_id, payload } = normalizePathPartVisibilityRequest(
+    {
+      resource: "ifc/bridge-for-minnd",
+      path,
+      part: "line",
+      visible: "true",
+    },
+    "project/bridge-for-minnd"
+  );
+
+  assert.equal(visible, true);
+  assert.equal(
+    layer_id,
+    "path-annotations-ifc-bridge-for-minnd-ifc-alignment-curve-215711-line"
+  );
+  assert.deepEqual(payload, {
+    resource: "ifc/bridge-for-minnd",
+    path,
+    part: "line",
+    layer_id,
+    line: {},
+  });
+});
+
+test("path drawing normalization uses one deterministic layer for show and hide", () => {
+  const shown = normalizePathPartVisibilityRequest(
+    {
+      resource: "ifc/bridge-for-minnd",
+      path,
+      part: "stations",
+      visible: true,
+      markers: [{ interval: "20m", range: { from: 100, to: "end" }, label: "measure" }],
+    },
+    "project/bridge-for-minnd"
+  );
+  const hidden = normalizePathPartVisibilityRequest(
+    {
+      resource: "ifc/bridge-for-minnd",
+      path,
+      part: "station",
+      visible: false,
+    },
+    "project/bridge-for-minnd"
+  );
+
+  assert.equal(shown.layer_id, hidden.layer_id);
+  assert.equal(
+    shown.layer_id,
+    deterministicPathPartLayerId({
+      resource: "ifc/bridge-for-minnd",
+      path,
+      part: "stations",
+    })
+  );
+  assert.deepEqual(shown.payload.markers, [
+    { range: { from: 100, to_end: true }, every: 20, label: "measure" },
+  ]);
+  assert.equal(shown.payload.line, undefined);
+  assert.equal(hidden.visible, false);
 });
 
 test("diagnostics include explicit and requested measure ranges", () => {

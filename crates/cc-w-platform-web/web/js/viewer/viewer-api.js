@@ -40,6 +40,7 @@ import {
   diagnosticMessage,
   firstPresent,
   normalizePathAnnotationRequest,
+  normalizePathPartVisibilityRequest,
 } from "./path-annotations.mjs";
 import { semanticIdsForViewerResource } from "./resource.js";
 
@@ -82,6 +83,31 @@ export function createViewerApi(options = {}) {
     requireViewerFeatureExport("section", name);
   const requireViewerAnnotationsExport = (name) =>
     requireViewerFeatureExport("annotations", name);
+  const compilePathAnnotationLayer = async (
+    payload,
+    {
+      mode = "replace",
+      layerId = null,
+      fallbackMessage = "Alignment annotation compilation failed.",
+    } = {}
+  ) => {
+    const response = await fetch("/api/annotations/path", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+    const compiled = await readJsonResponse(response, fallbackMessage);
+    if (!compiled?.layer) {
+      throw new Error("Path annotation compilation returned no layer.");
+    }
+    const layer = layerId ? { ...compiled.layer, id: layerId } : compiled.layer;
+    if (mode === "add") {
+      return annotations.merge(layer);
+    }
+    return annotations.set(layer);
+  };
   const section = {
     set: (spec) => {
       const setJson = requireViewerSectionExport("viewer_section_set_json");
@@ -119,26 +145,27 @@ export function createViewerApi(options = {}) {
     },
     showPath: async (spec = {}) => {
       const { mode, payload } = normalizePathAnnotationRequest(spec, viewer_current_resource());
-      const response = await fetch("/api/annotations/path", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      });
-      const compiled = await readJsonResponse(
-        response,
-        "Alignment annotation compilation failed."
-      );
-      if (!compiled?.layer) {
-        throw new Error("Path annotation compilation returned no layer.");
-      }
-      if (mode === "add") {
-        return annotations.merge(compiled.layer);
-      }
-      return annotations.set(compiled.layer);
+      return compilePathAnnotationLayer(payload, { mode });
     },
     show_path: (spec = {}) => annotations.showPath(spec),
+  };
+  const drawings = {
+    setPathPartVisible: async (spec = {}) => {
+      const { visible, layer_id, payload } = normalizePathPartVisibilityRequest(
+        spec,
+        viewer_current_resource()
+      );
+      if (!visible) {
+        return annotations.clear(layer_id);
+      }
+      return compilePathAnnotationLayer(payload, {
+        mode: "add",
+        layerId: layer_id,
+        fallbackMessage: "Path drawing compilation failed.",
+      });
+    },
+    set_path_part_visible: (spec = {}) => drawings.setPathPartVisible(spec),
+    state: () => annotations.state(),
   };
   const currentViewerElementIds = (ids, options = {}) =>
     semanticIdsForViewerResource(ids, viewer_current_resource(), options);
@@ -226,6 +253,7 @@ export function createViewerApi(options = {}) {
     state: () => api.viewState(),
     section,
     annotations,
+    drawings,
     setProfile: (profile) => parseViewState(viewer_set_profile(profile)),
     setViewMode: (mode) => setViewModeSoon(mode),
     defaultView: () => setViewModeSoon("default"),

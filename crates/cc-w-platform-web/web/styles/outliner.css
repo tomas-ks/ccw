@@ -74,15 +74,33 @@
   padding: 8px;
 }
 
+.outliner-facet-switcher {
+  flex: 0 0 auto;
+  margin: 0 0 8px;
+}
+
 .outliner-facet-tabs {
   flex: 0 0 auto;
   display: flex;
   gap: 0;
   overflow-x: auto;
   padding: 0;
-  margin: 0 0 8px;
+  margin: 0;
   border-bottom: 1px solid var(--border-subtle);
   scrollbar-width: none;
+}
+
+.outliner-facet-switcher.has-secondary-facets .outliner-primary-facet-tabs {
+  border-bottom-color: var(--border-strong);
+}
+
+.outliner-secondary-facet-tabs {
+  margin-top: -1px;
+  border: 1px solid var(--border-strong);
+  border-top-color: var(--surface-elevated);
+  border-radius: 0 0 6px 6px;
+  background: var(--surface-elevated);
+  overflow: hidden;
 }
 
 .outliner-facet-tabs::-webkit-scrollbar {
@@ -90,11 +108,11 @@
 }
 
 .outliner-facet-tab {
-  flex: 0 1 auto;
+  flex: 1 1 0;
   min-width: 0;
-  max-width: 78px;
+  max-width: none;
   margin: 0 0 -1px -1px;
-  padding: 5px 6px;
+  padding: 4px 5px;
   border: 1px solid var(--border-subtle);
   border-radius: 6px 6px 0 0;
   background: transparent;
@@ -109,6 +127,24 @@
   cursor: pointer;
 }
 
+.outliner-primary-facet-tab {
+  font-size: 11px;
+}
+
+.outliner-secondary-facet-tab {
+  margin: 0;
+  padding: 4px 5px;
+  border: 0;
+  border-left: 1px solid var(--border-subtle);
+  border-radius: 0;
+  background: transparent;
+  font-size: 10.5px;
+}
+
+.outliner-secondary-facet-tab:first-child {
+  border-left: 0;
+}
+
 .outliner-facet-tab:first-child {
   margin-left: 0;
 }
@@ -119,6 +155,17 @@
   background: var(--surface-elevated);
   border-color: var(--border-strong);
   border-bottom-color: var(--surface-elevated);
+}
+
+.outliner-facet-switcher.has-secondary-facets .outliner-primary-facet-tab.active {
+  border-bottom-color: var(--surface-elevated);
+}
+
+.outliner-secondary-facet-tab:hover,
+.outliner-secondary-facet-tab.active {
+  color: var(--text);
+  background: var(--hover-accent);
+  border-color: var(--border-subtle);
 }
 
 .outliner-empty {
@@ -200,6 +247,10 @@
   min-width: 0;
   justify-self: end;
   justify-content: end;
+}
+
+.outliner-drawing-row-meta {
+  grid-template-columns: 42px 42px;
 }
 
 .outliner-inspect-toggle {

@@ -7,7 +7,11 @@ import {
 } from "../viewer/resource.js";
 import {
   DEFAULT_SEMANTIC_OUTLINER_FACETS,
+  DRAWINGS_FACET_ID,
+  drawingGroupOutlinerState,
+  drawingGroupVisibilityOperation,
   normalizeSemanticOutliner,
+  normalizeDrawingsFacet,
   semanticDiagnosticMessage,
   semanticGroupDeclaredCount,
   semanticGroupInspectionOperation,
@@ -18,14 +22,38 @@ import {
 } from "../semantic/outliner-model.mjs";
 
 const WORKSPACE_FACET_ID = "workspace";
+const SEMANTICS_GROUP_ID = "semantics";
+const SEMANTIC_DEFAULT_FACET_ID = "classes";
+const SEMANTIC_FACET_IDS = Object.freeze([
+  "layers",
+  "classes",
+  "spatial",
+  "materials",
+  "construction",
+]);
 const BACKEND_ONLY_FACET_IDS = new Set([WORKSPACE_FACET_ID, "project"]);
+
+const PRIMARY_FACET_GROUPS = Object.freeze([
+  Object.freeze({ id: WORKSPACE_FACET_ID, label: "Workspace", facetId: WORKSPACE_FACET_ID }),
+  Object.freeze({ id: DRAWINGS_FACET_ID, label: "Drawings", facetId: DRAWINGS_FACET_ID }),
+  Object.freeze({
+    id: SEMANTICS_GROUP_ID,
+    label: "Semantics",
+    facetIds: SEMANTIC_FACET_IDS,
+    defaultFacetId: SEMANTIC_DEFAULT_FACET_ID,
+  }),
+]);
 
 export {
   DEFAULT_SEMANTIC_OUTLINER_FACETS,
+  DRAWINGS_FACET_ID,
+  drawingGroupOutlinerState,
+  drawingGroupVisibilityOperation,
   isIfcResource,
   isKnownResource,
   isProjectResource,
   normalizeSemanticOutliner,
+  normalizeDrawingsFacet,
   parseSourceScopedSemanticId,
   safeViewerCurrentResource,
   semanticDiagnosticMessage,
@@ -195,6 +223,38 @@ function groupDetailText(group) {
   return detail || kind;
 }
 
+function drawingPathText(path) {
+  if (!path) {
+    return "";
+  }
+  if (typeof path === "object" && !Array.isArray(path)) {
+    const kind = String(path.kind || path.type || "").trim();
+    const id = String(path.id || path.pathId || path.path_id || "").trim();
+    return [kind, id].filter(Boolean).join(": ");
+  }
+  return String(path || "").trim();
+}
+
+function drawingGroupDetailText(group) {
+  const metadata = group?.metadata && typeof group.metadata === "object" ? group.metadata : {};
+  const path = drawingPathText(metadata.path);
+  const resource = String(metadata.resource || "").trim();
+  if (path && resource) {
+    return `${resource} / ${path}`;
+  }
+  return path || resource || groupDetailText(group);
+}
+
+function drawingCountText(state) {
+  if (state.layerIds.length) {
+    return `${state.enabledCount}/${state.totalCount}`;
+  }
+  if (state.totalCount > 0) {
+    return `${state.totalCount}`;
+  }
+  return "empty";
+}
+
 function preferredSemanticFacetId(outliner, current = "") {
   const facets = Array.isArray(outliner?.facets) ? outliner.facets : [];
   if (current && facets.some((facet) => facet.id === current)) {
@@ -206,6 +266,49 @@ function preferredSemanticFacetId(outliner, current = "") {
   }
   const firstPopulated = facets.find((facet) => Array.isArray(facet.groups) && facet.groups.length);
   return firstPopulated?.id || facets[0]?.id || WORKSPACE_FACET_ID;
+}
+
+function hasFacet(outliner, facetId) {
+  return Array.isArray(outliner?.facets)
+    ? outliner.facets.some((facet) => facet.id === facetId)
+    : false;
+}
+
+function isSemanticFacetId(facetId) {
+  return SEMANTIC_FACET_IDS.includes(String(facetId || ""));
+}
+
+function availableSemanticFacets(outliner) {
+  const facets = Array.isArray(outliner?.facets) ? outliner.facets : [];
+  return SEMANTIC_FACET_IDS
+    .map((id) => facets.find((facet) => facet.id === id))
+    .filter(Boolean);
+}
+
+function preferredSemanticSubFacetId(outliner, current = "") {
+  if (isSemanticFacetId(current) && hasFacet(outliner, current)) {
+    return current;
+  }
+  const configuredDefault = PRIMARY_FACET_GROUPS.find(
+    (group) => group.id === SEMANTICS_GROUP_ID
+  )?.defaultFacetId;
+  if (configuredDefault && hasFacet(outliner, configuredDefault)) {
+    return configuredDefault;
+  }
+  return availableSemanticFacets(outliner)[0]?.id || WORKSPACE_FACET_ID;
+}
+
+function primaryGroupIdForFacet(facetId) {
+  if (facetId === WORKSPACE_FACET_ID) {
+    return WORKSPACE_FACET_ID;
+  }
+  if (facetId === DRAWINGS_FACET_ID) {
+    return DRAWINGS_FACET_ID;
+  }
+  if (isSemanticFacetId(facetId)) {
+    return SEMANTICS_GROUP_ID;
+  }
+  return WORKSPACE_FACET_ID;
 }
 
 function backendSemanticFacetsForRender(outliner, resource, { loading = false, error = "" } = {}) {
@@ -223,6 +326,42 @@ function backendSemanticFacetsForRender(outliner, resource, { loading = false, e
       groups: [],
       diagnostics: diagnostic ? [diagnostic] : [],
     }));
+}
+
+function drawingsFacetFromViewState(viewState, resource) {
+  for (const candidate of [
+    viewState?.drawings,
+    viewState?.drawing,
+    viewState?.drawingOutliner,
+    viewState?.drawing_outliner,
+  ]) {
+    if (candidate == null) {
+      continue;
+    }
+    const facet = normalizeDrawingsFacet(candidate, { resource });
+    if (facet.groups.length) {
+      return facet;
+    }
+  }
+  return null;
+}
+
+function withViewStateDrawingsFacet(outliner, viewState, resource) {
+  const viewStateFacet = drawingsFacetFromViewState(viewState, resource);
+  if (!viewStateFacet) {
+    return outliner;
+  }
+  const facets = Array.isArray(outliner?.facets) ? [...outliner.facets] : [];
+  const index = facets.findIndex((facet) => facet.id === DRAWINGS_FACET_ID);
+  if (index >= 0) {
+    if (!facets[index].groups?.length) {
+      facets[index] = viewStateFacet;
+    }
+  } else {
+    const layersIndex = facets.findIndex((facet) => facet.id === "layers");
+    facets.splice(layersIndex >= 0 ? layersIndex + 1 : facets.length, 0, viewStateFacet);
+  }
+  return { ...outliner, facets };
 }
 
 function workspaceFacetForProject(project, viewState, resource) {
@@ -262,32 +401,116 @@ function semanticOutlinerForRender(
   resource,
   status = {}
 ) {
-  return {
-    resource,
-    facets: [
-      workspaceFacetForProject(project, viewState, resource),
-      ...backendSemanticFacetsForRender(backendOutliner, resource, status),
-    ],
-    diagnostics: backendOutliner?.diagnostics || [],
-  };
+  return withViewStateDrawingsFacet(
+    {
+      resource,
+      facets: [
+        workspaceFacetForProject(project, viewState, resource),
+        ...backendSemanticFacetsForRender(backendOutliner, resource, status),
+      ],
+      diagnostics: backendOutliner?.diagnostics || [],
+    },
+    viewState,
+    resource
+  );
 }
 
-function renderSemanticFacetTabs(doc, outliner, activeFacetId, setActiveFacet) {
+function renderFacetTabButton(doc, { label, active, onClick, className = "" }) {
+  const button = doc.createElement("button");
+  button.type = "button";
+  button.className = `outliner-facet-tab${className ? ` ${className}` : ""}`;
+  button.textContent = label;
+  button.setAttribute("role", "tab");
+  button.setAttribute("aria-selected", String(active));
+  button.classList.toggle("active", active);
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function renderPrimaryFacetTabs(
+  doc,
+  outliner,
+  activeFacetId,
+  lastSemanticFacetId,
+  setActiveFacet
+) {
   const tabs = doc.createElement("div");
-  tabs.className = "outliner-facet-tabs";
+  tabs.className = "outliner-facet-tabs outliner-primary-facet-tabs";
   tabs.setAttribute("role", "tablist");
-  for (const facet of outliner.facets || []) {
-    const button = doc.createElement("button");
-    button.type = "button";
-    button.className = "outliner-facet-tab";
-    button.textContent = facet.label || facet.id;
-    button.setAttribute("role", "tab");
-    button.setAttribute("aria-selected", String(facet.id === activeFacetId));
-    button.classList.toggle("active", facet.id === activeFacetId);
-    button.addEventListener("click", () => setActiveFacet(facet.id));
+
+  const activePrimaryId = primaryGroupIdForFacet(activeFacetId);
+  for (const group of PRIMARY_FACET_GROUPS) {
+    const targetFacetId =
+      group.id === SEMANTICS_GROUP_ID
+        ? preferredSemanticSubFacetId(outliner, lastSemanticFacetId)
+        : group.facetId;
+    if (!targetFacetId || !hasFacet(outliner, targetFacetId)) {
+      continue;
+    }
+    const button = renderFacetTabButton(doc, {
+      label: group.label,
+      active: group.id === activePrimaryId,
+      onClick: () => setActiveFacet(targetFacetId),
+      className: "outliner-primary-facet-tab",
+    });
     tabs.appendChild(button);
   }
   return tabs;
+}
+
+function renderSemanticSubFacetTabs(doc, outliner, activeFacetId, setActiveFacet) {
+  if (!isSemanticFacetId(activeFacetId)) {
+    return null;
+  }
+  const facets = availableSemanticFacets(outliner);
+  if (facets.length <= 1) {
+    return null;
+  }
+
+  const tabs = doc.createElement("div");
+  tabs.className = "outliner-facet-tabs outliner-secondary-facet-tabs";
+  tabs.setAttribute("role", "tablist");
+  for (const facet of facets) {
+    const button = renderFacetTabButton(doc, {
+      label: facet.label || facet.id,
+      active: facet.id === activeFacetId,
+      onClick: () => setActiveFacet(facet.id),
+      className: "outliner-secondary-facet-tab",
+    });
+    tabs.appendChild(button);
+  }
+  return tabs;
+}
+
+function renderSemanticFacetSwitchers(
+  doc,
+  outliner,
+  activeFacetId,
+  lastSemanticFacetId,
+  setActiveFacet
+) {
+  const switcher = doc.createElement("div");
+  switcher.className = "outliner-facet-switcher";
+  switcher.appendChild(
+    renderPrimaryFacetTabs(
+      doc,
+      outliner,
+      activeFacetId,
+      lastSemanticFacetId,
+      setActiveFacet
+    )
+  );
+  const secondary = renderSemanticSubFacetTabs(
+    doc,
+    outliner,
+    activeFacetId,
+    setActiveFacet
+  );
+  if (secondary) {
+    switcher.classList.add("has-secondary-facets");
+    switcher.appendChild(secondary);
+  }
+  return switcher;
 }
 
 function semanticGroupSourceLabel(group) {
@@ -354,6 +577,7 @@ export function createProjectOutlinerController({
   let semanticErrorResource = "";
   let semanticError = "";
   let activeSemanticFacetId = WORKSPACE_FACET_ID;
+  let lastSemanticFacetId = SEMANTIC_DEFAULT_FACET_ID;
   let renderedScrollKey = "";
   let dragState = null;
 
@@ -501,6 +725,18 @@ export function createProjectOutlinerController({
     }
   };
 
+  const setActiveSemanticFacet = (facetId) => {
+    const nextFacetId = String(facetId || "").trim();
+    if (!nextFacetId) {
+      return;
+    }
+    activeSemanticFacetId = nextFacetId;
+    if (isSemanticFacetId(nextFacetId)) {
+      lastSemanticFacetId = nextFacetId;
+    }
+    renderSafely();
+  };
+
   const toggleMember = (member, ids, visible) => {
     const elementIds = Array.isArray(ids) ? ids : [];
     if (!elementIds.length) {
@@ -608,6 +844,91 @@ export function createProjectOutlinerController({
     }
   };
 
+  const drawingApi = () => viewer?.drawings || null;
+  const drawingSetPathPartVisible = () => {
+    const api = drawingApi();
+    return typeof api?.setPathPartVisible === "function"
+      ? api.setPathPartVisible
+      : null;
+  };
+
+  const callSetPathPartVisible = (command, visible) => {
+    const api = drawingApi();
+    const setPathPartVisible = drawingSetPathPartVisible();
+    if (!api || !setPathPartVisible) {
+      return null;
+    }
+    const resource = String(command.resource || "").trim();
+    const spec = {
+      resource,
+      path: command.path,
+      drawingPart: command.drawingPart,
+      part: command.drawingPart,
+      visible: Boolean(visible),
+    };
+    if (command.layerId) {
+      spec.layerId = command.layerId;
+    }
+    if (command.line !== undefined) {
+      spec.line = command.line;
+    }
+    if (command.markers !== undefined) {
+      spec.markers = command.markers;
+    }
+    if (command.maxSamples !== undefined) {
+      spec.maxSamples = command.maxSamples;
+    }
+    if (setPathPartVisible.length >= 3) {
+      return setPathPartVisible.call(
+        api,
+        command.path,
+        command.drawingPart,
+        Boolean(visible),
+        {
+          resource,
+          layerId: command.layerId || undefined,
+          line: command.line,
+          markers: command.markers,
+          maxSamples: command.maxSamples,
+        }
+      );
+    }
+    return setPathPartVisible.call(api, spec, Boolean(visible));
+  };
+
+  const toggleDrawingGroup = (group, viewState, resource, visible) => {
+    const operation = drawingGroupVisibilityOperation(group, viewState, resource, visible);
+    if (!operation.commands.length || !drawingSetPathPartVisible()) {
+      renderSafely();
+      return 0;
+    }
+    const pending = [];
+    try {
+      for (const command of operation.commands) {
+        const result = callSetPathPartVisible(command, visible);
+        if (result && typeof result.then === "function") {
+          pending.push(result);
+        }
+      }
+    } catch (error) {
+      console.error("workspace outliner drawing toggle failed", error);
+    }
+    if (pending.length) {
+      Promise.allSettled(pending)
+        .then((results) => {
+          for (const result of results) {
+            if (result.status === "rejected") {
+              console.error("workspace outliner drawing toggle failed", result.reason);
+            }
+          }
+        })
+        .finally(() => renderSafely());
+    } else {
+      renderSafely();
+    }
+    return operation.commands.length;
+  };
+
   const renderSemanticInspectButton = (
     group,
     viewState,
@@ -701,6 +1022,59 @@ export function createProjectOutlinerController({
     fragment.appendChild(row);
   };
 
+  const renderDrawingGroup = (fragment, group, viewState, resource, depth = 0) => {
+    const groupState = drawingGroupOutlinerState(group, viewState, resource);
+    const apiAvailable = Boolean(drawingSetPathPartVisible());
+    const row = doc.createElement("div");
+    row.className = "outliner-row outliner-group-row outliner-drawing-row";
+    row.style.setProperty("--outliner-depth", String(depth));
+
+    const checkbox = doc.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = groupState.checked;
+    checkbox.indeterminate = groupState.indeterminate;
+    checkbox.disabled = groupState.disabled || !apiAvailable;
+    checkbox.setAttribute("aria-label", `Toggle drawing ${group.label}`);
+    checkbox.title = apiAvailable
+      ? `Toggle drawing ${group.label}`
+      : "Viewer drawings API unavailable";
+    checkbox.addEventListener("change", () => {
+      toggleDrawingGroup(group, viewState, resource, checkbox.checked);
+    });
+
+    const text = doc.createElement("span");
+    text.className = "outliner-name-stack";
+
+    const name = doc.createElement("span");
+    name.className = "outliner-name";
+    name.textContent = group.label;
+    name.title = group.label;
+    text.appendChild(name);
+
+    const detail = drawingGroupDetailText(group);
+    if (detail) {
+      const detailNode = doc.createElement("span");
+      detailNode.className = "outliner-detail";
+      detailNode.textContent = detail;
+      text.appendChild(detailNode);
+    }
+
+    const meta = doc.createElement("span");
+    meta.className = "outliner-row-meta outliner-drawing-row-meta";
+    appendSourceBadgeSlot(doc, meta, "path");
+    const count = doc.createElement("span");
+    count.className = "outliner-count";
+    count.textContent = drawingCountText(groupState);
+    meta.appendChild(count);
+
+    row.append(checkbox, text, meta);
+    fragment.appendChild(row);
+
+    for (const child of group.children || []) {
+      renderDrawingGroup(fragment, child, viewState, resource, depth + 1);
+    }
+  };
+
   const renderSemanticGroup = (fragment, group, viewState, resource, depth = 0) => {
     const groupState = semanticGroupOutlinerState(group, viewState, resource);
     const row = doc.createElement("div");
@@ -757,11 +1131,17 @@ export function createProjectOutlinerController({
 
   const renderSemanticOutliner = (fragment, outliner, viewState, resource) => {
     activeSemanticFacetId = preferredSemanticFacetId(outliner, activeSemanticFacetId);
+    if (isSemanticFacetId(activeSemanticFacetId)) {
+      lastSemanticFacetId = activeSemanticFacetId;
+    }
     fragment.appendChild(
-      renderSemanticFacetTabs(doc, outliner, activeSemanticFacetId, (facetId) => {
-        activeSemanticFacetId = facetId;
-        renderSafely();
-      })
+      renderSemanticFacetSwitchers(
+        doc,
+        outliner,
+        activeSemanticFacetId,
+        lastSemanticFacetId,
+        setActiveSemanticFacet
+      )
     );
     const list = doc.createElement("div");
     list.className = "outliner-list";
@@ -789,7 +1169,11 @@ export function createProjectOutlinerController({
     }
 
     for (const group of facet.groups) {
-      renderSemanticGroup(list, group, viewState, resource);
+      if (facet.id === DRAWINGS_FACET_ID) {
+        renderDrawingGroup(list, group, viewState, resource);
+      } else {
+        renderSemanticGroup(list, group, viewState, resource);
+      }
     }
   };
 

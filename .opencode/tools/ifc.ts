@@ -1270,6 +1270,99 @@ export const viewer_annotations_show_path = tool({
   },
 });
 
+export const viewer_drawings_set_path_part_visible = tool({
+  description:
+    "Ask the host viewer to toggle one composable drawing part for an explicit measured path. For IFC alignments, use after ifc_alignment_catalog. This is the shared AI/UI/console surface for alignment drawing visibility; do not include raw polyline, point, coordinate, or vertex arrays.",
+  args: {
+    resource: tool.schema
+      .string()
+      .optional()
+      .describe("IFC or project resource the path source belongs to"),
+    path: tool.schema
+      .object({
+        kind: tool.schema
+          .string()
+          .describe("Path source kind. Currently use ifc_alignment for explicit IFC alignment paths."),
+        id: tool.schema
+          .string()
+          .describe("Resolver path id returned by ifc_alignment_catalog. Prefer curve:<db-node-id>; alignment:<db-node-id> is accepted only when it resolves through explicit Axis representation facts to exactly one IfcGradientCurve."),
+        measure: tool.schema
+          .string()
+          .optional()
+          .describe("Measure coordinate along the path. Use station for IFC alignment station/chainage drawings."),
+      })
+      .describe("Explicit measured path source to draw"),
+    part: tool.schema
+      .string()
+      .describe("Drawing part to toggle. Use line for the alignment path line, or stations for station markers/labels."),
+    visible: tool.schema
+      .boolean()
+      .describe("Whether this drawing part should be visible"),
+    line: tool.schema
+      .object({
+        ranges: tool.schema
+          .array(
+            tool.schema.object({
+              from: tool.schema.number().optional().describe("Optional absolute station/chainage start. For 'station 100 to 200', use from: 100 and do not set from_offset."),
+              to: tool.schema.number().optional().describe("Optional absolute station/chainage end. For 'station 100 to 200', use to: 200 and do not set to_offset."),
+              from_offset: tool.schema.number().optional().describe("Optional relative distance from the explicit path start. Use only for relative wording like 'first 120m'; never combine with from."),
+              to_offset: tool.schema.number().optional().describe("Optional relative distance from the explicit path start. Use only for relative wording like 'first 120m'; never combine with to."),
+              to_end: tool.schema.boolean().optional().describe("Use true for 'to the end' of the explicit path. Do not combine with to or to_offset; do not guess a numeric end station."),
+            })
+          )
+          .optional()
+          .describe("Path measure ranges for the line drawing. Omit for the whole explicit path when part is line."),
+      })
+      .optional()
+      .describe("Optional line drawing request. Used only when part is line."),
+    markers: tool.schema
+      .array(
+        tool.schema.object({
+          range: tool.schema
+            .object({
+              from: tool.schema.number().optional().describe("Optional absolute station/chainage start. For 'station 100 to 200', use from: 100 and do not set from_offset."),
+              to: tool.schema.number().optional().describe("Optional absolute station/chainage end. For 'station 100 to 200', use to: 200 and do not set to_offset."),
+              from_offset: tool.schema.number().optional().describe("Optional relative distance from the explicit path start. Use only for relative wording like 'first 120m'; never combine with from."),
+              to_offset: tool.schema.number().optional().describe("Optional relative distance from the explicit path start. Use only for relative wording like 'first 120m'; never combine with to."),
+              to_end: tool.schema.boolean().optional().describe("Use true for 'to the end' of the explicit path. Do not combine with to or to_offset; do not guess a numeric end station."),
+            })
+            .optional()
+            .describe("Optional measure range for this station-marker sampling rule. Omit to sample the whole explicit path."),
+          every: tool.schema.number().describe("Marker spacing in path measure units"),
+          label: tool.schema
+            .string()
+            .optional()
+            .describe("Use measure to label each marker by its path measure; use none for unlabeled markers."),
+        })
+      )
+      .optional()
+      .describe("Optional station marker sampling rules. Used only when part is stations."),
+    max_samples: tool.schema
+      .number()
+      .optional()
+      .describe("Optional maximum sample count per line range or marker group"),
+    why: tool.schema.string().optional().describe("Short reason for the viewer action"),
+  },
+  async execute(args) {
+    const reason = args.why?.trim();
+    const part = String(args.part || "").trim();
+    const details = [
+      args.visible ? "visible" : "hidden",
+      part ? `part ${part}` : null,
+      args.line === undefined ? null : "line ranges",
+      args.markers === undefined ? null : `${args.markers.length} marker groups`,
+    ]
+      .filter(Boolean)
+      .join(", ");
+    return [
+      `Prepared viewer.drawings.set_path_part_visible for ${args.path.kind}:${args.path.id}${details ? ` (${details})` : ""}.`,
+      reason ? `Why: ${reason}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  },
+});
+
 export const viewer_annotations_clear = tool({
   description: "Ask the host viewer to clear active scene annotations.",
   args: {

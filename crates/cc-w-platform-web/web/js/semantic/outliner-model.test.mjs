@@ -3,6 +3,10 @@ import test from "node:test";
 
 import {
   DEFAULT_SEMANTIC_OUTLINER_FACETS,
+  DRAWINGS_FACET_ID,
+  drawingGroupLayerId,
+  drawingGroupOutlinerState,
+  drawingGroupVisibilityOperation,
   normalizeSemanticOutliner,
   semanticGroupDeclaredCount,
   semanticGroupInspectionOperation,
@@ -15,9 +19,135 @@ import {
 test("default semantic facets start with workspace and omit IFC project", () => {
   assert.equal(DEFAULT_SEMANTIC_OUTLINER_FACETS[0].id, "workspace");
   assert.equal(DEFAULT_SEMANTIC_OUTLINER_FACETS[0].label, "Workspace");
+  assert.equal(DEFAULT_SEMANTIC_OUTLINER_FACETS[2].id, DRAWINGS_FACET_ID);
+  assert.equal(DEFAULT_SEMANTIC_OUTLINER_FACETS[2].label, "Drawings");
   assert.equal(
     DEFAULT_SEMANTIC_OUTLINER_FACETS.some((facet) => facet.id === "project"),
     false
+  );
+});
+
+test("normalizes drawings facet into alignment rows with path part children", () => {
+  const outliner = normalizeSemanticOutliner({
+    resource: "ifc/bridge-for-minnd",
+    facets: [
+      {
+        id: "drawing",
+        groups: [
+          {
+            id: "alignment:215711",
+            label: "Bridge alignment",
+            provenance: "ifc_graph",
+            resource: "ifc/bridge-for-minnd",
+            metadata: {
+              pathKind: "ifc_alignment",
+              pathId: "alignment:215711",
+              pathMeasure: "station",
+              stationMarkers:
+                '[{"range":{"to_end":true},"every":20,"label":"measure"}]',
+            },
+            drawingParts: ["line", "stations"],
+          },
+        ],
+      },
+    ],
+  });
+
+  const drawings = outliner.facets.find((facet) => facet.id === DRAWINGS_FACET_ID);
+  assert.equal(drawings.label, "Drawings");
+  assert.equal(drawings.groups.length, 1);
+
+  const alignment = drawings.groups[0];
+  assert.equal(alignment.label, "Bridge alignment");
+  assert.deepEqual(alignment.metadata.path, {
+    kind: "ifc_alignment",
+    id: "alignment:215711",
+    measure: "station",
+  });
+  assert.equal(alignment.metadata.resource, "ifc/bridge-for-minnd");
+  assert.deepEqual(
+    alignment.children.map((child) => child.label),
+    ["Line", "Stations"]
+  );
+  assert.deepEqual(
+    alignment.children.map((child) => child.metadata.drawingPart),
+    ["line", "stations"]
+  );
+  assert.deepEqual(alignment.children[1].metadata.markers, [
+    { range: { to_end: true }, every: 20, label: "measure" },
+  ]);
+  assert.equal(
+    drawingGroupLayerId(alignment.children[0]),
+    "path-annotations-ifc-bridge-for-minnd-ifc-alignment-alignment-215711-line"
+  );
+  assert.equal(
+    drawingGroupLayerId(alignment.children[1]),
+    "path-annotations-ifc-bridge-for-minnd-ifc-alignment-alignment-215711-stations"
+  );
+});
+
+test("drawing row checkbox state follows deterministic annotation layer ids", () => {
+  const outliner = normalizeSemanticOutliner({
+    resource: "ifc/bridge-for-minnd",
+    drawings: {
+      alignments: [
+        {
+          id: "alignment:215711",
+          label: "Bridge alignment",
+          resource: "ifc/bridge-for-minnd",
+          path: { kind: "ifc_alignment", id: "alignment:215711" },
+          drawingParts: ["line", "stations"],
+        },
+      ],
+    },
+  });
+  const alignment = outliner.facets.find((facet) => facet.id === DRAWINGS_FACET_ID)
+    .groups[0];
+  const [line, stations] = alignment.children;
+  const viewState = {
+    annotations: {
+      layers: [
+        {
+          id: "path-annotations-ifc-bridge-for-minnd-ifc-alignment-alignment-215711-line",
+          visible: true,
+        },
+        {
+          id: "path-annotations-ifc-bridge-for-minnd-ifc-alignment-alignment-215711-stations",
+          visible: false,
+        },
+      ],
+    },
+  };
+
+  const alignmentState = drawingGroupOutlinerState(
+    alignment,
+    viewState,
+    "ifc/bridge-for-minnd"
+  );
+  assert.equal(alignmentState.checked, true);
+  assert.equal(alignmentState.indeterminate, true);
+  assert.equal(alignmentState.enabledCount, 1);
+  assert.equal(alignmentState.totalCount, 2);
+
+  assert.equal(
+    drawingGroupOutlinerState(line, viewState, "ifc/bridge-for-minnd").checked,
+    true
+  );
+  assert.equal(
+    drawingGroupOutlinerState(stations, viewState, "ifc/bridge-for-minnd").checked,
+    false
+  );
+
+  const operation = drawingGroupVisibilityOperation(
+    alignment,
+    viewState,
+    "ifc/bridge-for-minnd",
+    false
+  );
+  assert.equal(operation.action, "hide");
+  assert.deepEqual(
+    operation.commands.map((command) => command.drawingPart),
+    ["line", "stations"]
   );
 });
 

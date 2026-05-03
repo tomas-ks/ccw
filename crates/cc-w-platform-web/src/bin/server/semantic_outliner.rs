@@ -16,6 +16,7 @@ use super::{
 };
 
 const LAYERS_FACET_ID: &str = "layers";
+const DRAWINGS_FACET_ID: &str = "drawings";
 const CLASSES_FACET_ID: &str = "classes";
 const SPATIAL_FACILITY_FACET_ID: &str = "spatial";
 const MATERIALS_STYLES_FACET_ID: &str = "materials";
@@ -58,6 +59,16 @@ const MATERIAL_PRODUCTS_QUERY: &str = "\
 MATCH (product:IfcProduct)<-[:RELATED_OBJECTS]-(:IfcRelAssociatesMaterial)-[:RELATING_MATERIAL]->(material)
 RETURN DISTINCT material.Name AS group_name, material.declared_entity AS identifier, id(product) AS product_node_id, product.GlobalId AS global_id, product.declared_entity AS declared_entity, product.Name AS product_name
 ORDER BY group_name, global_id";
+
+const ALIGNMENT_DRAWINGS_QUERY: &str = "\
+MATCH (alignment:IfcAlignment)-[:REPRESENTATION]->(:IfcProductDefinitionShape)-[:REPRESENTATIONS]->(representation:IfcShapeRepresentation)-[:ITEMS]->(curve:IfcGradientCurve)
+RETURN DISTINCT id(alignment) AS alignment_node_id, id(curve) AS curve_node_id, alignment.Name AS alignment_name, alignment.ObjectType AS alignment_object_type, representation.RepresentationIdentifier AS representation_identifier, representation.RepresentationType AS representation_type
+ORDER BY alignment_node_id, curve_node_id";
+
+const ALIGNMENT_STATION_COUNTS_QUERY: &str = "\
+MATCH (referent:IfcReferent)-[:OBJECT_PLACEMENT]->(:IfcLinearPlacement)-[:RELATIVE_PLACEMENT]->(:IfcAxis2PlacementLinear)-[:LOCATION]->(station_point:IfcPointByDistanceExpression)-[:BASIS_CURVE]->(curve:IfcGradientCurve)
+RETURN DISTINCT id(curve) AS curve_node_id, id(referent) AS station_node_id
+ORDER BY curve_node_id, station_node_id";
 
 pub(super) fn serve_semantic_outliner_api(
     stream: &mut TcpStream,
@@ -151,12 +162,14 @@ fn build_semantic_outliner_response(
     };
 
     let layers_facet = build_layers_facet(resource, state, &targets, &mut metrics);
+    let drawings_facet = build_drawings_facet(resource, state, &targets, &mut metrics);
     let classes_facet = build_classes_facet(resource, state, &targets, &mut metrics);
     let spatial_facet = build_spatial_facet(resource, state, &targets, &mut metrics);
     let materials_facet = build_materials_facet(resource, state, &targets, &mut metrics);
     let construction_facet = build_construction_state_hints_facet(&layers_facet);
     let facets = vec![
         layers_facet,
+        drawings_facet,
         classes_facet,
         spatial_facet,
         materials_facet,
@@ -222,6 +235,80 @@ fn build_layers_facet(
     }
 }
 
+fn build_drawings_facet(
+    response_resource: &str,
+    state: &ServerState,
+    targets: &[CypherResourceTarget],
+    metrics: &mut SemanticOutlinerMetrics,
+) -> SemanticOutlinerFacet {
+    let (station_results, station_query_metrics, mut diagnostics) = execute_outliner_query(
+        state,
+        targets,
+        DRAWINGS_FACET_ID,
+        ALIGNMENT_STATION_COUNTS_QUERY,
+    );
+    metrics.open_ms += station_query_metrics.open_ms;
+    metrics.query_ms += station_query_metrics.query_ms;
+
+    let mut station_counts = BTreeMap::<String, usize>::new();
+    for result in station_results {
+        match parse_alignment_station_counts(&result.source_resource, &result.result) {
+            Ok(parsed) => {
+                for (key, count) in parsed {
+                    station_counts.insert(key, count);
+                }
+            }
+            Err(error) => diagnostics.push(SemanticOutlinerDiagnostic::warning(
+                "alignment_station_counts_parse_failed",
+                error,
+                Some(result.source_resource),
+            )),
+        }
+    }
+
+    let (results, query_metrics, mut query_diagnostics) =
+        execute_outliner_query(state, targets, DRAWINGS_FACET_ID, ALIGNMENT_DRAWINGS_QUERY);
+    metrics.open_ms += query_metrics.open_ms;
+    metrics.query_ms += query_metrics.query_ms;
+    diagnostics.append(&mut query_diagnostics);
+
+    let mut groups = Vec::new();
+    for result in results {
+        match parse_alignment_drawing_rows(&result.source_resource, &result.result) {
+            Ok(parsed) => {
+                for row in parsed {
+                    groups.push(alignment_drawing_group(
+                        response_resource,
+                        row,
+                        &station_counts,
+                    ));
+                }
+            }
+            Err(error) => diagnostics.push(SemanticOutlinerDiagnostic::warning(
+                "alignment_drawings_parse_failed",
+                error,
+                Some(result.source_resource),
+            )),
+        }
+    }
+
+    if groups.is_empty() && diagnostics.is_empty() {
+        diagnostics.push(SemanticOutlinerDiagnostic::info(
+            "no_alignment_drawings",
+            "No IfcAlignment to explicit IfcGradientCurve drawing paths were found in the source graph.",
+            None,
+        ));
+    }
+
+    SemanticOutlinerFacet {
+        id: DRAWINGS_FACET_ID.to_owned(),
+        label: "Drawings".to_owned(),
+        provenance: IFC_GRAPH_PROVENANCE.to_owned(),
+        groups,
+        diagnostics,
+    }
+}
+
 fn build_classes_facet(
     response_resource: &str,
     state: &ServerState,
@@ -250,6 +337,7 @@ fn build_classes_facet(
             metrics.class_rows += rows;
             match parse_group_rows(&result.source_resource, &result.result, GroupRowKind::Class) {
                 Ok(mut parsed) => {
+                    parsed.retain(|row| !is_drawing_path_class(row.group_name.as_deref()));
                     for row in &mut parsed {
                         row.metadata
                             .entry("classMembership".to_owned())
@@ -479,6 +567,13 @@ fn construction_state_hint_for_layer(layer: &str) -> Option<(&'static str, &'sta
     None
 }
 
+fn is_drawing_path_class(class_name: Option<&str>) -> bool {
+    class_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| value.starts_with("IfcAlignment"))
+}
+
 fn execute_outliner_query(
     state: &ServerState,
     targets: &[CypherResourceTarget],
@@ -584,6 +679,158 @@ fn parse_group_rows(
         });
     }
     Ok(rows)
+}
+
+fn parse_alignment_station_counts(
+    source_resource: &str,
+    result: &CypherQueryResult,
+) -> Result<Vec<(String, usize)>, String> {
+    let curve_index = required_column_index(&result.columns, &["curvenodeid"], "curve_node_id")?;
+    let station_index =
+        required_column_index(&result.columns, &["stationnodeid"], "station_node_id")?;
+    let mut counts = BTreeMap::<String, BTreeSet<String>>::new();
+    for row in &result.rows {
+        let curve_node_id = row
+            .get(curve_index)
+            .map(String::as_str)
+            .unwrap_or("")
+            .trim();
+        let station_node_id = row
+            .get(station_index)
+            .map(String::as_str)
+            .unwrap_or("")
+            .trim();
+        if curve_node_id.is_empty() {
+            continue;
+        }
+        counts
+            .entry(alignment_drawing_count_key(source_resource, curve_node_id))
+            .or_default()
+            .insert(station_node_id.to_owned());
+    }
+    Ok(counts
+        .into_iter()
+        .map(|(key, station_ids)| (key, station_ids.len()))
+        .collect())
+}
+
+fn parse_alignment_drawing_rows(
+    source_resource: &str,
+    result: &CypherQueryResult,
+) -> Result<Vec<AlignmentDrawingRow>, String> {
+    let alignment_index =
+        required_column_index(&result.columns, &["alignmentnodeid"], "alignment_node_id")?;
+    let curve_index = required_column_index(&result.columns, &["curvenodeid"], "curve_node_id")?;
+    let name_index = find_column_index(&result.columns, &["alignmentname"]);
+    let object_type_index = find_column_index(&result.columns, &["alignmentobjecttype"]);
+    let representation_identifier_index =
+        find_column_index(&result.columns, &["representationidentifier"]);
+    let representation_type_index = find_column_index(&result.columns, &["representationtype"]);
+
+    let mut rows = Vec::new();
+    for row in &result.rows {
+        let alignment_node_id = row
+            .get(alignment_index)
+            .map(String::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let curve_node_id = row
+            .get(curve_index)
+            .map(String::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        if alignment_node_id.is_empty() || curve_node_id.is_empty() {
+            continue;
+        }
+        rows.push(AlignmentDrawingRow {
+            source_resource: source_resource.to_owned(),
+            alignment_node_id,
+            curve_node_id,
+            alignment_name: name_index.and_then(|index| parse_optional_string_cell(row.get(index))),
+            alignment_object_type: object_type_index
+                .and_then(|index| parse_optional_string_cell(row.get(index))),
+            representation_identifier: representation_identifier_index
+                .and_then(|index| parse_optional_string_cell(row.get(index))),
+            representation_type: representation_type_index
+                .and_then(|index| parse_optional_string_cell(row.get(index))),
+        });
+    }
+    Ok(rows)
+}
+
+fn alignment_drawing_group(
+    response_resource: &str,
+    row: AlignmentDrawingRow,
+    station_counts: &BTreeMap<String, usize>,
+) -> SemanticOutlinerGroup {
+    let path_id = format!("curve:{}", row.curve_node_id);
+    let station_count = station_counts
+        .get(&alignment_drawing_count_key(
+            &row.source_resource,
+            &row.curve_node_id,
+        ))
+        .copied()
+        .unwrap_or(0);
+    let label = row
+        .alignment_name
+        .as_deref()
+        .or(row.alignment_object_type.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("IfcAlignment {path_id}"));
+    let source_slug = if is_project_resource_id(response_resource) {
+        format!("{}:", slugify(&row.source_resource))
+    } else {
+        String::new()
+    };
+
+    let mut metadata = BTreeMap::new();
+    metadata.insert("resource".to_owned(), row.source_resource.clone());
+    metadata.insert("pathKind".to_owned(), "ifc_alignment".to_owned());
+    metadata.insert("pathId".to_owned(), path_id);
+    metadata.insert("pathMeasure".to_owned(), "station".to_owned());
+    metadata.insert(
+        "drawingParts".to_owned(),
+        if station_count > 0 {
+            "line,stations".to_owned()
+        } else {
+            "line".to_owned()
+        },
+    );
+    metadata.insert("line".to_owned(), "{}".to_owned());
+    metadata.insert("alignmentNodeId".to_owned(), row.alignment_node_id);
+    metadata.insert("curveNodeId".to_owned(), row.curve_node_id.clone());
+    metadata.insert("stationCount".to_owned(), station_count.to_string());
+    if let Some(value) = row.representation_identifier {
+        metadata.insert("representationIdentifier".to_owned(), value);
+    }
+    if let Some(value) = row.representation_type {
+        metadata.insert("representationType".to_owned(), value);
+    }
+    if station_count > 0 {
+        metadata.insert(
+            "stationMarkers".to_owned(),
+            r#"[{"range":{"to_end":true},"every":20.0,"label":"measure"}]"#.to_owned(),
+        );
+    }
+
+    SemanticOutlinerGroup {
+        id: format!("drawings:{source_slug}curve-{}", row.curve_node_id),
+        label,
+        kind: "path_drawing".to_owned(),
+        provenance: IFC_GRAPH_PROVENANCE.to_owned(),
+        source_resources: vec![row.source_resource],
+        element_count: 1,
+        semantic_ids: Vec::new(),
+        metadata,
+        diagnostics: Vec::new(),
+    }
+}
+
+fn alignment_drawing_count_key(source_resource: &str, curve_node_id: &str) -> String {
+    format!("{source_resource}\u{0}{curve_node_id}")
 }
 
 fn aggregate_product_groups(
@@ -912,6 +1159,17 @@ struct ProductGroupRow {
     kind: GroupRowKind,
 }
 
+#[derive(Debug)]
+struct AlignmentDrawingRow {
+    source_resource: String,
+    alignment_node_id: String,
+    curve_node_id: String,
+    alignment_name: Option<String>,
+    alignment_object_type: Option<String>,
+    representation_identifier: Option<String>,
+    representation_type: Option<String>,
+}
+
 struct ProductGroupAccumulator {
     id: String,
     label: String,
@@ -1080,6 +1338,51 @@ mod tests {
             groups[0].semantic_ids,
             vec!["building-global-id".to_owned(), "wall-global-id".to_owned()]
         );
+    }
+
+    #[test]
+    fn alignment_drawing_group_exposes_line_and_station_parts_from_explicit_graph_rows() {
+        let mut station_counts = BTreeMap::new();
+        station_counts.insert(
+            alignment_drawing_count_key("ifc/bridge-for-minnd", "215711"),
+            3,
+        );
+
+        let group = alignment_drawing_group(
+            "project/bridge-for-minnd",
+            AlignmentDrawingRow {
+                source_resource: "ifc/bridge-for-minnd".to_owned(),
+                alignment_node_id: "193656".to_owned(),
+                curve_node_id: "215711".to_owned(),
+                alignment_name: Some("Bridge alignment".to_owned()),
+                alignment_object_type: None,
+                representation_identifier: Some("Axis".to_owned()),
+                representation_type: Some("Curve3D".to_owned()),
+            },
+            &station_counts,
+        );
+
+        assert_eq!(group.id, "drawings:ifc-bridge-for-minnd:curve-215711");
+        assert_eq!(group.label, "Bridge alignment");
+        assert_eq!(
+            group.metadata.get("resource").unwrap(),
+            "ifc/bridge-for-minnd"
+        );
+        assert_eq!(group.metadata.get("pathKind").unwrap(), "ifc_alignment");
+        assert_eq!(group.metadata.get("pathId").unwrap(), "curve:215711");
+        assert_eq!(group.metadata.get("drawingParts").unwrap(), "line,stations");
+        assert!(group.metadata.get("stationMarkers").is_some());
+        assert!(group.semantic_ids.is_empty());
+    }
+
+    #[test]
+    fn drawing_path_classes_are_not_normal_visibility_classes() {
+        assert!(is_drawing_path_class(Some("IfcAlignment")));
+        assert!(is_drawing_path_class(Some("IfcAlignmentHorizontal")));
+        assert!(is_drawing_path_class(Some("IfcAlignmentSegment")));
+        assert!(is_drawing_path_class(Some("IfcAlignmentVertical")));
+        assert!(!is_drawing_path_class(Some("IfcAnnotation")));
+        assert!(!is_drawing_path_class(Some("IfcBeam")));
     }
 
     #[test]

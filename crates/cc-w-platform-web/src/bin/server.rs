@@ -1375,6 +1375,20 @@ enum AgentUiAction {
     ViewerSectionSet { section: serde_json::Value },
     #[serde(rename = "viewer.section.clear")]
     ViewerSectionClear,
+    #[serde(rename = "viewer.drawings.set_path_part_visible")]
+    ViewerDrawingsSetPathPartVisible {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+        path: serde_json::Value,
+        part: String,
+        visible: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        markers: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_samples: Option<serde_json::Value>,
+    },
     #[serde(rename = "viewer.annotations.show_path")]
     ViewerAnnotationsShowPath {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5503,6 +5517,23 @@ fn agent_ui_action_from_backend(action: BackendAgentUiAction) -> AgentUiAction {
             AgentUiAction::ViewerSectionSet { section }
         }
         BackendAgentUiAction::ViewerSectionClear => AgentUiAction::ViewerSectionClear,
+        BackendAgentUiAction::ViewerDrawingsSetPathPartVisible {
+            resource,
+            path,
+            part,
+            visible,
+            line,
+            markers,
+            max_samples,
+        } => AgentUiAction::ViewerDrawingsSetPathPartVisible {
+            resource,
+            path,
+            part,
+            visible,
+            line,
+            markers,
+            max_samples,
+        },
         BackendAgentUiAction::ViewerAnnotationsShowPath {
             resource,
             path,
@@ -5949,6 +5980,16 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
     let mut section_set_present = false;
     let mut section_clear_present = false;
     let mut latest_section = None::<serde_json::Value>;
+    let mut drawings_set_path_part_visible_present = false;
+    let mut path_part_visibility_actions = Vec::<(
+        Option<String>,
+        serde_json::Value,
+        String,
+        bool,
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+    )>::new();
     let mut annotations_show_present = false;
     let mut annotations_clear_present = false;
     let mut latest_path_annotation = None::<(
@@ -6119,6 +6160,29 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                     section_clear_present = true;
                 }
             }
+            AgentUiAction::ViewerDrawingsSetPathPartVisible {
+                resource,
+                path,
+                part,
+                visible,
+                line,
+                markers,
+                max_samples,
+            } => {
+                if !drawings_set_path_part_visible_present {
+                    order.push(14u8);
+                    drawings_set_path_part_visible_present = true;
+                }
+                path_part_visibility_actions.push((
+                    resource,
+                    path,
+                    part,
+                    visible,
+                    line,
+                    markers,
+                    max_samples,
+                ));
+            }
             AgentUiAction::ViewerAnnotationsShowPath {
                 resource,
                 path,
@@ -6128,14 +6192,14 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                 max_samples,
             } => {
                 if !annotations_show_present {
-                    order.push(14u8);
+                    order.push(15u8);
                     annotations_show_present = true;
                 }
                 latest_path_annotation = Some((resource, path, line, markers, mode, max_samples));
             }
             AgentUiAction::ViewerAnnotationsClear { resource } => {
                 if !annotations_clear_present {
-                    order.push(15u8);
+                    order.push(16u8);
                     annotations_clear_present = true;
                 }
                 latest_annotations_clear_resource = Some(resource);
@@ -6248,6 +6312,21 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
             }
             13 => normalized.push(AgentUiAction::ViewerSectionClear),
             14 => {
+                for (resource, path, part, visible, line, markers, max_samples) in
+                    &path_part_visibility_actions
+                {
+                    normalized.push(AgentUiAction::ViewerDrawingsSetPathPartVisible {
+                        resource: resource.clone(),
+                        path: path.clone(),
+                        part: part.clone(),
+                        visible: *visible,
+                        line: line.clone(),
+                        markers: markers.clone(),
+                        max_samples: max_samples.clone(),
+                    });
+                }
+            }
+            15 => {
                 if let Some((resource, path, line, markers, mode, max_samples)) =
                     latest_path_annotation.clone()
                 {
@@ -6261,7 +6340,7 @@ fn normalize_agent_ui_actions(actions: Vec<AgentUiAction>) -> Vec<AgentUiAction>
                     });
                 }
             }
-            15 => normalized.push(AgentUiAction::ViewerAnnotationsClear {
+            16 => normalized.push(AgentUiAction::ViewerAnnotationsClear {
                 resource: latest_annotations_clear_resource.clone().flatten(),
             }),
             _ => {}
